@@ -32,8 +32,8 @@ class Config:
     LLM_BASE_URL = os.environ.get('LLM_BASE_URL', 'https://api.openai.com/v1')
     LLM_MODEL_NAME = os.environ.get('LLM_MODEL_NAME', 'gpt-4o-mini')
     
-    # Zep配置
-    ZEP_API_KEY = os.environ.get('ZEP_API_KEY')
+    # Zep配置（已移除依赖，保留兼容性）
+    ZEP_API_KEY = os.environ.get('ZEP_API_KEY', '')
     
     # 文件上传配置
     MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB
@@ -47,6 +47,8 @@ class Config:
     # OASIS模拟配置
     OASIS_DEFAULT_MAX_ROUNDS = int(os.environ.get('OASIS_DEFAULT_MAX_ROUNDS', '10'))
     OASIS_SIMULATION_DATA_DIR = os.path.join(os.path.dirname(__file__), '../uploads/simulations')
+    # 并行配置 - 根据LLM API并发限制调整
+    OASIS_DEFAULT_PARALLEL_PROFILE_COUNT = int(os.environ.get('OASIS_DEFAULT_PARALLEL_PROFILE_COUNT', '15'))
     
     # OASIS平台可用动作配置
     OASIS_TWITTER_ACTIONS = [
@@ -69,7 +71,6 @@ class Config:
         errors: list[str] = []
         if not cls.LLM_API_KEY:
             errors.append("LLM_API_KEY 未配置")
-        if not cls.ZEP_API_KEY:
-            errors.append("ZEP_API_KEY 未配置")
+        # ZEP_API_KEY 不再是必需项（已切换为本地图谱存储）
         return errors
 

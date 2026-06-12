@@ -4,7 +4,11 @@ Step2: Zep实体读取与过滤、OASIS模拟准备与运行（全程自动化�
 """
 
 import os
+import sys
+import json
 import traceback
+from datetime import datetime
+from typing import List, Dict, Any
 from flask import request, jsonify, send_file
 
 from . import simulation_bp
@@ -43,6 +47,184 @@ def optimize_interview_prompt(prompt: str) -> str:
     return f"{INTERVIEW_PROMPT_PREFIX}{prompt}"
 
 
+def _get_simulation_dir(simulation_id: str) -> str:
+    """获取模拟数据目录路径"""
+    return os.path.join(Config.OASIS_SIMULATION_DATA_DIR, simulation_id)
+
+
+def _load_agent_profiles(simulation_id: str) -> List[Dict[str, Any]]:
+    """
+    从模拟数据目录加载 Agent Profiles
+
+    优先读取 reddit_profiles.json，其次 twitter_profiles.csv
+    """
+    sim_dir = _get_simulation_dir(simulation_id)
+    profiles = []
+
+    reddit_profile_path = os.path.join(sim_dir, "reddit_profiles.json")
+    if os.path.exists(reddit_profile_path):
+        try:
+            with open(reddit_profile_path, 'r', encoding='utf-8') as f:
+                profiles = json.load(f)
+            logger.info(f"从 reddit_profiles.json 加载了 {len(profiles)} 个人设")
+            return profiles
+        except Exception as e:
+            logger.warning(f"读取 reddit_profiles.json 失败: {e}")
+
+    twitter_profile_path = os.path.join(sim_dir, "twitter_profiles.csv")
+    if os.path.exists(twitter_profile_path):
+        try:
+            import csv as csv_module
+            with open(twitter_profile_path, 'r', encoding='utf-8') as f:
+                reader = csv_module.DictReader(f)
+                for row in reader:
+                    profiles.append({
+                        "realname": row.get("name", ""),
+                        "username": row.get("username", ""),
+                        "bio": row.get("description", ""),
+                        "persona": row.get("user_char", ""),
+                        "profession": row.get("profession", "未知")
+                    })
+            logger.info(f"从 twitter_profiles.csv 加载了 {len(profiles)} 个人设")
+            return profiles
+        except Exception as e:
+            logger.warning(f"读取 twitter_profiles.csv 失败: {e}")
+
+    return profiles
+
+
+def offline_interview_agents_batch(
+    simulation_id: str,
+    interviews: List[Dict[str, Any]],
+    platform: str = None
+) -> Dict[str, Any]:
+    """
+    离线采访模式 - 不依赖运行中的模拟环境
+
+    从 Agent Profiles 文件加载人设数据，通过 LLM 模拟 Agent 回答问题
+
+    Args:
+        simulation_id: 模拟ID
+        interviews: 采访列表
+        platform: 默认平台
+
+    Returns:
+        采访结果
+    """
+    from ..utils.llm_client import LLMClient
+
+    # 加载 Agent Profiles
+    profiles = _load_agent_profiles(simulation_id)
+    if not profiles:
+        logger.error(f"未找到 Agent Profiles: simulation_id={simulation_id}")
+        return {
+            "success": False,
+            "interviews_count": len(interviews),
+            "error": "未找到 Agent 人设数据，请先生成 Agent 人设",
+            "timestamp": datetime.now().isoformat()
+        }
+
+    logger.info(f"离线采访模式：使用 {len(profiles)} 个 Agent 人设")
+
+    # 创建 LLM 客户端
+    try:
+        llm_client = LLMClient()
+    except ValueError as e:
+        logger.error(f"LLM 客户端初始化失败: {e}")
+        return {
+            "success": False,
+            "interviews_count": len(interviews),
+            "error": f"LLM 配置错误: {str(e)}",
+            "timestamp": datetime.now().isoformat()
+        }
+
+    # 构建结果字典
+    results = {}
+    errors = []
+
+    for interview in interviews:
+        agent_id = interview.get("agent_id")
+        prompt = interview.get("prompt", "")
+        item_platform = interview.get("platform", platform)
+
+        # 查找对应的 Agent
+        agent = None
+        if agent_id is not None and agent_id < len(profiles):
+            agent = profiles[agent_id]
+
+        if not agent:
+            errors.append(f"Agent {agent_id} 未找到")
+            logger.warning(f"Agent {agent_id} 未找到（共 {len(profiles)} 个 Agent）")
+            continue
+
+        # 构建 LLM 提示词
+        agent_name = agent.get("username", agent.get("realname", f"Agent_{agent_id}"))
+        agent_bio = agent.get("bio", "")
+        agent_profession = agent.get("profession", "未知")
+        agent_persona = agent.get("persona", agent.get("user_char", ""))
+
+        # 根据平台生成系统提示
+        platform_name = item_platform if item_platform else "双平台"
+        system_prompt = (
+            f"你是模拟世界中的角色 '{agent_name}'。"
+            f"你的职业是 {agent_profession}。"
+            f"{f'你活跃在{platform_name}平台。' if platform_name != '双平台' else '你在模拟世界中活动。'}"
+        )
+
+        if agent_bio:
+            system_prompt += f"\n\n你的简介：{agent_bio}"
+
+        if agent_persona:
+            system_prompt += f"\n\n你的人设详细描述：{agent_persona[:500]}"  # 截断避免过长
+
+        system_prompt += (
+            "\n\n请以上述人设为基础，用角色的口吻直接回答问题。"
+            "回答要自然、符合角色性格，不要暴露你是AI。"
+            "用中文回答（除非问题是英文的）。\n\n问题："
+        )
+
+        try:
+            response = llm_client.chat(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.8,
+                max_tokens=1024
+            )
+
+            # 构建结果
+            platform_key = item_platform if item_platform else "both"
+            result_key = f"{platform_key}_{agent_id}"
+            results[result_key] = {
+                "agent_id": agent_id,
+                "response": response,
+                "platform": platform_key,
+                "username": agent_name,
+                "mode": "offline"
+            }
+            logger.info(f"离线采访 Agent {agent_id} ({agent_name}) 完成")
+
+        except Exception as e:
+            errors.append(f"Agent {agent_id} 采访失败: {str(e)}")
+            logger.error(f"离线采访 Agent {agent_id} 失败: {e}")
+
+    timestamp = datetime.now().isoformat()
+    logger.info(f"离线采访完成: 成功 {len(results)} 个，失败 {len(errors)} 个")
+
+    return {
+        "success": len(results) > 0,
+        "interviews_count": len(results),
+        "result": {
+            "interviews_count": len(results),
+            "results": results
+        },
+        "errors": errors if errors else None,
+        "mode": "offline",
+        "timestamp": timestamp
+    }
+
+
 # ============== 实体读取接口 ==============
 
 @simulation_bp.route('/entities/<graph_id>', methods=['GET'])
@@ -57,18 +239,12 @@ def get_graph_entities(graph_id: str):
         enrich: 是否获取相关边信息（默认true）
     """
     try:
-        if not Config.ZEP_API_KEY:
-            return jsonify({
-                "success": False,
-                "error": t('api.zepApiKeyMissing')
-            }), 500
-        
         entity_types_str = request.args.get('entity_types', '')
         entity_types = [t.strip() for t in entity_types_str.split(',') if t.strip()] if entity_types_str else None
         enrich = request.args.get('enrich', 'true').lower() == 'true'
-        
+
         logger.info(f"获取图谱实体: graph_id={graph_id}, entity_types={entity_types}, enrich={enrich}")
-        
+
         reader = ZepEntityReader()
         result = reader.filter_defined_entities(
             graph_id=graph_id,
@@ -94,12 +270,6 @@ def get_graph_entities(graph_id: str):
 def get_entity_detail(graph_id: str, entity_uuid: str):
     """获取单个实体的详细信息"""
     try:
-        if not Config.ZEP_API_KEY:
-            return jsonify({
-                "success": False,
-                "error": t('api.zepApiKeyMissing')
-            }), 500
-        
         reader = ZepEntityReader()
         entity = reader.get_entity_with_context(graph_id, entity_uuid)
         
@@ -127,14 +297,8 @@ def get_entity_detail(graph_id: str, entity_uuid: str):
 def get_entities_by_type(graph_id: str, entity_type: str):
     """获取指定类型的所有实体"""
     try:
-        if not Config.ZEP_API_KEY:
-            return jsonify({
-                "success": False,
-                "error": t('api.zepApiKeyMissing')
-            }), 500
-        
         enrich = request.args.get('enrich', 'true').lower() == 'true'
-        
+
         reader = ZepEntityReader()
         entities = reader.get_entities_by_type(
             graph_id=graph_id,
@@ -308,7 +472,7 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
         # - completed: 运行完成，说明准备早就完成了
         # - stopped: 已停止，说明准备早就完成了
         # - failed: 运行失败（但准备是完成的）
-        prepared_statuses = ["ready", "preparing", "running", "completed", "stopped", "failed"]
+        prepared_statuses = ["ready", "preparing", "running", "completed", "stopped", "failed", "paused"]
         if status in prepared_statuses and config_generated:
             # 获取文件统计信息
             profiles_file = os.path.join(simulation_dir, "reddit_profiles.json")
@@ -381,7 +545,7 @@ def prepare_simulation():
             "simulation_id": "sim_xxxx",                   // 必填，模拟ID
             "entity_types": ["Student", "PublicFigure"],  // 可选，指定实体类型
             "use_llm_for_profiles": true,                 // 可选，是否用LLM生成人设
-            "parallel_profile_count": 5,                  // 可选，并行生成人设数量，默认5
+            "parallel_profile_count": 15,                  // 可选，并行生成人设数量，默认15（可通过环境变量OASIS_DEFAULT_PARALLEL_PROFILE_COUNT覆盖）
             "force_regenerate": false                     // 可选，强制重新生成，默认false
         }
     
@@ -466,7 +630,7 @@ def prepare_simulation():
         
         entity_types_list = data.get('entity_types')
         use_llm_for_profiles = data.get('use_llm_for_profiles', True)
-        parallel_profile_count = data.get('parallel_profile_count', 5)
+        parallel_profile_count = data.get('parallel_profile_count', Config.OASIS_DEFAULT_PARALLEL_PROFILE_COUNT)
         
         # ========== 同步获取实体数量（在后台任务启动前） ==========
         # 这样前端在调用prepare后立即就能获取到预期Agent总数
@@ -984,6 +1148,78 @@ def get_simulation_history():
             "success": False,
             "error": str(e),
             "traceback": traceback.format_exc()
+        }), 500
+
+
+@simulation_bp.route('/<simulation_id>', methods=['DELETE'])
+def delete_simulation(simulation_id: str):
+    """
+    删除模拟（彻底删除所有相关数据）
+
+    删除内容：
+    1. 模拟状态文件（state.json）
+    2. 模拟运行状态（run_state.json）
+    3. 模拟数据目录（profiles, configs, reports 等）
+    4. 关联的报告文件
+    """
+    try:
+        import shutil
+        from ..services.report_agent import ReportManager
+
+        manager = SimulationManager()
+        sim_state = manager.get_simulation(simulation_id)
+
+        if not sim_state:
+            return jsonify({
+                "success": False,
+                "error": t('api.simulationNotFound', id=simulation_id)
+            }), 404
+
+        # 检查是否有正在运行的模拟
+        run_state = SimulationRunner.get_run_state(simulation_id)
+        if run_state and run_state.runner_status == RunnerStatus.RUNNING:
+            return jsonify({
+                "success": False,
+                "error": "模拟正在运行中，请先停止后再删除"
+            }), 400
+
+        # 直接构建目录路径（避免 _get_simulation_dir 创建空目录）
+        sim_dir = os.path.join(manager.SIMULATION_DATA_DIR, simulation_id)
+
+        # 删除报告（如果有）
+        report_id = _get_report_id_for_simulation(simulation_id)
+        if report_id:
+            try:
+                ReportManager.delete_report(report_id)
+                logger.info(f"已删除报告: {report_id}")
+            except Exception as e:
+                logger.warning(f"删除报告失败: {e}")
+
+        # 删除整个模拟数据目录
+        if os.path.exists(sim_dir):
+            shutil.rmtree(sim_dir)
+            logger.info(f"已删除模拟数据目录: {sim_dir}")
+
+        # 清理可能残留的空目录
+        if os.path.exists(sim_dir):
+            try:
+                os.rmdir(sim_dir)
+                logger.info(f"已清理空目录: {sim_dir}")
+            except OSError:
+                pass  # 目录非空或无法删除，忽略
+
+        return jsonify({
+            "success": True,
+            "message": f"模拟已删除: {simulation_id}"
+        })
+
+    except Exception as e:
+        logger.error(f"删除模拟失败: {simulation_id}, error={str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({
+            "success": False,
+            "error": str(e)
         }), 500
 
 
@@ -2360,11 +2596,7 @@ def interview_agents_batch():
                 }), 400
 
         # 检查环境状态
-        if not SimulationRunner.check_env_alive(simulation_id):
-            return jsonify({
-                "success": False,
-                "error": t('api.envNotRunning')
-            }), 400
+        env_alive = SimulationRunner.check_env_alive(simulation_id)
 
         # 优化每个采访项的prompt，添加前缀避免Agent调用工具
         optimized_interviews = []
@@ -2372,6 +2604,20 @@ def interview_agents_batch():
             optimized_interview = interview.copy()
             optimized_interview['prompt'] = optimize_interview_prompt(interview.get('prompt', ''))
             optimized_interviews.append(optimized_interview)
+
+        # 环境未运行时使用离线采访模式
+        if not env_alive:
+            logger.info(f"模拟环境未运行，切换到离线采访模式: simulation_id={simulation_id}")
+            result = offline_interview_agents_batch(
+                simulation_id=simulation_id,
+                interviews=optimized_interviews,
+                platform=platform
+            )
+            return jsonify({
+                "success": result.get("success", False),
+                "data": result,
+                "mode": "offline"  # 标记为离线模式
+            })
 
         result = SimulationRunner.interview_agents_batch(
             simulation_id=simulation_id,
@@ -2382,7 +2628,8 @@ def interview_agents_batch():
 
         return jsonify({
             "success": result.get("success", False),
-            "data": result
+            "data": result,
+            "mode": "online"  # 标记为在线模式
         })
 
     except ValueError as e:
@@ -2709,6 +2956,248 @@ def close_simulation_env():
         
     except Exception as e:
         logger.error(f"关闭环境失败: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+# ==================== 快照 API ====================
+
+@simulation_bp.route('/<simulation_id>/snapshot/create', methods=['POST'])
+def create_simulation_snapshot(simulation_id):
+    """
+    创建模拟快照
+
+    完整保存当前模拟的运行状态，包括：
+    - 运行状态（轮次、进度、动作等）
+    - 模拟配置（Agent 配置、时代变量等）
+    - 动作记录（actions.jsonl）
+    - 模拟数据库（reddit_simulation.db, twitter_simulation.db）
+
+    请求（JSON）：
+        {
+            "simulation_id": "sim_xxxx",           // 可选，从 URL 参数获取
+            "snapshot_name": "snapshot_name"       // 可选，默认使用时间戳
+        }
+
+    返回：
+        {
+            "success": true,
+            "data": {
+                "snapshot_name": "snapshot_20260612_090000",
+                "snapshot_dir": "/path/to/snapshots/snapshot_xxx",
+                "files": ["run_state.json", "simulation_config.json", ...],
+                "run_state": {...}  // 运行状态快照
+            }
+        }
+    """
+    try:
+        data = request.get_json() or {}
+        snapshot_name = data.get('snapshot_name')
+
+        # 如果 URL 中没有 simulation_id，从请求体获取
+        if not simulation_id:
+            simulation_id = data.get('simulation_id')
+
+        if not simulation_id:
+            return jsonify({
+                "success": False,
+                "error": t('api.requireSimulationId')
+            }), 400
+
+        result = SimulationRunner.create_snapshot(
+            simulation_id=simulation_id,
+            snapshot_name=snapshot_name
+        )
+
+        if result.get("success"):
+            return jsonify({
+                "success": True,
+                "data": {
+                    "snapshot_name": result["snapshot_name"],
+                    "snapshot_dir": result["snapshot_dir"],
+                    "files": result["files"],
+                    "run_state": result.get("run_state"),
+                }
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "error": result.get("error", "创建快照失败")
+            }), 400
+
+    except Exception as e:
+        logger.error(f"创建快照失败: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@simulation_bp.route('/<simulation_id>/snapshot/list', methods=['GET'])
+def list_simulation_snapshots(simulation_id):
+    """
+    列出模拟的所有快照
+
+    返回该模拟的所有已保存快照列表。
+
+    返回：
+        {
+            "success": true,
+            "data": {
+                "snapshots": [
+                    {
+                        "snapshot_name": "snapshot_20260612_090000",
+                        "simulation_id": "sim_xxxx",
+                        "created_at": "2026-06-12T09:00:00",
+                        "files": ["run_state.json", ...],
+                        "run_state": {...}
+                    },
+                    ...
+                ]
+            }
+        }
+    """
+    try:
+        if not simulation_id:
+            return jsonify({
+                "success": False,
+                "error": t('api.requireSimulationId')
+            }), 400
+
+        result = SimulationRunner.list_snapshots(simulation_id=simulation_id)
+
+        return jsonify({
+            "success": True,
+            "data": {
+                "snapshots": result.get("snapshots", [])
+            }
+        })
+
+    except Exception as e:
+        logger.error(f"列出快照失败: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@simulation_bp.route('/<simulation_id>/snapshot/restore', methods=['POST'])
+def restore_simulation_snapshot(simulation_id):
+    """
+    恢复模拟快照
+
+    从指定快照恢复完整的模拟状态。
+
+    请求（JSON）：
+        {
+            "simulation_id": "sim_xxxx",           // 可选，从 URL 参数获取
+            "snapshot_name": "snapshot_xxx"        // 必填，快照名称
+        }
+
+    返回：
+        {
+            "success": true,
+            "data": {
+                "snapshot_name": "snapshot_xxx",
+                "simulation_id": "sim_xxxx",
+                "restored_files": ["run_state.json", ...]
+            }
+        }
+    """
+    try:
+        data = request.get_json() or {}
+        snapshot_name = data.get('snapshot_name')
+
+        # 如果 URL 中没有 simulation_id，从请求体获取
+        if not simulation_id:
+            simulation_id = data.get('simulation_id')
+
+        if not simulation_id:
+            return jsonify({
+                "success": False,
+                "error": t('api.requireSimulationId')
+            }), 400
+
+        if not snapshot_name:
+            return jsonify({
+                "success": False,
+                "error": "请指定快照名称 snapshot_name"
+            }), 400
+
+        result = SimulationRunner.restore_snapshot(
+            simulation_id=simulation_id,
+            snapshot_name=snapshot_name
+        )
+
+        if result.get("success"):
+            return jsonify({
+                "success": True,
+                "data": {
+                    "snapshot_name": result["snapshot_name"],
+                    "simulation_id": result["simulation_id"],
+                    "restored_files": result.get("restored_files", []),
+                }
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "error": result.get("error", "恢复快照失败")
+            }), 400
+
+    except Exception as e:
+        logger.error(f"恢复快照失败: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@simulation_bp.route('/<simulation_id>/snapshot/<snapshot_name>', methods=['DELETE'])
+def delete_simulation_snapshot(simulation_id, snapshot_name):
+    """
+    删除指定快照
+
+    返回：
+        {
+            "success": true,
+            "data": {
+                "snapshot_name": "snapshot_xxx"
+            }
+        }
+    """
+    try:
+        if not simulation_id:
+            return jsonify({
+                "success": False,
+                "error": t('api.requireSimulationId')
+            }), 400
+
+        result = SimulationRunner.delete_snapshot(
+            simulation_id=simulation_id,
+            snapshot_name=snapshot_name
+        )
+
+        if result.get("success"):
+            return jsonify({
+                "success": True,
+                "data": {
+                    "snapshot_name": result["snapshot_name"]
+                }
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "error": result.get("error", "删除快照失败")
+            }), 400
+
+    except Exception as e:
+        logger.error(f"删除快照失败: {str(e)}")
         return jsonify({
             "success": False,
             "error": str(e),
