@@ -10,6 +10,7 @@
 4. 生成平台配置
 """
 
+import concurrent.futures
 import json
 import math
 from typing import Dict, Any, List, Optional, Callable
@@ -305,24 +306,37 @@ class SimulationConfigGenerator:
         event_config = self._parse_event_config(event_config_result)
         reasoning_parts.append(f"{t('progress.eventConfigLabel')}: {event_config_result.get('reasoning', t('common.success'))}")
         
-        # ========== 步骤3-N: 分批生成Agent配置 ==========
+        # ========== 步骤3-N: 分批生成Agent配置（并行） ==========
         all_agent_configs = []
+        batch_tasks = []
         for batch_idx in range(num_batches):
             start_idx = batch_idx * self.AGENTS_PER_BATCH
             end_idx = min(start_idx + self.AGENTS_PER_BATCH, len(entities))
-            batch_entities = entities[start_idx:end_idx]
-            
+            batch_tasks.append({
+                'batch_idx': batch_idx,
+                'start_idx': start_idx,
+                'end_idx': end_idx,
+                'entities': entities[start_idx:end_idx],
+            })
+
+        # 并行生成所有批次
+        def generate_single_batch(task):
             report_progress(
-                3 + batch_idx,
-                t('progress.generatingAgentConfig', start=start_idx + 1, end=end_idx, total=len(entities))
+                3 + task['batch_idx'],
+                t('progress.generatingAgentConfig', start=task['start_idx'] + 1, end=task['end_idx'], total=len(entities))
             )
-            
-            batch_configs = self._generate_agent_configs_batch(
+            return self._generate_agent_configs_batch(
                 context=context,
-                entities=batch_entities,
-                start_idx=start_idx,
+                entities=task['entities'],
+                start_idx=task['start_idx'],
                 simulation_requirement=simulation_requirement
             )
+
+        max_workers = min(5, len(batch_tasks))  # 最多 5 个 LLM 并发调用
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            results = list(executor.map(generate_single_batch, batch_tasks))
+
+        for batch_configs in results:
             all_agent_configs.extend(batch_configs)
         
         reasoning_parts.append(t('progress.agentConfigResult', count=len(all_agent_configs)))
