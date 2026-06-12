@@ -628,6 +628,8 @@ const fetchRunStatus = async () => {
         if (data.runner_status === 'failed') {
           addLog(t('log.simFailed', { error: data.error || 'Unknown error' }))
           emit('update-status', 'failed')
+          // 失败时自动创建快照
+          await autoCreateSnapshotOnFail(data)
         } else {
           addLog(t('log.simCompleted'))
           emit('update-status', 'completed')
@@ -807,6 +809,28 @@ onUnmounted(() => {
 })
 
 // ==================== 快照相关方法 ====================
+
+// 失败时自动创建快照
+const autoCreateSnapshotOnFail = async (failData) => {
+  if (!props.simulationId) return
+
+  const currentRound = failData.current_round || 0
+  const totalRound = failData.total_rounds || '?'
+  const name = `fail_R${currentRound}_${totalRound}`
+
+  addLog(t('log.autoSnapshotCreating', { round: currentRound, total: totalRound }))
+
+  try {
+    const res = await createSnapshot(props.simulationId, { snapshot_name: name })
+    if (res.success) {
+      addLog(t('log.autoSnapshotCreated', { name: res.data.snapshot_name }))
+    } else {
+      addLog(t('log.autoSnapshotFailed', { error: res.error || t('common.unknownError') }))
+    }
+  } catch (err) {
+    addLog(t('log.autoSnapshotException', { error: err.message }))
+  }
+}
 
 // 创建快照
 const handleCreateSnapshot = async () => {

@@ -620,7 +620,11 @@
     "snapshotDeleted": "✓ 快照已删除：{name}",
     "snapshotDeleteFailed": "✗ 快照删除失败：{error}",
     "snapshotDeleteException": "✗ 快照删除异常：{error}",
-    "snapshotDeleteConfirm": "确定要删除快照'{name}'吗？\n此操作不可撤销。"
+    "snapshotDeleteConfirm": "确定要删除快照'{name}'吗？\n此操作不可撤销。",
+    "autoSnapshotCreating": "自动创建失败快照：R{round}/{total}",
+    "autoSnapshotCreated": "✓ 自动快照已创建：{name}",
+    "autoSnapshotFailed": "✗ 自动快照创建失败：{error}",
+    "autoSnapshotException": "✗ 自动快照异常：{error}"
   },
   "report": {
     "taskStarted": "报告生成任务开始",

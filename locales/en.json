@@ -620,7 +620,11 @@
     "snapshotDeleted": "✓ Snapshot deleted: {name}",
     "snapshotDeleteFailed": "✗ Snapshot deletion failed: {error}",
     "snapshotDeleteException": "✗ Snapshot deletion error: {error}",
-    "snapshotDeleteConfirm": "Delete snapshot '{name}'?\nThis action cannot be undone."
+    "snapshotDeleteConfirm": "Delete snapshot '{name}'?\nThis action cannot be undone.",
+    "autoSnapshotCreating": "Auto-creating failure snapshot: R{round}/{total}",
+    "autoSnapshotCreated": "✓ Auto-snapshot created: {name}",
+    "autoSnapshotFailed": "✗ Auto-snapshot failed: {error}",
+    "autoSnapshotException": "✗ Auto-snapshot error: {error}"
   },
   "report": {
     "taskStarted": "Report generation task started",
