@@ -308,7 +308,37 @@ class SimulationRunner:
             json.dump(data, f, ensure_ascii=False, indent=2)
         
         cls._run_states[state.simulation_id] = state
-    
+
+    @classmethod
+    def _sync_manager_state(cls, simulation_id: str, run_state: SimulationRunState):
+        """
+        将 SimulationRunner 的运行状态同步回 SimulationManager 的 state.json。
+        解决模拟进程结束/失败后 state.json 仍显示 running 的问题。
+        """
+        try:
+            from .simulation_manager import SimulationManager, SimulationStatus
+
+            manager = SimulationManager()
+            sim_state = manager.get_simulation(simulation_id)
+            if not sim_state:
+                return
+
+            # 根据 runner_status 映射到 SimulationStatus
+            status_map = {
+                RunnerStatus.COMPLETED: SimulationStatus.COMPLETED,
+                RunnerStatus.FAILED: SimulationStatus.FAILED,
+                RunnerStatus.STOPPED: SimulationStatus.STOPPED,
+            }
+            new_status = status_map.get(run_state.runner_status)
+            if new_status:
+                sim_state.status = new_status
+                sim_state.current_round = run_state.current_round
+                sim_state.error = run_state.error
+                manager._save_simulation_state(sim_state)
+                logger.info(f"已同步 state.json: {simulation_id} -> {new_status.value}")
+        except Exception as e:
+            logger.error(f"同步 state.json 失败: {simulation_id}, error={e}")
+
     @classmethod
     def start_simulation(
         cls,
@@ -483,36 +513,49 @@ class SimulationRunner:
         """监控模拟进程，解析动作日志"""
         set_locale(locale)
         sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
-        
+
         # 新的日志结构：分平台的动作日志
         twitter_actions_log = os.path.join(sim_dir, "twitter", "actions.jsonl")
         reddit_actions_log = os.path.join(sim_dir, "reddit", "actions.jsonl")
-        
+
         process = cls._processes.get(simulation_id)
         state = cls.get_run_state(simulation_id)
-        
+
         if not process or not state:
             return
-        
+
         twitter_position = 0
         reddit_position = 0
-        
+        last_save_time = 0  # 上次保存时间戳
+        save_interval = 5  # 至少间隔 5 秒才保存
+
         try:
             while process.poll() is None:  # 进程仍在运行
+                changed = False
                 # 读取 Twitter 动作日志
                 if os.path.exists(twitter_actions_log):
-                    twitter_position = cls._read_action_log(
+                    new_position = cls._read_action_log(
                         twitter_actions_log, twitter_position, state, "twitter"
                     )
-                
+                    if new_position != twitter_position:
+                        twitter_position = new_position
+                        changed = True
+
                 # 读取 Reddit 动作日志
                 if os.path.exists(reddit_actions_log):
-                    reddit_position = cls._read_action_log(
+                    new_position = cls._read_action_log(
                         reddit_actions_log, reddit_position, state, "reddit"
                     )
-                
-                # 更新状态
-                cls._save_run_state(state)
+                    if new_position != reddit_position:
+                        reddit_position = new_position
+                        changed = True
+
+                # 只在数据有变化时保存，且间隔至少 5 秒（减少磁盘 I/O）
+                current_time = time.time()
+                if (changed or current_time - last_save_time >= save_interval):
+                    cls._save_run_state(state)
+                    last_save_time = current_time
+
                 time.sleep(2)
             
             # 进程结束后，最后读取一次日志
@@ -545,12 +588,18 @@ class SimulationRunner:
             state.twitter_running = False
             state.reddit_running = False
             cls._save_run_state(state)
-            
+
+            # 同步更新 SimulationManager 的 state.json
+            cls._sync_manager_state(simulation_id, state)
+
         except Exception as e:
             logger.error(f"监控线程异常: {simulation_id}, error={str(e)}")
             state.runner_status = RunnerStatus.FAILED
             state.error = str(e)
             cls._save_run_state(state)
+
+            # 同步更新 SimulationManager 的 state.json
+            cls._sync_manager_state(simulation_id, state)
         
         finally:
             # 停止图谱记忆更新器
@@ -1759,10 +1808,294 @@ class SimulationRunner:
         
         # 按时间降序排序
         results.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
-        
+
         # 如果查询了多个平台，限制总数
         if len(platforms) > 1 and len(results) > limit:
             results = results[:limit]
-        
+
         return results
+
+    # ==================== 快照功能 ====================
+
+    @classmethod
+    def create_snapshot(cls, simulation_id: str, snapshot_name: Optional[str] = None) -> Dict[str, Any]:
+        """
+        创建模拟快照（完整保存当前运行状态）
+
+        快照包含：
+        - run_state.json — 运行状态（轮次、进度、动作等）
+        - simulation_config.json — 模拟配置（Agent 配置、时代变量等）
+        - reddit/actions.jsonl / twitter/actions.jsonl — 所有动作记录
+        - reddit_simulation.db / twitter_simulation.db — 模拟数据库
+        - 图谱文件（如果存在）
+
+        Args:
+            simulation_id: 模拟ID
+            snapshot_name: 快照名称（可选，默认使用时间戳）
+
+        Returns:
+            快照信息（路径、名称、时间戳等）
+        """
+        import shutil
+        from datetime import datetime
+
+        sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
+
+        if not os.path.exists(sim_dir):
+            return {
+                "success": False,
+                "error": f"模拟目录不存在: {simulation_id}"
+            }
+
+        # 生成快照名称
+        if not snapshot_name:
+            snapshot_name = f"snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        snapshot_dir = os.path.join(sim_dir, "snapshots", snapshot_name)
+
+        # 如果快照目录已存在，删除后重建
+        if os.path.exists(snapshot_dir):
+            shutil.rmtree(snapshot_dir)
+
+        # 创建快照目录
+        os.makedirs(snapshot_dir, exist_ok=True)
+
+        # 文件清单：需要保存的关键文件
+        files_to_snapshot = [
+            "run_state.json",
+            "simulation_config.json",
+            "state.json",
+        ]
+
+        # 平台目录：actions.jsonl
+        dirs_to_snapshot = ["reddit", "twitter"]
+
+        snapshot_files = []
+        errors = []
+
+        # 保存文件
+        for filename in files_to_snapshot:
+            src = os.path.join(sim_dir, filename)
+            if os.path.exists(src):
+                dst = os.path.join(snapshot_dir, filename)
+                try:
+                    shutil.copy2(src, dst)
+                    snapshot_files.append(filename)
+                except Exception as e:
+                    errors.append(f"复制 {filename} 失败: {str(e)}")
+
+        # 保存平台目录
+        for dir_name in dirs_to_snapshot:
+            src_dir = os.path.join(sim_dir, dir_name)
+            if os.path.exists(src_dir):
+                dst_dir = os.path.join(snapshot_dir, dir_name)
+                try:
+                    # 只复制 actions.jsonl 和 profiles.json
+                    for file_in_dir in ["actions.jsonl", "profiles.json"]:
+                        src_file = os.path.join(src_dir, file_in_dir)
+                        if os.path.exists(src_file):
+                            dst_file = os.path.join(dst_dir, file_in_dir)
+                            os.makedirs(os.path.dirname(dst_file), exist_ok=True)
+                            shutil.copy2(src_file, dst_file)
+                            snapshot_files.append(f"{dir_name}/{file_in_dir}")
+                except Exception as e:
+                    errors.append(f"复制 {dir_name} 目录失败: {str(e)}")
+
+        # 保存数据库文件
+        db_files = [
+            "reddit_simulation.db",
+            "reddit_simulation_*.db",
+            "twitter_simulation.db",
+            "twitter_simulation_*.db",
+        ]
+
+        import glob
+        for db_pattern in db_files:
+            matching_files = glob.glob(os.path.join(sim_dir, db_pattern))
+            for db_path in matching_files:
+                db_name = os.path.basename(db_path)
+                dst = os.path.join(snapshot_dir, db_name)
+                try:
+                    shutil.copy2(db_path, dst)
+                    snapshot_files.append(db_name)
+                except Exception as e:
+                    errors.append(f"复制 {db_name} 失败: {str(e)}")
+
+        # 保存快照元数据
+        metadata = {
+            "snapshot_name": snapshot_name,
+            "snapshot_dir": snapshot_dir,
+            "simulation_id": simulation_id,
+            "created_at": datetime.now().isoformat(),
+            "files": snapshot_files,
+            "run_state": None,
+        }
+
+        # 加载运行状态
+        run_state = cls.get_run_state(simulation_id)
+        if run_state:
+            metadata["run_state"] = run_state.to_dict()
+
+        metadata_path = os.path.join(snapshot_dir, "metadata.json")
+        with open(metadata_path, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+        return {
+            "success": len(errors) == 0,
+            "snapshot_name": snapshot_name,
+            "snapshot_dir": snapshot_dir,
+            "simulation_id": simulation_id,
+            "files": snapshot_files,
+            "errors": errors if errors else None,
+            "run_state": metadata["run_state"],
+        }
+
+    @classmethod
+    def list_snapshots(cls, simulation_id: str) -> Dict[str, Any]:
+        """
+        列出模拟的所有快照
+
+        Args:
+            simulation_id: 模拟ID
+
+        Returns:
+            快照列表
+        """
+        sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
+        snapshots_dir = os.path.join(sim_dir, "snapshots")
+
+        if not os.path.exists(snapshots_dir):
+            return {
+                "success": True,
+                "snapshots": []
+            }
+
+        snapshots = []
+        for snapshot_name in sorted(os.listdir(snapshots_dir)):
+            snapshot_dir = os.path.join(snapshots_dir, snapshot_name)
+            if not os.path.isdir(snapshot_dir):
+                continue
+
+            metadata_path = os.path.join(snapshot_dir, "metadata.json")
+            if os.path.exists(metadata_path):
+                try:
+                    with open(metadata_path, 'r', encoding='utf-8') as f:
+                        metadata = json.load(f)
+                    snapshots.append(metadata)
+                except Exception as e:
+                    logger.error(f"读取快照元数据失败: {snapshot_name}, error: {e}")
+
+        return {
+            "success": True,
+            "snapshots": snapshots
+        }
+
+    @classmethod
+    def restore_snapshot(cls, simulation_id: str, snapshot_name: str) -> Dict[str, Any]:
+        """
+        恢复模拟快照
+
+        从快照恢复完整的模拟状态：
+        - 恢复 run_state.json（运行状态）
+        - 恢复 simulation_config.json（模拟配置）
+        - 恢复 actions.jsonl（动作记录）
+        - 恢复数据库文件
+
+        Args:
+            simulation_id: 模拟ID
+            snapshot_name: 快照名称
+
+        Returns:
+            恢复结果
+        """
+        import shutil
+
+        sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
+        snapshot_dir = os.path.join(sim_dir, "snapshots", snapshot_name)
+
+        if not os.path.exists(snapshot_dir):
+            return {
+                "success": False,
+                "error": f"快照目录不存在: {snapshot_name}"
+            }
+
+        # 读取快照元数据
+        metadata_path = os.path.join(snapshot_dir, "metadata.json")
+        if not os.path.exists(metadata_path):
+            return {
+                "success": False,
+                "error": "快照元数据不存在"
+            }
+
+        with open(metadata_path, 'r', encoding='utf-8') as f:
+            metadata = json.load(f)
+
+        restored_files = []
+        errors = []
+
+        # 恢复文件到模拟目录
+        for filename in metadata.get("files", []):
+            src = os.path.join(snapshot_dir, filename)
+            dst = os.path.join(sim_dir, filename)
+
+            # 创建目标目录（如果需要）
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+
+            try:
+                shutil.copy2(src, dst)
+                restored_files.append(filename)
+            except Exception as e:
+                errors.append(f"恢复 {filename} 失败: {str(e)}")
+
+        # 清除内存中的运行状态（确保下次查询时从文件重新加载）
+        if simulation_id in cls._run_states:
+            del cls._run_states[simulation_id]
+
+        logger.info(f"恢复快照完成: {simulation_id}/{snapshot_name}, 恢复文件: {len(restored_files)}")
+
+        return {
+            "success": len(errors) == 0,
+            "snapshot_name": snapshot_name,
+            "simulation_id": simulation_id,
+            "restored_files": restored_files,
+            "errors": errors if errors else None,
+        }
+
+    @classmethod
+    def delete_snapshot(cls, simulation_id: str, snapshot_name: str) -> Dict[str, Any]:
+        """
+        删除指定快照
+
+        Args:
+            simulation_id: 模拟ID
+            snapshot_name: 快照名称
+
+        Returns:
+            删除结果
+        """
+        import shutil
+
+        sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
+        snapshot_dir = os.path.join(sim_dir, "snapshots", snapshot_name)
+
+        if not os.path.exists(snapshot_dir):
+            return {
+                "success": False,
+                "error": f"快照不存在: {snapshot_name}"
+            }
+
+        try:
+            shutil.rmtree(snapshot_dir)
+            logger.info(f"删除快照完成: {simulation_id}/{snapshot_name}")
+            return {
+                "success": True,
+                "snapshot_name": snapshot_name,
+            }
+        except Exception as e:
+            logger.error(f"删除快照失败: {simulation_id}/{snapshot_name}, error: {e}")
+            return {
+                "success": False,
+                "error": f"删除失败: {str(e)}"
+            }
+
 
