@@ -91,7 +91,7 @@
       </div>
 
       <div class="action-controls">
-        <button 
+        <button
           class="action-btn primary"
           :disabled="phase !== 2 || isGeneratingReport"
           @click="handleNextStep"
@@ -99,6 +99,20 @@
           <span v-if="isGeneratingReport" class="loading-spinner-small"></span>
           {{ isGeneratingReport ? $t('step3.generatingReportBtn') : $t('step3.startGenerateReportBtn') }}
           <span v-if="!isGeneratingReport" class="arrow-icon">→</span>
+        </button>
+
+        <!-- 快照管理按钮 -->
+        <button
+          class="action-btn secondary"
+          @click="handleListSnapshots"
+          :title="$t('step3.manageSnapshots')"
+        >
+          <svg class="btn-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path>
+            <polyline points="17 21 17 13 7 13 7 21"></polyline>
+            <polyline points="7 3 7 8 15 8"></polyline>
+          </svg>
+          {{ $t('step3.snapshots') }}
         </button>
       </div>
     </div>
@@ -269,6 +283,83 @@
       </div>
     </div>
 
+    <!-- Snapshot Management Panel -->
+    <div v-if="showSnapshotPanel" class="snapshot-panel">
+      <div class="snapshot-panel-header">
+        <span class="snapshot-title">{{ $t('step3.snapshotPanelTitle') }}</span>
+        <button class="snapshot-close-btn" @click="showSnapshotPanel = false">×</button>
+      </div>
+
+      <!-- Create Snapshot Form -->
+      <div class="snapshot-create-section">
+        <div class="create-form">
+          <input
+            v-model="snapshotName"
+            :placeholder="$t('step3.snapshotNamePlaceholder')"
+            class="snapshot-name-input"
+            @keyup.enter="handleCreateSnapshot"
+          />
+          <button
+            class="create-snapshot-btn"
+            :disabled="isCreatingSnapshot || !props.simulationId"
+            @click="handleCreateSnapshot"
+          >
+            <span v-if="isCreatingSnapshot" class="loading-spinner-small"></span>
+            {{ $t('step3.createSnapshotBtn') }}
+          </button>
+        </div>
+        <p class="create-hint">{{ $t('step3.snapshotCreateHint') }}</p>
+      </div>
+
+      <!-- Snapshot List -->
+      <div class="snapshot-list-section" v-if="snapshots.length > 0">
+        <div class="snapshot-list-header">{{ $t('step3.snapshotListHeader') }} ({{ snapshots.length }})</div>
+        <div class="snapshot-list">
+          <div
+            v-for="snapshot in snapshots"
+            :key="snapshot.snapshot_name"
+            class="snapshot-item"
+          >
+            <div class="snapshot-info">
+              <div class="snapshot-name">{{ snapshot.snapshot_name }}</div>
+              <div class="snapshot-time">{{ snapshot.created_at }}</div>
+              <div class="snapshot-stats" v-if="snapshot.run_state">
+                <span class="stat-badge">
+                  {{ $t('step3.snapshotStatRound', { current: snapshot.run_state.current_round || 0, total: snapshot.run_state.total_rounds || 0 }) }}
+                </span>
+                <span class="stat-badge">
+                  {{ snapshot.run_state.total_actions_count || 0 }} {{ $t('step3.snapshotStatActions') }}
+                </span>
+              </div>
+            </div>
+            <div class="snapshot-actions">
+              <button
+                class="snapshot-action-btn restore"
+                :disabled="isRestoringSnapshot"
+                @click="handleRestoreSnapshot(snapshot)"
+                :title="$t('step3.restoreSnapshot')"
+              >
+                ↻
+              </button>
+              <button
+                class="snapshot-action-btn delete"
+                :disabled="isDeletingSnapshot"
+                @click="handleDeleteSnapshot(snapshot.snapshot_name)"
+                :title="$t('step3.deleteSnapshot')"
+              >
+                🗑
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Empty State -->
+      <div v-else class="snapshot-empty">
+        {{ $t('step3.snapshotEmpty') }}
+      </div>
+    </div>
+
     <!-- Bottom Info / Logs -->
     <div class="system-logs">
       <div class="log-header">
@@ -293,7 +384,11 @@ import {
   startSimulation,
   stopSimulation,
   getRunStatus,
-  getRunStatusDetail
+  getRunStatusDetail,
+  createSnapshot,
+  listSnapshots,
+  restoreSnapshot,
+  deleteSnapshot
 } from '../api/simulation'
 import { generateReport } from '../api/report'
 
@@ -325,6 +420,14 @@ const runStatus = ref({})
 const allActions = ref([]) // 所有动作（增量累积）
 const actionIds = ref(new Set()) // 用于去重的动作ID集合
 const scrollContainer = ref(null)
+
+// 快照相关状态
+const showSnapshotPanel = ref(false)
+const snapshots = ref([])
+const isCreatingSnapshot = ref(false)
+const isRestoringSnapshot = ref(false)
+const isDeletingSnapshot = ref(false)
+const snapshotName = ref('') // 用户输入的快照名称
 
 // Computed
 // 按时间顺序显示动作（最新的在最后面，即底部）
@@ -511,8 +614,8 @@ const fetchRunStatus = async () => {
         prevRedditRound.value = data.reddit_current_round
       }
       
-      // 检测模拟是否已完成（通过 runner_status 或平台完成状态判断）
-      const isCompleted = data.runner_status === 'completed' || data.runner_status === 'stopped'
+      // 检测模拟是否已完成/失败/停止（通过 runner_status 或平台完成状态判断）
+      const isCompleted = data.runner_status === 'completed' || data.runner_status === 'stopped' || data.runner_status === 'failed'
       
       // 额外检查：如果后端还没来得及更新 runner_status，但平台已经报告完成
       // 通过检测 twitter_completed 和 reddit_completed 状态判断
@@ -522,10 +625,15 @@ const fetchRunStatus = async () => {
         if (platformsCompleted && !isCompleted) {
           addLog(t('log.allPlatformsCompleted'))
         }
-        addLog(t('log.simCompleted'))
+        if (data.runner_status === 'failed') {
+          addLog(t('log.simFailed', { error: data.error || 'Unknown error' }))
+          emit('update-status', 'failed')
+        } else {
+          addLog(t('log.simCompleted'))
+          emit('update-status', 'completed')
+        }
         phase.value = 2
         stopPolling()
-        emit('update-status', 'completed')
       }
     }
   } catch (err) {
@@ -686,6 +794,119 @@ watch(() => props.systemLogs?.length, () => {
     }
   })
 })
+
+onMounted(() => {
+  addLog(t('log.step3Init'))
+  if (props.simulationId) {
+    doStartSimulation()
+  }
+})
+
+onUnmounted(() => {
+  stopPolling()
+})
+
+// ==================== 快照相关方法 ====================
+
+// 创建快照
+const handleCreateSnapshot = async () => {
+  if (!props.simulationId) {
+    addLog(t('log.snapshotNoSimId'))
+    return
+  }
+
+  const name = snapshotName.value.trim() || undefined
+  isCreatingSnapshot.value = true
+
+  addLog(t('log.snapshotCreating', { name: name || t('log.snapshotAuto') }))
+
+  try {
+    const res = await createSnapshot(props.simulationId, { snapshot_name: name })
+
+    if (res.success) {
+      addLog(t('log.snapshotCreated', { name: res.data.snapshot_name }))
+      snapshotName.value = ''
+      // 刷新快照列表
+      await handleListSnapshots()
+    } else {
+      addLog(t('log.snapshotCreateFailed', { error: res.error || t('common.unknownError') }))
+    }
+  } catch (err) {
+    addLog(t('log.snapshotCreateException', { error: err.message }))
+  } finally {
+    isCreatingSnapshot.value = false
+  }
+}
+
+// 列出快照
+const handleListSnapshots = async () => {
+  if (!props.simulationId) return
+
+  try {
+    const res = await listSnapshots(props.simulationId)
+
+    if (res.success) {
+      snapshots.value = res.data.snapshots || []
+      showSnapshotPanel.value = true
+    }
+  } catch (err) {
+    console.error('获取快照列表失败:', err)
+  }
+}
+
+// 恢复快照
+const handleRestoreSnapshot = async (snapshot) => {
+  if (!props.simulationId) return
+
+  const confirmed = confirm(t('log.snapshotRestoreConfirm', { name: snapshot.snapshot_name }))
+  if (!confirmed) return
+
+  isRestoringSnapshot.value = true
+  addLog(t('log.snapshotRestoring', { name: snapshot.snapshot_name }))
+
+  try {
+    const res = await restoreSnapshot(props.simulationId, { snapshot_name: snapshot.snapshot_name })
+
+    if (res.success) {
+      addLog(t('log.snapshotRestored', { name: res.data.snapshot_name }))
+      // 刷新运行状态
+      await fetchRunStatus()
+      showSnapshotPanel.value = false
+    } else {
+      addLog(t('log.snapshotRestoreFailed', { error: res.error || t('common.unknownError') }))
+    }
+  } catch (err) {
+    addLog(t('log.snapshotRestoreException', { error: err.message }))
+  } finally {
+    isRestoringSnapshot.value = false
+  }
+}
+
+// 删除快照
+const handleDeleteSnapshot = async (snapshotName) => {
+  if (!props.simulationId) return
+
+  const confirmed = confirm(t('log.snapshotDeleteConfirm', { name: snapshotName }))
+  if (!confirmed) return
+
+  isDeletingSnapshot.value = true
+
+  try {
+    const res = await deleteSnapshot(props.simulationId, snapshotName)
+
+    if (res.success) {
+      addLog(t('log.snapshotDeleted', { name: snapshotName }))
+      // 刷新快照列表
+      await handleListSnapshots()
+    } else {
+      addLog(t('log.snapshotDeleteFailed', { error: res.error || t('common.unknownError') }))
+    }
+  } catch (err) {
+    addLog(t('log.snapshotDeleteException', { error: err.message }))
+  } finally {
+    isDeletingSnapshot.value = false
+  }
+}
 
 onMounted(() => {
   addLog(t('log.step3Init'))
@@ -869,6 +1090,13 @@ onUnmounted(() => {
   color: #1A936F;
   display: flex;
   align-items: center;
+}
+
+/* Action Controls */
+.action-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
 
 /* Action Button */
@@ -1263,5 +1491,230 @@ onUnmounted(() => {
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
   margin-right: 6px;
+}
+
+/* ==================== 快照管理面板样式 ==================== */
+.snapshot-panel {
+  background: #F8F9FA;
+  border-top: 1px solid #E0E0E0;
+  padding: 16px 24px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.snapshot-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #DDD;
+}
+
+.snapshot-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #333;
+}
+
+.snapshot-close-btn {
+  background: none;
+  border: none;
+  font-size: 20px;
+  color: #999;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+}
+
+.snapshot-close-btn:hover {
+  color: #333;
+}
+
+.snapshot-create-section {
+  margin-bottom: 12px;
+}
+
+.create-form {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.snapshot-name-input {
+  flex: 1;
+  padding: 8px 12px;
+  border: 1px solid #DDD;
+  border-radius: 4px;
+  font-size: 13px;
+  font-family: 'JetBrains Mono', monospace;
+  background: #FFF;
+}
+
+.snapshot-name-input:focus {
+  outline: none;
+  border-color: #000;
+}
+
+.create-snapshot-btn {
+  padding: 8px 16px;
+  background: #000;
+  color: #FFF;
+  border: none;
+  border-radius: 4px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.create-snapshot-btn:hover:not(:disabled) {
+  background: #333;
+}
+
+.create-snapshot-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.create-hint {
+  font-size: 11px;
+  color: #888;
+  margin: 0;
+}
+
+.snapshot-list-section {
+  margin-top: 12px;
+}
+
+.snapshot-list-header {
+  font-size: 12px;
+  font-weight: 600;
+  color: #666;
+  margin-bottom: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.snapshot-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.snapshot-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 12px;
+  background: #FFF;
+  border: 1px solid #E0E0E0;
+  border-radius: 4px;
+  transition: all 0.2s;
+}
+
+.snapshot-item:hover {
+  border-color: #CCC;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+}
+
+.snapshot-info {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.snapshot-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: #333;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.snapshot-time {
+  font-size: 11px;
+  color: #888;
+}
+
+.snapshot-stats {
+  display: flex;
+  gap: 6px;
+}
+
+.stat-badge {
+  font-size: 10px;
+  padding: 2px 6px;
+  background: #F0F0F0;
+  color: #666;
+  border-radius: 2px;
+  font-weight: 500;
+}
+
+.snapshot-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.snapshot-action-btn {
+  background: none;
+  border: 1px solid #DDD;
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 14px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.snapshot-action-btn.restore {
+  color: #0066CC;
+  border-color: #0066CC;
+}
+
+.snapshot-action-btn.restore:hover:not(:disabled) {
+  background: #0066CC;
+  color: #FFF;
+}
+
+.snapshot-action-btn.delete {
+  color: #CC0000;
+  border-color: #CC0000;
+}
+
+.snapshot-action-btn.delete:hover:not(:disabled) {
+  background: #CC0000;
+  color: #FFF;
+}
+
+.snapshot-action-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.snapshot-empty {
+  text-align: center;
+  padding: 24px;
+  color: #999;
+  font-size: 13px;
+  font-style: italic;
+}
+
+.btn-icon {
+  display: inline-block;
+  vertical-align: middle;
+}
+
+.action-btn.secondary {
+  background: #FFF;
+  color: #333;
+  border: 1px solid #DDD;
+}
+
+.action-btn.secondary:hover:not(:disabled) {
+  background: #F5F5F5;
+  border-color: #CCC;
 }
 </style>
