@@ -825,7 +825,7 @@ const startPrepareSimulation = async () => {
 }
 
 const startPolling = () => {
-  pollTimer = setInterval(pollPrepareStatus, 2000)
+  pollTimer = setInterval(pollPrepareStatus, 3000)
 }
 
 const stopPolling = () => {

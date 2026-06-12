@@ -569,8 +569,35 @@ const handleStopSimulation = async () => {
 let statusTimer = null
 let detailTimer = null
 
+// 动态轮询：接近完成时加速
+const getDynamicInterval = () => {
+  if (!runStatus.value || !runStatus.value.current_round || !runStatus.value.total_rounds) {
+    return 2000
+  }
+  const current = runStatus.value.current_round
+  const total = runStatus.value.total_rounds
+
+  // 最后 5 轮加速到 1 秒
+  if (total - current <= 5 && current > 0) {
+    return 1000
+  }
+  // 最后 15 轮加速到 1.5 秒
+  if (total - current <= 15 && current > 0) {
+    return 1500
+  }
+  // 默认 2 秒
+  return 2000
+}
+
 const startStatusPolling = () => {
-  statusTimer = setInterval(fetchRunStatus, 2000)
+  // 使用递归 setTimeout 实现动态间隔
+  const poll = () => {
+    fetchRunStatus().then(() => {
+      const interval = getDynamicInterval()
+      statusTimer = setTimeout(poll, interval)
+    })
+  }
+  poll()
 }
 
 const startDetailPolling = () => {
@@ -579,7 +606,7 @@ const startDetailPolling = () => {
 
 const stopPolling = () => {
   if (statusTimer) {
-    clearInterval(statusTimer)
+    clearTimeout(statusTimer)
     statusTimer = null
   }
   if (detailTimer) {
