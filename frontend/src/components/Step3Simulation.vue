@@ -312,7 +312,7 @@
       </div>
 
       <!-- Snapshot List -->
-      <div class="snapshot-list-section" v-if="snapshots.length > 0">
+      <div class="snapshot-list-section" v-if="snapshots.length > 0 && !showRestoreChoice">
         <div class="snapshot-list-header">{{ $t('step3.snapshotListHeader') }} ({{ snapshots.length }})</div>
         <div class="snapshot-list">
           <div
@@ -350,6 +350,28 @@
                 🗑
               </button>
             </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Restore Choice Dialog -->
+      <div v-if="showRestoreChoice" class="restore-choice-overlay">
+        <div class="restore-choice-dialog">
+          <h3>{{ $t('log.snapshotRestoreChooseTitle') }}</h3>
+          <p class="restore-choice-hint">{{ selectedSnapshot?.snapshot_name }}</p>
+          <div class="restore-choice-options">
+            <label class="restore-choice-option">
+              <input type="radio" name="restoreMode" value="continue" v-model="restoreMode" />
+              <span class="option-label">{{ $t('log.snapshotRestoreContinueFromSnapshot', { round: (selectedSnapshot?.run_state?.current_round || 0) + 1 }) }}</span>
+            </label>
+            <label class="restore-choice-option">
+              <input type="radio" name="restoreMode" value="start_over" v-model="restoreMode" />
+              <span class="option-label">{{ $t('log.snapshotRestoreStartOver') }}</span>
+            </label>
+          </div>
+          <div class="restore-choice-actions">
+            <button class="btn-cancel" @click="showRestoreChoice = false">{{ $t('common.cancel') }}</button>
+            <button class="btn-confirm" @click="doRestoreSnapshot">{{ $t('common.confirm') }}</button>
           </div>
         </div>
       </div>
@@ -428,6 +450,11 @@ const isCreatingSnapshot = ref(false)
 const isRestoringSnapshot = ref(false)
 const isDeletingSnapshot = ref(false)
 const snapshotName = ref('') // 用户输入的快照名称
+const showRestoreChoice = ref(false)
+const restoreMode = ref('continue')
+const selectedSnapshot = ref(null)
+const restoreStartRound = ref(null) // 恢复快照时指定的 start_round
+const wasRestored = ref(false) // 标记是否刚从快照恢复
 
 // Computed
 // 按时间顺序显示动作（最新的在最后面，即底部）
@@ -504,10 +531,23 @@ const doStartSimulation = async () => {
       force: true,  // 强制重新开始
       enable_graph_memory_update: true  // 开启动态图谱更新
     }
-    
-    if (props.maxRounds) {
+
+    // 如果从快照恢复并选择了继续模式，传递 start_round
+    if (restoreStartRound.value !== null && restoreStartRound.value > 0) {
+      params.start_round = restoreStartRound.value
+      addLog(`  └─ 使用快照恢复的 start_round: ${restoreStartRound.value}`)
+      restoreStartRound.value = null  // 消费后清除
+    }
+
+    // 仅非快照恢复模式传 max_rounds
+    // 快照恢复后 total_rounds 已由快照恢复，不应再被 max_rounds 截断
+    if (!wasRestored.value && props.maxRounds) {
       params.max_rounds = props.maxRounds
       addLog(t('log.setMaxRounds', { rounds: props.maxRounds }))
+    }
+    // 快照恢复完成后清除标志
+    if (wasRestored.value) {
+      wasRestored.value = false
     }
     
     addLog(t('log.graphMemoryUpdateEnabled'))
@@ -592,9 +632,11 @@ const getDynamicInterval = () => {
 const startStatusPolling = () => {
   // 使用递归 setTimeout 实现动态间隔
   const poll = () => {
-    fetchRunStatus().then(() => {
-      const interval = getDynamicInterval()
-      statusTimer = setTimeout(poll, interval)
+    fetchRunStatus().then((completed) => {
+      if (!completed) {
+        const interval = getDynamicInterval()
+        statusTimer = setTimeout(poll, interval)
+      }
     })
   }
   poll()
@@ -660,14 +702,20 @@ const fetchRunStatus = async () => {
         } else {
           addLog(t('log.simCompleted'))
           emit('update-status', 'completed')
+          // 成功完成时自动创建最终快照
+          await autoCreateSnapshotOnComplete(data)
         }
         phase.value = 2
         stopPolling()
+        return true  // 通知 poll 链不再继续
       }
+
+      return false  // 模拟未完成，继续轮询
     }
   } catch (err) {
     console.warn('获取运行状态失败:', err)
   }
+  return false
 }
 
 // 检查所有启用的平台是否已完成
@@ -859,6 +907,27 @@ const autoCreateSnapshotOnFail = async (failData) => {
   }
 }
 
+// 成功完成时自动创建最终快照
+const autoCreateSnapshotOnComplete = async (completeData) => {
+  if (!props.simulationId) return
+
+  const totalRound = completeData.total_rounds || '?'
+  const name = `final_R${totalRound}`
+
+  addLog(t('log.autoFinalSnapshotCreating', { round: totalRound }))
+
+  try {
+    const res = await createSnapshot(props.simulationId, { snapshot_name: name })
+    if (res.success) {
+      addLog(t('log.autoFinalSnapshotCreated', { name: res.data.snapshot_name }))
+    } else {
+      addLog(t('log.autoSnapshotFailed', { error: res.error || t('common.unknownError') }))
+    }
+  } catch (err) {
+    addLog(t('log.autoSnapshotException', { error: err.message }))
+  }
+}
+
 // 创建快照
 const handleCreateSnapshot = async () => {
   if (!props.simulationId) {
@@ -905,18 +974,46 @@ const handleListSnapshots = async () => {
   }
 }
 
-// 恢复快照
+// 恢复快照 — 弹出选择弹窗
 const handleRestoreSnapshot = async (snapshot) => {
   if (!props.simulationId) return
 
-  const confirmed = confirm(t('log.snapshotRestoreConfirm', { name: snapshot.snapshot_name }))
-  if (!confirmed) return
+  selectedSnapshot.value = snapshot
+  restoreMode.value = 'continue'
+  showRestoreChoice.value = true
+}
 
+// 执行恢复（从弹窗确认）
+const doRestoreSnapshot = async () => {
+  const snapshot = selectedSnapshot.value
+  if (!snapshot || !props.simulationId) return
+
+  showRestoreChoice.value = false
   isRestoringSnapshot.value = true
-  addLog(t('log.snapshotRestoring', { name: snapshot.snapshot_name }))
+
+  const isContinue = restoreMode.value === 'continue'
+  const startRound = isContinue ? (snapshot.run_state?.current_round || 0) : 0
+
+  if (isContinue) {
+    addLog(t('log.snapshotRestoring', { name: snapshot.snapshot_name }))
+    addLog(t('log.snapshotRestoreContinueFromSnapshot', { round: startRound }))
+    // 保存 start_round 供后续 doStartSimulation 使用
+    restoreStartRound.value = startRound
+  } else {
+    addLog(t('log.snapshotRestoring', { name: snapshot.snapshot_name }))
+    addLog(t('log.snapshotRestoreStartOver'))
+    // 清除 start_round，确保从头开始
+    restoreStartRound.value = null
+  }
+
+  // 标记已从快照恢复，防止 doStartSimulation 误传 max_rounds
+  wasRestored.value = true
 
   try {
-    const res = await restoreSnapshot(props.simulationId, { snapshot_name: snapshot.snapshot_name })
+    const res = await restoreSnapshot(props.simulationId, {
+      snapshot_name: snapshot.snapshot_name,
+      start_round: startRound,
+    })
 
     if (res.success) {
       addLog(t('log.snapshotRestored', { name: res.data.snapshot_name }))
@@ -925,11 +1022,14 @@ const handleRestoreSnapshot = async (snapshot) => {
       showSnapshotPanel.value = false
     } else {
       addLog(t('log.snapshotRestoreFailed', { error: res.error || t('common.unknownError') }))
+      wasRestored.value = false
     }
   } catch (err) {
     addLog(t('log.snapshotRestoreException', { error: err.message }))
+    wasRestored.value = false
   } finally {
     isRestoringSnapshot.value = false
+    selectedSnapshot.value = null
   }
 }
 
@@ -959,16 +1059,6 @@ const handleDeleteSnapshot = async (snapshotName) => {
   }
 }
 
-onMounted(() => {
-  addLog(t('log.step3Init'))
-  if (props.simulationId) {
-    doStartSimulation()
-  }
-})
-
-onUnmounted(() => {
-  stopPolling()
-})
 </script>
 
 <style scoped>
@@ -1767,5 +1857,141 @@ onUnmounted(() => {
 .action-btn.secondary:hover:not(:disabled) {
   background: #F5F5F5;
   border-color: #CCC;
+}
+
+/* Restore Choice Dialog */
+.restore-choice-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+  animation: fadeInOverlay 0.2s ease;
+}
+
+@keyframes fadeInOverlay {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.restore-choice-dialog {
+  background: #000;
+  border-radius: 12px;
+  padding: 28px 32px;
+  min-width: 420px;
+  max-width: 500px;
+  width: 90vw;
+  box-shadow: 0 16px 64px rgba(0, 0, 0, 0.5);
+  animation: slideUpDialog 0.25s ease;
+}
+
+@keyframes slideUpDialog {
+  from {
+    opacity: 0;
+    transform: translateY(20px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.restore-choice-dialog h3 {
+  margin: 0 0 6px 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: #FFF;
+  letter-spacing: -0.01em;
+}
+
+.restore-choice-hint {
+  margin: 0 0 20px 0;
+  font-size: 13px;
+  color: #777;
+  font-family: 'JetBrains Mono', monospace;
+  word-break: break-all;
+}
+
+.restore-choice-options {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 24px;
+}
+
+.restore-choice-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  cursor: pointer;
+  padding: 14px 16px;
+  border: 1.5px solid #333;
+  border-radius: 8px;
+  transition: all 0.2s ease;
+  background: #111;
+}
+
+.restore-choice-option:hover {
+  border-color: #666;
+  background: #1a1a1a;
+}
+
+.restore-choice-option input[type="radio"] {
+  margin: 3px 0 0 0;
+  width: 16px;
+  height: 16px;
+  accent-color: #FFF;
+  flex-shrink: 0;
+}
+
+.option-label {
+  font-size: 14px;
+  color: #DDD;
+  line-height: 1.5;
+}
+
+.restore-choice-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+}
+
+.restore-choice-actions button {
+  padding: 8px 20px;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  border: 1px solid #444;
+  transition: all 0.2s ease;
+  min-width: 72px;
+}
+
+.restore-choice-actions .btn-cancel {
+  background: transparent;
+  color: #999;
+}
+
+.restore-choice-actions .btn-cancel:hover {
+  background: #222;
+  border-color: #666;
+  color: #FFF;
+}
+
+.restore-choice-actions .btn-confirm {
+  background: #FFF;
+  color: #000;
+  border-color: #FFF;
+}
+
+.restore-choice-actions .btn-confirm:hover {
+  background: #DDD;
+  border-color: #DDD;
 }
 </style>

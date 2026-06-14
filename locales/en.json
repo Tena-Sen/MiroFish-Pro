@@ -624,7 +624,12 @@
     "autoSnapshotCreating": "Auto-creating failure snapshot: R{round}/{total}",
     "autoSnapshotCreated": "✓ Auto-snapshot created: {name}",
     "autoSnapshotFailed": "✗ Auto-snapshot failed: {error}",
-    "autoSnapshotException": "✗ Auto-snapshot error: {error}"
+    "autoSnapshotException": "✗ Auto-snapshot error: {error}",
+    "autoFinalSnapshotCreating": "Auto-creating final snapshot: R{round}",
+    "autoFinalSnapshotCreated": "✓ Final snapshot created: {name}",
+    "snapshotRestoreChooseTitle": "Choose Restore Mode",
+    "snapshotRestoreContinueFromSnapshot": "Continue from snapshot (start from round {round})",
+    "snapshotRestoreStartOver": "Start over (re-run all rounds)"
   },
   "report": {
     "taskStarted": "Report generation task started",

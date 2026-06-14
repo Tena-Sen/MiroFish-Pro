@@ -624,7 +624,12 @@
     "autoSnapshotCreating": "自动创建失败快照：R{round}/{total}",
     "autoSnapshotCreated": "✓ 自动快照已创建：{name}",
     "autoSnapshotFailed": "✗ 自动快照创建失败：{error}",
-    "autoSnapshotException": "✗ 自动快照异常：{error}"
+    "autoSnapshotException": "✗ 自动快照异常：{error}",
+    "autoFinalSnapshotCreating": "自动创建最终快照：R{round}",
+    "autoFinalSnapshotCreated": "✓ 最终快照已创建：{name}",
+    "snapshotRestoreChooseTitle": "选择恢复模式",
+    "snapshotRestoreContinueFromSnapshot": "从快照节点继续（从第 {round} 轮开始）",
+    "snapshotRestoreStartOver": "从头开始（重新运行所有轮次）"
   },
   "report": {
     "taskStarted": "报告生成任务开始",
