@@ -170,9 +170,9 @@ class ZepGraphMemoryUpdater:
     监控模拟的 actions 日志文件，将新的 agent 活动实时更新到本地图谱中。
     """
 
-    BATCH_SIZE = 5
+    BATCH_SIZE = 10  # Phase 4a: 5→10，每批多处理 1 倍活动
     PLATFORM_DISPLAY_NAMES = {'twitter': '世界1', 'reddit': '世界2'}
-    SEND_INTERVAL = 0.5
+    SEND_INTERVAL = 0.3  # Phase 4a: 0.5→0.3s，flush 间隔更短
     MAX_RETRIES = 3
     RETRY_DELAY = 2
 
@@ -287,7 +287,17 @@ class ZepGraphMemoryUpdater:
                 self._total_sent += 1
                 self._total_items_sent += len(activities)
                 display_name = self._get_platform_display_name(platform)
-                logger.info(f"成功批量发送 {len(activities)} 条{display_name}活动到图谱 {self.graph_id}")
+                # 优化（清理噪音）：从 INFO 降为 DEBUG
+                # 旧实现每 0.3s 一次，一天 3000+ 条，让控制台巨乱
+                # 关键信息（成功条数、目标 graph_id）改在每 N 次汇总时 INFO 一次
+                # 业务语义不变：成功状态仍可通过 _total_sent / get_stats() 读取
+                logger.debug(f"成功批量发送 {len(activities)} 条{display_name}活动到图谱 {self.graph_id}")
+                # 极简汇总：每 50 次成功才打印一次 INFO
+                if self._total_sent % 50 == 0:
+                    logger.info(
+                        f"图谱 {self.graph_id} 累计发送 {self._total_sent} 批 "
+                        f"({self._total_items_sent} 条活动)"
+                    )
                 logger.debug(f"批量内容预览: {combined_text[:200]}...")
                 return
 

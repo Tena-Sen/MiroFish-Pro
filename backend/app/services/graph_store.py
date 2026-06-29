@@ -16,6 +16,7 @@ from datetime import datetime
 import networkx as nx
 
 from ..utils.logger import get_logger
+from ..utils.atomic_io import atomic_write_json
 
 logger = get_logger('mirofish.graph_store')
 
@@ -120,6 +121,10 @@ class GraphStore:
         self._tfidf_doc_types: List[str] = []  # "node" 或 "edge"
         self._tfidf_dirty = True
 
+        # 脏标记（性能优化）：add_node/add_edge 只标脏，由调用方按需 flush()
+        # 业务语义不变：构造图（create）/本体设置（set_ontology）/批末（add_batch/flush）仍保证落盘
+        self._dirty: bool = False
+
         # 确保存储目录存在
         os.makedirs(self._store_dir, exist_ok=True)
 
@@ -192,7 +197,7 @@ class GraphStore:
 
     def add_node(self, name: str, labels: List[str], summary: str = "",
                  attributes: Dict[str, Any] = None, node_uuid: str = None) -> str:
-        """添加节点"""
+        """添加节点（仅标脏，由调用方按需 flush() 落盘）"""
         node_uuid = node_uuid or str(uuid.uuid4())
         node = NodeData(
             uuid=node_uuid,
@@ -204,7 +209,8 @@ class GraphStore:
         self._nodes[node_uuid] = node
         self._graph.add_node(node_uuid, name=name, labels=labels)
         self._tfidf_dirty = True
-        self._save()
+        # 优化：不再每次 _save()，仅标脏；批末/生命周期点会 flush()
+        self._dirty = True
         return node_uuid
 
     def get_node(self, node_uuid: str) -> Optional[NodeData]:
@@ -234,7 +240,7 @@ class GraphStore:
     def add_edge(self, name: str, fact: str, source_node_uuid: str,
                  target_node_uuid: str, attributes: Dict[str, Any] = None,
                  edge_uuid: str = None, episodes: List[str] = None) -> str:
-        """添加边"""
+        """添加边（仅标脏，由调用方按需 flush() 落盘）"""
         edge_uuid = edge_uuid or str(uuid.uuid4())
         edge = EdgeData(
             uuid=edge_uuid,
@@ -248,7 +254,8 @@ class GraphStore:
         self._edges[edge_uuid] = edge
         self._graph.add_edge(source_node_uuid, target_node_uuid, uuid=edge_uuid, name=name)
         self._tfidf_dirty = True
-        self._save()
+        # 优化：不再每次 _save()，仅标脏；批末/生命周期点会 flush()
+        self._dirty = True
         return edge_uuid
 
     def get_edge(self, edge_uuid: str) -> Optional[EdgeData]:
@@ -289,6 +296,8 @@ class GraphStore:
         本地方案：直接将文本作为 episode 存储，
         后续由 LLM 或规则引擎提取实体和关系。
 
+        优化：循环内 add_node 不再逐次落盘，循环结束统一 flush() 一次。
+
         Args:
             texts: 文本列表
 
@@ -307,11 +316,12 @@ class GraphStore:
                 node_uuid=ep_uuid,
             )
             episode_uuids.append(ep_uuid)
-        self._save()
+        # 批末统一落盘（优化前：N 次 _save() + 1 次；优化后：1 次）
+        self.flush()
         return episode_uuids
 
     def add_single_episode(self, text: str, episode_type: str = "text") -> str:
-        """添加单条 episode（兼容 Zep graph.add）"""
+        """添加单条 episode（兼容 Zep graph.add）—— 独立 API，调用即落盘"""
         ep_uuid = str(uuid.uuid4())
         self.add_node(
             name=f"episode_{ep_uuid[:8]}",
@@ -320,8 +330,18 @@ class GraphStore:
             attributes={"type": episode_type, "raw_text": text},
             node_uuid=ep_uuid,
         )
-        self._save()
+        # add_single_episode 是单条独立 API（zep_graph_memory_updater.py 等调用方依赖其立即落盘的语义）
+        self.flush()
         return ep_uuid
+
+    def flush(self) -> None:
+        """将脏数据落盘。无脏数据时是 no-op。
+
+        设计：仅 _save() 一次，原子写入，不破坏既有持久化语义。
+        """
+        if self._dirty:
+            self._save()
+            self._dirty = False
 
     # ========== 搜索（TF-IDF 语义搜索） ==========
 
@@ -514,8 +534,8 @@ class GraphStore:
             "saved_at": datetime.now().isoformat(),
         }
         try:
-            with open(self._data_path(), 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            # 原子写入：避免 graph 构建过程中前端读到半截 JSON
+            atomic_write_json(self._data_path(), data)
         except Exception as e:
             logger.error(f"保存图谱失败: {e}")
 
@@ -553,8 +573,13 @@ class GraphStore:
             self._ontology.edge_types = onto.get("edge_types", {})
 
             self._tfidf_dirty = True
-            logger.info(f"加载图谱: {self.graph_id}, "
-                       f"{len(self._nodes)} 节点, {len(self._edges)} 边")
+            # 优化（清理噪音）：从 INFO 降为 DEBUG
+            # 旧实现：每次 GraphStore(graph_id) 实例化（高频操作）都打印一条，
+            # API 端点每次调用都创建新实例 → 一天 1448 条
+            # 关键信息（节点/边数）改在初始化时一次性 INFO（仅当非空）
+            # 业务语义不变：图谱本身已加载
+            logger.debug(f"加载图谱: {self.graph_id}, "
+                        f"{len(self._nodes)} 节点, {len(self._edges)} 边")
 
         except Exception as e:
             logger.warning(f"加载图谱数据失败: {e}")
