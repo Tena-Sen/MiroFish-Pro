@@ -78,6 +78,15 @@
 
       <!-- RIGHT PANEL: Interaction Interface -->
       <div class="right-panel" ref="rightPanel">
+        <!-- 返回按钮 -->
+        <button class="back-step-btn-interaction" @click="goBack">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="19" y1="12" x2="5" y2="12"></line>
+            <polyline points="12 19 5 12 12 5"></polyline>
+          </svg>
+          <span>{{ $t('common.back') }} to Step 4</span>
+        </button>
+
         <!-- Unified Action Bar - Professional Design -->
         <div class="action-bar">
         <div class="action-bar-header">
@@ -162,6 +171,20 @@
                   <polyline points="6 9 12 15 18 9"></polyline>
                 </svg>
               </button>
+            </div>
+
+            <!-- Environment Status Indicator -->
+            <div v-if="props.simulationId" class="env-status-bar" :class="envStatus || 'unknown'">
+              <span v-if="envStatusLoading" class="env-status-dot env-loading">⋯</span>
+              <span v-else-if="envStatus === 'alive'" class="env-status-dot env-alive">●</span>
+              <span v-else-if="envStatus === 'stopped'" class="env-status-dot env-stopped">●</span>
+              <span v-else class="env-status-dot env-unknown">●</span>
+              <span class="env-status-text">
+                <template v-if="envStatusLoading">{{ $t('step5.checkingEnv') }}</template>
+                <template v-else-if="envStatus === 'alive'">{{ $t('step5.envAlive') }}</template>
+                <template v-else-if="envStatus === 'stopped'">{{ $t('step5.envStopped') }}</template>
+                <template v-else>{{ $t('step5.envUnknown') }}</template>
+              </span>
             </div>
             <div v-if="showToolsDetail" class="tools-card-body">
               <div class="tools-grid">
@@ -414,16 +437,49 @@
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { chatWithReport, getReport, getAgentLog } from '../api/report'
-import { interviewAgents, getSimulationProfilesRealtime } from '../api/simulation'
+import { interviewAgents, getSimulationProfilesRealtime, getEnvStatus } from '../api/simulation'
 
 const { t } = useI18n()
+
+// 环境状态
+const envStatus = ref(null) // 'alive' | 'stopped' | null (unknown)
+const envStatusLoading = ref(false)
+
+const refreshEnvStatus = async () => {
+  if (!props.simulationId) return
+  envStatusLoading.value = true
+  try {
+    const res = await getEnvStatus({ simulation_id: props.simulationId })
+    if (res.success && res.data) {
+      envStatus.value = res.data.env_alive ? 'alive' : 'stopped'
+    }
+  } catch (err) {
+    console.warn('检查环境状态失败:', err)
+  } finally {
+    envStatusLoading.value = false
+  }
+}
+
+// 环境未运行错误检测
+const isEnvNotRunningError = (errorMsg) => {
+  if (!errorMsg) return false
+  const msg = errorMsg.toLowerCase()
+  return msg.includes('envNotRunning') ||
+         (msg.includes('环境') && msg.includes('运行')) ||
+         (msg.includes('environment') && (msg.includes('not running') || msg.includes('not run')))
+}
 
 const props = defineProps({
   reportId: String,
   simulationId: String
 })
 
-const emit = defineEmits(['add-log', 'update-status'])
+const emit = defineEmits(['add-log', 'update-status', 'go-back'])
+
+// 返回到上一个步骤
+const goBack = () => {
+  emit('go-back')
+}
 
 // State
 const activeTab = ref('chat')
@@ -680,6 +736,10 @@ const sendMessage = async () => {
 }
 
 const sendToReportAgent = async (message) => {
+  if (!props.simulationId) {
+    addLog(t('log.noSimulationId'))
+    return
+  }
   addLog(t('log.sendToReportAgent', { message: message.substring(0, 50) }))
   
   // Build chat history for API
@@ -705,11 +765,19 @@ const sendToReportAgent = async (message) => {
     })
     addLog(t('log.reportAgentReplied'))
   } else {
-    throw new Error(res.error || t('step5.requestFailed'))
+    const errorMsg = res.error || t('step5.requestFailed')
+    if (isEnvNotRunningError(errorMsg)) {
+      throw new Error(t('step5.envNotRunningUser', { error: errorMsg }))
+    }
+    throw new Error(errorMsg)
   }
 }
 
 const sendToAgent = async (message) => {
+  if (!props.simulationId) {
+    addLog(t('log.noSimulationId'))
+    return
+  }
   if (!selectedAgent.value || selectedAgentIndex.value === null) {
     throw new Error(t('step5.selectAgentFirst'))
   }
@@ -737,19 +805,32 @@ const sendToAgent = async (message) => {
   
   if (res.success && res.data) {
     // 正确的数据路径: res.data.result.results 是一个对象字典
-    // 格式: {"twitter_0": {...}, "reddit_0": {...}} 或单平台 {"reddit_0": {...}}
+    // 格式: {"reddit_0": {...}, "twitter_0": {...}} 或离线模式 {"both_0": {...}}
     const resultData = res.data.result || res.data
     const resultsDict = resultData.results || resultData
-    
-    // 将对象字典转换为数组，优先获取 reddit 平台的回复
+
+    // 将对象字典转换为数组，查找当前 Agent 的回复
     let responseContent = null
     const agentId = selectedAgentIndex.value
-    
+
     if (typeof resultsDict === 'object' && !Array.isArray(resultsDict)) {
-      // 优先使用 reddit 平台回复，其次 twitter
-      const redditKey = `reddit_${agentId}`
-      const twitterKey = `twitter_${agentId}`
-      const agentResult = resultsDict[redditKey] || resultsDict[twitterKey] || Object.values(resultsDict)[0]
+      // 尝试多种可能的 key 格式
+      const possibleKeys = [
+        `reddit_${agentId}`,
+        `twitter_${agentId}`,
+        `both_${agentId}`
+      ]
+      let agentResult = null
+      for (const key of possibleKeys) {
+        if (resultsDict[key]) {
+          agentResult = resultsDict[key]
+          break
+        }
+      }
+      // 如果没找到特定 key，取第一个可用结果
+      if (!agentResult) {
+        agentResult = Object.values(resultsDict)[0]
+      }
       if (agentResult) {
         responseContent = agentResult.response || agentResult.answer
       }
@@ -764,12 +845,20 @@ const sendToAgent = async (message) => {
         content: responseContent,
         timestamp: new Date().toISOString()
       })
+      // 如果是离线模式，添加提示
+      if (res.data?.mode === 'offline') {
+        addLog(t('log.offlineInterviewMode'))
+      }
       addLog(t('log.agentReplied', { name: selectedAgent.value.username }))
     } else {
       throw new Error(t('step5.noResponse'))
     }
   } else {
-    throw new Error(res.error || t('step5.requestFailed'))
+    const errorMsg = res.error || t('step5.requestFailed')
+    if (isEnvNotRunningError(errorMsg)) {
+      throw new Error(t('step5.envNotRunningUser', { error: errorMsg }))
+    }
+    throw new Error(errorMsg)
   }
 }
 
@@ -807,7 +896,13 @@ const submitSurvey = async () => {
   
   isSurveying.value = true
   addLog(t('log.sendSurvey', { count: selectedAgents.value.size }))
-  
+
+  if (!props.simulationId) {
+    addLog(t('log.noSimulationId'))
+    isSurveying.value = false
+    return
+  }
+
   try {
     const interviews = Array.from(selectedAgents.value).map(idx => ({
       agent_id: idx,
@@ -836,9 +931,19 @@ const submitSurvey = async () => {
         let responseContent = t('step5.noResponse')
 
         if (typeof resultsDict === 'object' && !Array.isArray(resultsDict)) {
-          const redditKey = `reddit_${agentIdx}`
-          const twitterKey = `twitter_${agentIdx}`
-          const agentResult = resultsDict[redditKey] || resultsDict[twitterKey]
+          // 尝试多种可能的 key 格式（兼容在线/离线模式）
+          const possibleKeys = [
+            `reddit_${agentIdx}`,
+            `twitter_${agentIdx}`,
+            `both_${agentIdx}`
+          ]
+          let agentResult = null
+          for (const key of possibleKeys) {
+            if (resultsDict[key]) {
+              agentResult = resultsDict[key]
+              break
+            }
+          }
           if (agentResult) {
             responseContent = agentResult.response || agentResult.answer || t('step5.noResponse')
           }
@@ -862,7 +967,11 @@ const submitSurvey = async () => {
       surveyResults.value = surveyResultsList
       addLog(t('log.receivedReplies', { count: surveyResults.value.length }))
     } else {
-      throw new Error(res.error || t('step5.requestFailed'))
+      const errorMsg = res.error || t('step5.requestFailed')
+      if (isEnvNotRunningError(errorMsg)) {
+        throw new Error(t('step5.envNotRunningUser', { error: errorMsg }))
+      }
+      throw new Error(errorMsg)
     }
   } catch (err) {
     addLog(t('log.surveySendFailed', { error: err.message }))
@@ -941,12 +1050,17 @@ onMounted(() => {
   addLog(t('log.step5Init'))
   loadReportData()
   loadProfiles()
+  refreshEnvStatus()
   document.addEventListener('click', handleClickOutside)
 })
 
-onUnmounted(() => {
-  document.removeEventListener('click', handleClickOutside)
-})
+// Watch simulationId changes
+watch(() => props.simulationId, (newId) => {
+  if (newId) {
+    loadProfiles()
+    refreshEnvStatus()
+  }
+}, { immediate: true })
 
 watch(() => props.reportId, (newId) => {
   if (newId) {
@@ -954,11 +1068,9 @@ watch(() => props.reportId, (newId) => {
   }
 }, { immediate: true })
 
-watch(() => props.simulationId, (newId) => {
-  if (newId) {
-    loadProfiles()
-  }
-}, { immediate: true })
+onUnmounted(() => {
+  document.removeEventListener('click', handleClickOutside)
+})
 </script>
 
 <style scoped>
@@ -1320,6 +1432,39 @@ watch(() => props.simulationId, (newId) => {
   border-bottom: 1px solid #E5E7EB;
   background: linear-gradient(180deg, #FFFFFF 0%, #FAFBFC 100%);
   gap: 16px;
+}
+
+/* 返回按钮样式 */
+.back-step-btn-interaction {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  padding: 12px 20px;
+  font-size: 13px;
+  font-weight: 500;
+  color: #6B7280;
+  background: #F9FAFB;
+  border: 1px solid #E5E7EB;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  margin-bottom: 8px;
+}
+
+.back-step-btn-interaction:hover {
+  background: #F3F4F6;
+  border-color: #D1D5DB;
+  color: #374151;
+}
+
+.back-step-btn-interaction svg {
+  transition: transform 0.2s ease;
+}
+
+.back-step-btn-interaction:hover svg {
+  transform: translateX(-4px);
 }
 
 .action-bar-header {
@@ -2574,6 +2719,49 @@ watch(() => props.simulationId, (newId) => {
   border-top: 1px solid #E5E7EB;
   margin: 24px 0;
 }
+
+/* Environment Status Bar */
+.env-status-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  margin: 0 16px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  background: #F5F5F5;
+}
+
+.env-status-bar.alive {
+  background: #E8F5E9;
+  color: #2E7D32;
+}
+
+.env-status-bar.stopped {
+  background: #FFF3E0;
+  color: #E65100;
+}
+
+.env-status-bar.unknown,
+.env-status-bar.null {
+  background: #F5F5F5;
+  color: #757575;
+}
+
+.env-loading {
+  animation: pulse 1s infinite;
+}
+
+.env-status-dot {
+  font-size: 14px;
+  line-height: 1;
+}
+
+.env-alive { color: #4CAF50; }
+.env-stopped { color: #FF9800; }
+.env-unknown { color: #9E9E9E; }
+.env-loading { color: #666; }
 </style>
 
 <style>

@@ -185,3 +185,48 @@ export const getSimulationHistory = (limit = 20) => {
   return service.get('/api/simulation/history', { params: { limit } })
 }
 
+/**
+ * 删除模拟（彻底删除所有相关数据）
+ * @param {string} simulationId
+ */
+export const deleteSimulation = (simulationId) => {
+  return service.delete(`/api/simulation/${simulationId}`)
+}
+
+// ==================== 快照相关 API ====================
+
+/**
+ * 创建模拟快照（保存当前模拟状态）
+ * @param {string} simulationId
+ * @param {Object} data - { snapshot_name? }
+ */
+export const createSnapshot = (simulationId, data = {}) => {
+  return requestWithRetry(() => service.post(`/api/simulation/${simulationId}/snapshot/create`, data), 1, 0)
+}
+
+/**
+ * 列出模拟的所有快照
+ * @param {string} simulationId
+ */
+export const listSnapshots = (simulationId) => {
+  return service.get(`/api/simulation/${simulationId}/snapshot/list`)
+}
+
+/**
+ * 恢复模拟快照
+ * @param {string} simulationId
+ * @param {Object} data - { snapshot_name }
+ */
+export const restoreSnapshot = (simulationId, data) => {
+  return requestWithRetry(() => service.post(`/api/simulation/${simulationId}/snapshot/restore`, data), 1, 0)
+}
+
+/**
+ * 删除指定快照
+ * @param {string} simulationId
+ * @param {string} snapshotName
+ */
+export const deleteSnapshot = (simulationId, snapshotName) => {
+  return service.delete(`/api/simulation/${simulationId}/snapshot/${snapshotName}`)
+}
+

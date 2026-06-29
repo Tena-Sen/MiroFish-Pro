@@ -1099,21 +1099,23 @@ class PlatformSimulation:
 
 
 async def run_twitter_simulation(
-    config: Dict[str, Any], 
+    config: Dict[str, Any],
     simulation_dir: str,
     action_logger: Optional[PlatformActionLogger] = None,
     main_logger: Optional[SimulationLogManager] = None,
-    max_rounds: Optional[int] = None
+    max_rounds: Optional[int] = None,
+    start_round: int = 0
 ) -> PlatformSimulation:
     """运行Twitter模拟
-    
+
     Args:
         config: 模拟配置
         simulation_dir: 模拟目录
         action_logger: 动作日志记录器
         main_logger: 主日志管理器
         max_rounds: 最大模拟轮数（可选，用于截断过长的模拟）
-        
+        start_round: 从指定轮次开始（0=从头开始）
+
     Returns:
         PlatformSimulation: 包含env和agent_graph的结果对象
     """
@@ -1150,7 +1152,18 @@ async def run_twitter_simulation(
     
     db_path = os.path.join(simulation_dir, "twitter_simulation.db")
     if os.path.exists(db_path):
-        os.remove(db_path)
+        try:
+            os.remove(db_path)
+        except PermissionError:
+            # Windows 文件锁定问题，等待后重试
+            import time
+            time.sleep(2)
+            try:
+                os.remove(db_path)
+            except PermissionError:
+                # 如果仍然锁定，使用新文件名
+                db_path = os.path.join(simulation_dir, f"twitter_simulation_{int(time.time())}.db")
+                log_info(f"原数据库文件被锁定，使用新文件: {db_path}")
     
     result.env = oasis.make(
         agent_graph=result.agent_graph,
@@ -1215,17 +1228,21 @@ async def run_twitter_simulation(
     total_hours = time_config.get("total_simulation_hours", 72)
     minutes_per_round = time_config.get("minutes_per_round", 30)
     total_rounds = (total_hours * 60) // minutes_per_round
-    
+
+    # 如果指定了起始轮次，跳过已执行的轮次
+    if start_round > 0:
+        log_info(f"从轮次 {start_round + 1} 开始（已跳过 {start_round} 轮初始事件）")
+
     # 如果指定了最大轮数，则截断
     if max_rounds is not None and max_rounds > 0:
         original_rounds = total_rounds
         total_rounds = min(total_rounds, max_rounds)
         if total_rounds < original_rounds:
             log_info(f"轮数已截断: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
-    
+
     start_time = datetime.now()
-    
-    for round_num in range(total_rounds):
+
+    for round_num in range(start_round, total_rounds):
         # 检查是否收到退出信号
         if _shutdown_event and _shutdown_event.is_set():
             if main_logger:
@@ -1291,21 +1308,23 @@ async def run_twitter_simulation(
 
 
 async def run_reddit_simulation(
-    config: Dict[str, Any], 
+    config: Dict[str, Any],
     simulation_dir: str,
     action_logger: Optional[PlatformActionLogger] = None,
     main_logger: Optional[SimulationLogManager] = None,
-    max_rounds: Optional[int] = None
+    max_rounds: Optional[int] = None,
+    start_round: int = 0
 ) -> PlatformSimulation:
     """运行Reddit模拟
-    
+
     Args:
         config: 模拟配置
         simulation_dir: 模拟目录
         action_logger: 动作日志记录器
         main_logger: 主日志管理器
         max_rounds: 最大模拟轮数（可选，用于截断过长的模拟）
-        
+        start_round: 从指定轮次开始（0=从头开始）
+
     Returns:
         PlatformSimulation: 包含env和agent_graph的结果对象
     """
@@ -1341,7 +1360,18 @@ async def run_reddit_simulation(
     
     db_path = os.path.join(simulation_dir, "reddit_simulation.db")
     if os.path.exists(db_path):
-        os.remove(db_path)
+        try:
+            os.remove(db_path)
+        except PermissionError:
+            # Windows 文件锁定问题，等待后重试
+            import time
+            time.sleep(2)
+            try:
+                os.remove(db_path)
+            except PermissionError:
+                # 如果仍然锁定，使用新文件名
+                db_path = os.path.join(simulation_dir, f"reddit_simulation_{int(time.time())}.db")
+                log_info(f"原数据库文件被锁定，使用新文件: {db_path}")
     
     result.env = oasis.make(
         agent_graph=result.agent_graph,
@@ -1414,17 +1444,21 @@ async def run_reddit_simulation(
     total_hours = time_config.get("total_simulation_hours", 72)
     minutes_per_round = time_config.get("minutes_per_round", 30)
     total_rounds = (total_hours * 60) // minutes_per_round
-    
+
+    # 如果指定了起始轮次，跳过已执行的轮次
+    if start_round > 0:
+        log_info(f"从轮次 {start_round + 1} 开始（已跳过 {start_round} 轮初始事件）")
+
     # 如果指定了最大轮数，则截断
     if max_rounds is not None and max_rounds > 0:
         original_rounds = total_rounds
         total_rounds = min(total_rounds, max_rounds)
         if total_rounds < original_rounds:
             log_info(f"轮数已截断: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
-    
+
     start_time = datetime.now()
-    
-    for round_num in range(total_rounds):
+
+    for round_num in range(start_round, total_rounds):
         # 检查是否收到退出信号
         if _shutdown_event and _shutdown_event.is_set():
             if main_logger:
@@ -1514,6 +1548,12 @@ async def main():
         help='最大模拟轮数（可选，用于截断过长的模拟）'
     )
     parser.add_argument(
+        '--start-round',
+        type=int,
+        default=0,
+        help='从指定轮次开始（用于快照恢复后继续）'
+    )
+    parser.add_argument(
         '--no-wait',
         action='store_true',
         default=False,
@@ -1577,14 +1617,14 @@ async def main():
     reddit_result: Optional[PlatformSimulation] = None
     
     if args.twitter_only:
-        twitter_result = await run_twitter_simulation(config, simulation_dir, twitter_logger, log_manager, args.max_rounds)
+        twitter_result = await run_twitter_simulation(config, simulation_dir, twitter_logger, log_manager, args.max_rounds, args.start_round)
     elif args.reddit_only:
-        reddit_result = await run_reddit_simulation(config, simulation_dir, reddit_logger, log_manager, args.max_rounds)
+        reddit_result = await run_reddit_simulation(config, simulation_dir, reddit_logger, log_manager, args.max_rounds, args.start_round)
     else:
         # 并行运行（每个平台使用独立的日志记录器）
         results = await asyncio.gather(
-            run_twitter_simulation(config, simulation_dir, twitter_logger, log_manager, args.max_rounds),
-            run_reddit_simulation(config, simulation_dir, reddit_logger, log_manager, args.max_rounds),
+            run_twitter_simulation(config, simulation_dir, twitter_logger, log_manager, args.max_rounds, args.start_round),
+            run_reddit_simulation(config, simulation_dir, reddit_logger, log_manager, args.max_rounds, args.start_round),
         )
         twitter_result, reddit_result = results
     

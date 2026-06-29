@@ -51,7 +51,7 @@
       <!-- Right Panel: Step Components -->
       <div class="panel-wrapper right" :style="rightPanelStyle">
         <!-- Step 1: 图谱构建 -->
-        <Step1GraphBuild 
+        <Step1GraphBuild
           v-if="currentStep === 1"
           :currentPhase="currentPhase"
           :projectData="projectData"
@@ -60,6 +60,7 @@
           :graphData="graphData"
           :systemLogs="systemLogs"
           @next-step="handleNextStep"
+          @go-back="() => handleGoBack(1)"
         />
         <!-- Step 2: 环境搭建 -->
         <Step2EnvSetup
@@ -67,7 +68,7 @@
           :projectData="projectData"
           :graphData="graphData"
           :systemLogs="systemLogs"
-          @go-back="handleGoBack"
+          @go-back="() => handleGoBack(2)"
           @next-step="handleNextStep"
           @add-log="addLog"
         />
@@ -173,9 +174,14 @@ const handleNextStep = (params = {}) => {
   }
 }
 
-const handleGoBack = () => {
-  if (currentStep.value > 1) {
-    currentStep.value--
+const handleGoBack = (fromStep) => {
+  // fromStep: 1=图谱构建, 2=环境搭建
+  if (fromStep === 1) {
+    // Step 1 回退：回到项目列表
+    router.push('/')
+  } else {
+    // Step 2 回退：到 Step 1
+    currentStep.value = Math.max(1, currentStep.value - 1)
     addLog(t('log.returnToStep', { step: currentStep.value, name: stepNames.value[currentStep.value - 1] }))
   }
 }

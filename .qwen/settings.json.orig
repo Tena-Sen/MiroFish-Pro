@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python *)",
+      "Bash(dir *)",
+      "Bash(type *)",
+      "Bash(git add *)"
+    ]
+  },
+  "$version": 4
+}

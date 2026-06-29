@@ -13,6 +13,7 @@ import os
 import json
 import time
 import re
+import logging
 from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -96,6 +97,11 @@ class ReportLogger:
         # 追加写入 JSONL 文件
         with open(self.log_file_path, 'a', encoding='utf-8') as f:
             f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+
+        # 同时写入 console_log.txt（通过 logging 模块，会被 ReportConsoleLogger 的文件处理器捕获）
+        section_info = f"[{section_title}]" if section_title else ""
+        console_msg = f"{log_entry.get('timestamp', '')} INFO: {action} - {json.dumps(details, ensure_ascii=False)}"
+        logging.getLogger('mirofish.report_agent').info(f"{section_info} {console_msg}")
     
     def log_start(self, simulation_id: str, graph_id: str, simulation_requirement: str):
         """记录报告生成开始"""

@@ -399,11 +399,11 @@ class OntologyGenerator:
     
     def generate_python_code(self, ontology: Dict[str, Any]) -> str:
         """
-        将本体定义转换为Python代码（类似ontology.py）
-        
+        将本体定义转换为Python代码
+
         Args:
             ontology: 本体定义
-            
+
         Returns:
             Python代码字符串
         """
@@ -413,65 +413,60 @@ class OntologyGenerator:
             '由MiroFish自动生成，用于社会舆论模拟',
             '"""',
             '',
-            'from pydantic import Field',
-            'from zep_cloud.external_clients.ontology import EntityModel, EntityText, EdgeModel',
+            'from dataclasses import dataclass, field',
+            'from typing import Optional, List, Dict, Any',
             '',
             '',
             '# ============== 实体类型定义 ==============',
             '',
         ]
-        
+
         # 生成实体类型
         for entity in ontology.get("entity_types", []):
             name = entity["name"]
             desc = entity.get("description", f"A {name} entity.")
-            
-            code_lines.append(f'class {name}(EntityModel):')
+
+            code_lines.append(f'@dataclass')
+            code_lines.append(f'class {name}:')
             code_lines.append(f'    """{desc}"""')
-            
+
             attrs = entity.get("attributes", [])
             if attrs:
                 for attr in attrs:
                     attr_name = attr["name"]
                     attr_desc = attr.get("description", attr_name)
-                    code_lines.append(f'    {attr_name}: EntityText = Field(')
-                    code_lines.append(f'        description="{attr_desc}",')
-                    code_lines.append(f'        default=None')
-                    code_lines.append(f'    )')
+                    code_lines.append(f'    {attr_name}: Optional[str] = None  # {attr_desc}')
             else:
                 code_lines.append('    pass')
-            
+
             code_lines.append('')
             code_lines.append('')
-        
+
         code_lines.append('# ============== 关系类型定义 ==============')
         code_lines.append('')
-        
+
         # 生成关系类型
         for edge in ontology.get("edge_types", []):
             name = edge["name"]
-            # 转换为PascalCase类名
             class_name = ''.join(word.capitalize() for word in name.split('_'))
             desc = edge.get("description", f"A {name} relationship.")
-            
-            code_lines.append(f'class {class_name}(EdgeModel):')
+
+            code_lines.append(f'@dataclass')
+            code_lines.append(f'class {class_name}:')
             code_lines.append(f'    """{desc}"""')
-            
+
             attrs = edge.get("attributes", [])
             if attrs:
                 for attr in attrs:
                     attr_name = attr["name"]
                     attr_desc = attr.get("description", attr_name)
-                    code_lines.append(f'    {attr_name}: EntityText = Field(')
-                    code_lines.append(f'        description="{attr_desc}",')
-                    code_lines.append(f'        default=None')
-                    code_lines.append(f'    )')
+                    code_lines.append(f'    {attr_name}: Optional[str] = None  # {attr_desc}')
             else:
                 code_lines.append('    pass')
-            
+
             code_lines.append('')
             code_lines.append('')
-        
+
         # 生成类型字典
         code_lines.append('# ============== 类型配置 ==============')
         code_lines.append('')
@@ -488,7 +483,7 @@ class OntologyGenerator:
             code_lines.append(f'    "{name}": {class_name},')
         code_lines.append('}')
         code_lines.append('')
-        
+
         # 生成边的source_targets映射
         code_lines.append('EDGE_SOURCE_TARGETS = {')
         for edge in ontology.get("edge_types", []):
@@ -501,6 +496,6 @@ class OntologyGenerator:
                 ])
                 code_lines.append(f'    "{name}": [{st_list}],')
         code_lines.append('}')
-        
+
         return '\n'.join(code_lines)
 

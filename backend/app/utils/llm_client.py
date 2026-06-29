@@ -4,11 +4,16 @@ LLM客户端封装
 """
 
 import json
+import logging
 import re
+import time
 from typing import Optional, Dict, Any, List
 from openai import OpenAI
+from openai._exceptions import APIConnectionError, APITimeoutError
 
 from ..config import Config
+
+logger = logging.getLogger(__name__)
 
 
 class LLMClient:
@@ -99,5 +104,27 @@ class LLMClient:
         try:
             return json.loads(cleaned_response)
         except json.JSONDecodeError:
-            raise ValueError(f"LLM返回的JSON格式无效: {cleaned_response}")
+            # 尝试提取第一个完整的JSON对象
+            try:
+                # 找到第一个 { 的位置
+                start = cleaned_response.find('{')
+                if start == -1:
+                    raise ValueError(f"LLM返回中未找到JSON对象: {cleaned_response[:200]}")
+
+                # 从第一个 { 开始，找到匹配的 }
+                depth = 0
+                end = start
+                for i in range(start, len(cleaned_response)):
+                    if cleaned_response[i] == '{':
+                        depth += 1
+                    elif cleaned_response[i] == '}':
+                        depth -= 1
+                        if depth == 0:
+                            end = i + 1
+                            break
+
+                json_str = cleaned_response[start:end]
+                return json.loads(json_str)
+            except (json.JSONDecodeError, ValueError) as e:
+                raise ValueError(f"LLM返回的JSON格式无效: {cleaned_response[:200]}")
 

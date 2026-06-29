@@ -55,6 +55,7 @@
           :reportId="currentReportId"
           :simulationId="simulationId"
           :systemLogs="systemLogs"
+          @go-back="handleGoBack"
           @add-log="addLog"
           @update-status="updateStatus"
         />
@@ -123,8 +124,15 @@ const statusText = computed(() => {
 const addLog = (msg) => {
   const time = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' }) + '.' + new Date().getMilliseconds().toString().padStart(3, '0')
   systemLogs.value.push({ time, msg })
-  if (systemLogs.value.length > 200) {
-    systemLogs.value.shift()
+}
+
+// --- Navigation ---
+const handleGoBack = () => {
+  // 返回到 Step 3 (开始模拟)
+  if (simulationId.value) {
+    router.push({ name: 'SimulationRun', params: { simulationId: simulationId.value } })
+  } else {
+    router.push('/')
   }
 }
 

@@ -4,12 +4,13 @@
 
 from .ontology_generator import OntologyGenerator
 from .graph_builder import GraphBuilderService
+from .graph_store import GraphStore
 from .text_processor import TextProcessor
 from .zep_entity_reader import ZepEntityReader, EntityNode, FilteredEntities
 from .oasis_profile_generator import OasisProfileGenerator, OasisAgentProfile
 from .simulation_manager import SimulationManager, SimulationState, SimulationStatus
 from .simulation_config_generator import (
-    SimulationConfigGenerator, 
+    SimulationConfigGenerator,
     SimulationParameters,
     AgentActivityConfig,
     TimeSimulationConfig,
@@ -38,8 +39,9 @@ from .simulation_ipc import (
 )
 
 __all__ = [
-    'OntologyGenerator', 
-    'GraphBuilderService', 
+    'OntologyGenerator',
+    'GraphBuilderService',
+    'GraphStore',
     'TextProcessor',
     'ZepEntityReader',
     'EntityNode',

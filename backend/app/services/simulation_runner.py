@@ -12,6 +12,7 @@ import threading
 import subprocess
 import signal
 import atexit
+from collections import deque
 from typing import Dict, Any, List, Optional, Union
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -21,6 +22,7 @@ from queue import Queue
 from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.locale import get_locale, set_locale
+from ..utils.atomic_io import atomic_write_json
 from .zep_graph_memory_updater import ZepGraphMemoryManager
 from .simulation_ipc import SimulationIPCClient, CommandType, IPCResponse
 
@@ -103,12 +105,16 @@ class SimulationRunState:
     """模拟运行状态（实时）"""
     simulation_id: str
     runner_status: RunnerStatus = RunnerStatus.IDLE
-    
+
     # 进度信息
     current_round: int = 0
     total_rounds: int = 0
     simulated_hours: int = 0
     total_simulation_hours: int = 0
+
+    # 用户传入的目标最大轮数（用于截断），0 表示未设置
+    # 快照必须显式记录此值，以便恢复时知道原始意图
+    user_max_rounds: int = 0
     
     # 各平台独立轮次和模拟时间（用于双平台并行显示）
     twitter_current_round: int = 0
@@ -128,35 +134,41 @@ class SimulationRunState:
     
     # 每轮摘要
     rounds: List[RoundSummary] = field(default_factory=list)
-    
+
     # 最近动作（用于前端实时展示）
-    recent_actions: List[AgentAction] = field(default_factory=list)
+    # 优化 B6：用 deque(maxlen=50) 替代 list，appendleft + 自动截断 O(1)
+    # 业务语义不变：仍按"最新在前"顺序，max 50 条
     max_recent_actions: int = 50
-    
+    recent_actions: "deque" = field(default_factory=lambda: deque(maxlen=50))
+
+    # 优化 B2：脏标记 —— state 字段被改动后置 True，由 _save_run_state_if_dirty 统一落盘
+    # 业务语义不变：磁盘最终内容与原版完全一致
+    _dirty: bool = False
+
     # 时间戳
     started_at: Optional[str] = None
     updated_at: str = field(default_factory=lambda: datetime.now().isoformat())
     completed_at: Optional[str] = None
-    
+
     # 错误信息
     error: Optional[str] = None
-    
+
     # 进程ID（用于停止）
     process_pid: Optional[int] = None
-    
+
     def add_action(self, action: AgentAction):
         """添加动作到最近动作列表"""
-        self.recent_actions.insert(0, action)
-        if len(self.recent_actions) > self.max_recent_actions:
-            self.recent_actions = self.recent_actions[:self.max_recent_actions]
-        
+        # 优化 B6：deque.appendleft + 自动截断（O(1)）
+        self.recent_actions.appendleft(action)
+
         if action.platform == "twitter":
             self.twitter_actions_count += 1
         else:
             self.reddit_actions_count += 1
-        
+
         self.updated_at = datetime.now().isoformat()
-    
+        self._dirty = True  # 优化 B2：标脏
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "simulation_id": self.simulation_id,
@@ -166,6 +178,8 @@ class SimulationRunState:
             "simulated_hours": self.simulated_hours,
             "total_simulation_hours": self.total_simulation_hours,
             "progress_percent": round(self.current_round / max(self.total_rounds, 1) * 100, 1),
+            # 用户原始的 max_rounds（用于快照诊断/恢复）
+            "user_max_rounds": self.user_max_rounds,
             # 各平台独立轮次和时间
             "twitter_current_round": self.twitter_current_round,
             "reddit_current_round": self.reddit_current_round,
@@ -184,10 +198,11 @@ class SimulationRunState:
             "error": self.error,
             "process_pid": self.process_pid,
         }
-    
+
     def to_detail_dict(self) -> Dict[str, Any]:
         """包含最近动作的详细信息"""
         result = self.to_dict()
+        # deque 同样支持迭代 + list(...) 转 list，下游 [a.to_dict() for a in ...] 不变
         result["recent_actions"] = [a.to_dict() for a in self.recent_actions]
         result["rounds_count"] = len(self.rounds)
         return result
@@ -226,7 +241,7 @@ class SimulationRunner:
     
     # 图谱记忆更新配置
     _graph_memory_enabled: Dict[str, bool] = {}  # simulation_id -> enabled
-    
+
     @classmethod
     def get_run_state(cls, simulation_id: str) -> Optional[SimulationRunState]:
         """获取运行状态"""
@@ -257,6 +272,8 @@ class SimulationRunner:
                 total_rounds=data.get("total_rounds", 0),
                 simulated_hours=data.get("simulated_hours", 0),
                 total_simulation_hours=data.get("total_simulation_hours", 0),
+                # 旧快照可能没有这个字段，data.get 默认 0
+                user_max_rounds=data.get("user_max_rounds", 0),
                 # 各平台独立轮次和时间
                 twitter_current_round=data.get("twitter_current_round", 0),
                 reddit_current_round=data.get("reddit_current_round", 0),
@@ -275,10 +292,12 @@ class SimulationRunner:
                 process_pid=data.get("process_pid"),
             )
             
-            # 加载最近动作
+            # 加载最近动作（JSON 按 [新→旧] 顺序存，deque 也需保持此顺序）
+            # 优化 B6：直接用 appendleft 与运行时一致；deque 自动按 maxlen 截断
+            # 业务语义不变：deque 左端是最新动作
             actions_data = data.get("recent_actions", [])
             for a in actions_data:
-                state.recent_actions.append(AgentAction(
+                state.recent_actions.appendleft(AgentAction(
                     round_num=a.get("round_num", 0),
                     timestamp=a.get("timestamp", ""),
                     platform=a.get("platform", ""),
@@ -296,18 +315,127 @@ class SimulationRunner:
             return None
     
     @classmethod
-    def _save_run_state(cls, state: SimulationRunState):
-        """保存运行状态到文件"""
+    def _save_run_state(cls, state: SimulationRunState, force: bool = False):
+        """保存运行状态到文件
+
+        Args:
+            state: 运行状态对象
+            force: 是否强制写入（默认 False，标脏时由调用方决定）
+
+        业务语义不变：磁盘最终内容与原版完全一致。
+        """
         sim_dir = os.path.join(cls.RUN_STATE_DIR, state.simulation_id)
         os.makedirs(sim_dir, exist_ok=True)
         state_file = os.path.join(sim_dir, "run_state.json")
-        
+
         data = state.to_detail_dict()
-        
-        with open(state_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        
+
+        # 使用原子写入：监控线程每 5s 写一次，前端每 2-3s 读取，避免读到半截 JSON
+        atomic_write_json(state_file, data)
+
+        # 写盘完成后清脏标记
+        state._dirty = False
         cls._run_states[state.simulation_id] = state
+
+    @classmethod
+    def _cleanup_ipc_dirs(cls, simulation_id: str) -> None:
+        """
+        关键修复（BUG-7/8）：清理 ipc_commands/ 和 ipc_responses/ 残留。
+        旧实现不删这两个目录，force=true 重启 / restore_snapshot 后，
+        新子进程 IPC server poll_commands 读到旧命令，server 端用相同 command_id 发响应，
+        新 Flask 端 IPC client 等不到（它等的是新 command_id），旧响应残留
+        解决：清空两个目录内所有 .json，与 IPC client/server 协议一致。
+        """
+        sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
+        for ipc_dir_name in ("ipc_commands", "ipc_responses"):
+            ipc_dir_path = os.path.join(sim_dir, ipc_dir_name)
+            if not os.path.isdir(ipc_dir_path):
+                continue
+            try:
+                for entry in os.listdir(ipc_dir_path):
+                    if not entry.endswith(".json"):
+                        continue
+                    try:
+                        os.remove(os.path.join(ipc_dir_path, entry))
+                    except Exception as e:
+                        logger.warning(f"清理 IPC {ipc_dir_name}/{entry} 失败: {e}")
+                logger.info(f"已清理 IPC 目录残留: {ipc_dir_name}/")
+            except Exception as e:
+                logger.warning(f"清理 IPC 目录失败 {ipc_dir_name}: {e}")
+
+    @classmethod
+    def _cleanup_stale_simulation_resources(cls, simulation_id: str, reason: str = "") -> None:
+        """
+        清理某个 simulation_id 残留的子进程、监控线程和共享资源。
+
+        用于：
+        1. _start_simulation_impl 启动新进程前（防止双进程并发）
+        2. restore_snapshot 后清理旧资源（可选，作为 _start_simulation_impl 的预清理）
+
+        清理范围：
+        - cls._processes[simulation_id]          # 旧的子进程（终止+清理引用）
+        - cls._monitor_threads[simulation_id]     # 旧的监控线程（join+清理引用）
+        - cls._action_queues[simulation_id]       # 旧的动作队列
+        - cls._graph_memory_enabled[simulation_id] # 旧的图谱更新器标志
+        - cls._stdout_files[simulation_id]        # 旧的 stdout 文件句柄
+        - cls._stderr_files[simulation_id]        # 旧的 stderr 文件句柄
+
+        Args:
+            simulation_id: 模拟 ID
+            reason: 清理原因（仅用于日志）
+        """
+        log_prefix = f"[清理残留资源] {simulation_id}"
+        if reason:
+            log_prefix += f" ({reason})"
+        logger.info(log_prefix)
+
+        # 1. 终止旧进程
+        old_process = cls._processes.get(simulation_id)
+        if old_process is not None:
+            if old_process.poll() is None:
+                logger.info(f"  - 终止旧子进程 PID={old_process.pid}")
+                try:
+                    cls._terminate_process(old_process, simulation_id, timeout=5)
+                except Exception as e:
+                    logger.warning(f"  - 终止旧子进程失败: {e}")
+            else:
+                logger.info(f"  - 旧子进程已退出（returncode={old_process.returncode}），跳过终止")
+            cls._processes.pop(simulation_id, None)
+
+        # 2. 等待旧监控线程退出
+        # 监控线程会在其 finally 块中清理 stdout_files / stderr_files / _processes 等资源
+        # 必须等它退出，否则它的 finally 块会清理掉我们即将创建的新资源
+        old_monitor = cls._monitor_threads.get(simulation_id)
+        if old_monitor is not None:
+            if old_monitor.is_alive():
+                logger.info("  - 等待旧监控线程退出（最多 10 秒）")
+                old_monitor.join(timeout=10)
+                if old_monitor.is_alive():
+                    logger.warning("  - 旧监控线程 10 秒内未退出（可能仍持有 stdout 句柄）")
+            cls._monitor_threads.pop(simulation_id, None)
+
+        # 3. 清理其他共享资源（监控线程 finally 已清理一部分，这里是双保险）
+        for dict_name in ("_action_queues", "_graph_memory_enabled"):
+            target = getattr(cls, dict_name, None)
+            if target is not None and simulation_id in target:
+                target.pop(simulation_id, None)
+
+        # 4. 关闭 stdout/stderr 文件句柄（如果监控线程还没来得及关）
+        for files_dict_name in ("_stdout_files", "_stderr_files"):
+            files_dict = getattr(cls, files_dict_name, None)
+            if files_dict is None:
+                continue
+            fh = files_dict.get(simulation_id)
+            if fh is not None:
+                try:
+                    fh.close()
+                except Exception as e:
+                    logger.warning(f"  - 关闭 {files_dict_name} 失败: {e}")
+                files_dict.pop(simulation_id, None)
+
+        # 5. 关键修复（BUG-7/8）：清理 IPC 命令/响应残留
+        # 在启动新进程前清掉旧 IPC 命令，避免新子进程 IPC server 读到旧命令
+        cls._cleanup_ipc_dirs(simulation_id)
 
     @classmethod
     def _sync_manager_state(cls, simulation_id: str, run_state: SimulationRunState):
@@ -346,31 +474,51 @@ class SimulationRunner:
         platform: str = "parallel",  # twitter / reddit / parallel
         max_rounds: int = None,  # 最大模拟轮数（可选，用于截断过长的模拟）
         enable_graph_memory_update: bool = False,  # 是否将活动更新到Zep图谱
-        graph_id: str = None  # Zep图谱ID（启用图谱更新时必需）
+        graph_id: str = None,  # Zep图谱ID（启用图谱更新时必需）
+        start_round: int = 0,  # 从指定轮次开始（用于快照恢复后继续）
     ) -> SimulationRunState:
         """
         启动模拟
-        
+
         Args:
             simulation_id: 模拟ID
             platform: 运行平台 (twitter/reddit/parallel)
             max_rounds: 最大模拟轮数（可选，用于截断过长的模拟）
             enable_graph_memory_update: 是否将Agent活动动态更新到Zep图谱
             graph_id: Zep图谱ID（启用图谱更新时必需）
-            
+            start_round: 从指定轮次开始（0=从头开始）
+
         Returns:
             SimulationRunState
         """
-        # 检查是否已在运行
-        existing = cls.get_run_state(simulation_id)
-        if existing and existing.runner_status in [RunnerStatus.RUNNING, RunnerStatus.STARTING]:
-            raise ValueError(f"模拟已在运行中: {simulation_id}")
-        
+        try:
+            return cls._start_simulation_impl(
+                simulation_id, platform, max_rounds, enable_graph_memory_update, graph_id, start_round
+            )
+        except (ValueError, KeyError):
+            raise
+        except Exception as e:
+            logger.error(f"start_simulation 内部异常: simulation_id={simulation_id}, error={e}")
+            raise ValueError(f"启动模拟内部错误: {str(e)}")
+
+    @classmethod
+    def _start_simulation_impl(
+        cls,
+        simulation_id: str,
+        platform: str,
+        max_rounds,
+        enable_graph_memory_update: bool,
+        graph_id: str,
+        start_round: int,
+    ) -> SimulationRunState:
+        logger.info(f"_start_simulation_impl 开始: simulation_id={simulation_id}, platform={platform}, start_round={start_round}, max_rounds={max_rounds}")
+
         # 加载模拟配置
         sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
         config_path = os.path.join(sim_dir, "simulation_config.json")
-        
+
         if not os.path.exists(config_path):
+            logger.error(f"模拟配置不存在: {config_path}")
             raise ValueError(f"模拟配置不存在，请先调用 /prepare 接口")
         
         with open(config_path, 'r', encoding='utf-8') as f:
@@ -381,29 +529,108 @@ class SimulationRunner:
         total_hours = time_config.get("total_simulation_hours", 72)
         minutes_per_round = time_config.get("minutes_per_round", 30)
         total_rounds = int(total_hours * 60 / minutes_per_round)
-        
-        # 如果指定了最大轮数，则截断
+
+        # 记录起始轮次
+        actual_start_round = 0
+        if start_round > 0:
+            actual_start_round = start_round
+            logger.info(f"从轮次 {actual_start_round} 开始（已跳过 {start_round} 轮）")
+        else:
+            logger.info(f"将从头开始（start_round={start_round}）")
+
+        # 快照恢复场景：尝试从 run_state.json 恢复 total_rounds / user_max_rounds
+        # 无论选择"继续"还是"从头开始"，都应该恢复这些字段
+        # 因为它们代表的是「整个模拟应有的总轮数/最大轮数」，不是剩余轮数
+        # 重要：通过 run_state.json 中的 restored_at 标记判断是否刚被 restore_snapshot 重置过
+        # （restore_snapshot 会写入 restored_at；普通启动没有这个字段）
+        # 这样可以同时覆盖 start_round=0（start_over 模式）的快照恢复场景
+        # 旧实现仅依赖 runner_status == 'idle'，在崩溃/异常路径下不可靠
+        run_state_file = os.path.join(sim_dir, "run_state.json")
+        restored_from_snapshot = False
+        if os.path.exists(run_state_file):
+            try:
+                with open(run_state_file, 'r', encoding='utf-8') as f:
+                    saved_state = json.load(f)
+                saved_total_rounds = saved_state.get('total_rounds')
+                saved_user_max_rounds = saved_state.get('user_max_rounds', 0)
+                saved_runner_status = saved_state.get('runner_status', '')
+                saved_restored_at = saved_state.get('restored_at', '')
+                saved_current_round = saved_state.get('current_round', 0)
+                logger.info(
+                    f"读取 run_state.json: current_round={saved_current_round}, "
+                    f"total_rounds={saved_total_rounds}, user_max_rounds={saved_user_max_rounds}, "
+                    f"runner_status={saved_runner_status}, restored_at={saved_restored_at}"
+                )
+
+                # 关键修复：用 restored_at 时间戳作为「快照恢复」的可靠信号
+                # 原因：runner_status 在崩溃/异常路径下可能残留为 running/stopping，
+                # 旧实现下 restored_from_snapshot 会判 False，导致 --max-rounds
+                # 不透传给子脚本，子脚本按 time_config 独立计算 total_rounds 多跑。
+                # 兼容：如果 restored_at 不存在（老 run_state 升级场景），回退到
+                # runner_status=='idle' 判定，并要求 current_round>0（与「真快照恢复」一致）
+                if saved_restored_at:
+                    restored_from_snapshot = True
+                    logger.info(
+                        f"检测到 restored_at={saved_restored_at}，判定为快照恢复场景（可靠信号）"
+                    )
+                elif saved_runner_status == 'idle' and saved_current_round > 0:
+                    restored_from_snapshot = True
+                    logger.info("检测到 runner_status=idle 且 current_round>0，判定为快照恢复场景（兼容路径）")
+                else:
+                    logger.info("未检测到快照恢复标记，判定为普通启动")
+
+                if saved_total_rounds and saved_total_rounds > 0:
+                    total_rounds = saved_total_rounds
+                    logger.info(f"从快照恢复 total_rounds: {total_rounds}（原计算值 {int(total_hours * 60 / minutes_per_round)}）")
+                else:
+                    logger.info(f"run_state.json 中 total_rounds={saved_total_rounds}，使用配置计算值 {int(total_hours * 60 / minutes_per_round)}")
+            except Exception as e:
+                logger.warning(f"读取快照 total_rounds 失败: {e}，使用计算值")
+
+        # 如果指定了最大轮数，则截断（仅在非快照恢复且显式传了 max_rounds 时）
+        # 快照恢复场景下不应截断 total_rounds，因为它代表的是整个模拟应有的总轮数
+        # 注意：如果是快照恢复，total_rounds 已经从 run_state.json 恢复过了（可能是被原 max_rounds 截断后的值），
+        # 此时不能再用新的 max_rounds 进一步截断，否则可能与快照意图冲突
         if max_rounds is not None and max_rounds > 0:
             original_rounds = total_rounds
             total_rounds = min(total_rounds, max_rounds)
             if total_rounds < original_rounds:
                 logger.info(f"轮数已截断: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
-        
+
+        # 确定本次运行最终要保存的 user_max_rounds：
+        # - 快照恢复：使用从 run_state.json 恢复的值（保持快照原始意图）
+        # - 普通启动：使用用户本次传入的 max_rounds
+        final_user_max_rounds = 0
+        if restored_from_snapshot and saved_user_max_rounds and saved_user_max_rounds > 0:
+            final_user_max_rounds = saved_user_max_rounds
+        elif max_rounds is not None and max_rounds > 0:
+            final_user_max_rounds = max_rounds
+
         state = SimulationRunState(
             simulation_id=simulation_id,
             runner_status=RunnerStatus.STARTING,
             total_rounds=total_rounds,
             total_simulation_hours=total_hours,
             started_at=datetime.now().isoformat(),
+            current_round=actual_start_round,
+            user_max_rounds=final_user_max_rounds,
         )
         
         cls._save_run_state(state)
-        
+
+        # 自检修复：启动新进程前清理旧的进程/监控线程/共享资源
+        # 关键场景：快照恢复（continue 或 start_over）后，原模拟的子进程可能仍在运行
+        # （因为 restore_snapshot 不会停止进程），如果不清理会导致：
+        #   1. 两个子进程并发写 actions.jsonl / DB，文件冲突
+        #   2. 两个监控线程并发写 run_state.json，状态竞争
+        #   3. 旧的 stdout 文件句柄被新进程复用，旧监控线程 finally 中可能错误清理新进程的资源
+        cls._cleanup_stale_simulation_resources(simulation_id, reason="启动新进程前清理")
+
         # 如果启用图谱记忆更新，创建更新器
         if enable_graph_memory_update:
             if not graph_id:
                 raise ValueError("启用图谱记忆更新时必须提供 graph_id")
-            
+
             try:
                 ZepGraphMemoryManager.create_updater(simulation_id, graph_id)
                 cls._graph_memory_enabled[simulation_id] = True
@@ -413,7 +640,9 @@ class SimulationRunner:
                 cls._graph_memory_enabled[simulation_id] = False
         else:
             cls._graph_memory_enabled[simulation_id] = False
-        
+
+        logger.info(f"图谱记忆更新器处理完成: simulation_id={simulation_id}, enabled={cls._graph_memory_enabled.get(simulation_id, False)}")
+
         # 确定运行哪个脚本（脚本位于 backend/scripts/ 目录）
         if platform == "twitter":
             script_name = "run_twitter_simulation.py"
@@ -429,12 +658,15 @@ class SimulationRunner:
         script_path = os.path.join(cls.SCRIPTS_DIR, script_name)
         
         if not os.path.exists(script_path):
+            logger.error(f"脚本不存在: {script_path}")
             raise ValueError(f"脚本不存在: {script_path}")
-        
+
+        logger.info(f"脚本检查通过: {script_path}")
+
         # 创建动作队列
         action_queue = Queue()
         cls._action_queues[simulation_id] = action_queue
-        
+
         # 启动模拟进程
         try:
             # 构建运行命令，使用完整路径
@@ -442,17 +674,40 @@ class SimulationRunner:
             #   twitter/actions.jsonl - Twitter 动作日志
             #   reddit/actions.jsonl  - Reddit 动作日志
             #   simulation.log        - 主进程日志
-            
+
             cmd = [
                 sys.executable,  # Python解释器
                 script_path,
                 "--config", config_path,  # 使用完整配置文件路径
             ]
-            
-            # 如果指定了最大轮数，添加到命令行参数
-            if max_rounds is not None and max_rounds > 0:
+
+            # 关键修复：快照恢复场景下，必须将快照恢复后的 total_rounds
+            # 作为 --max-rounds 传递给脚本。否则脚本会从 simulation_config.json 独立计算
+            # total_rounds = (total_hours * 60) // minutes_per_round，如果原始模拟使用了
+            # max_rounds 截断（例如 max_rounds=50，config total_rounds=72），快照保存的
+            # total_rounds=50，但脚本计算的会是 72，导致 range(start_round, 72) 多跑数轮，
+            # 表现为「失去最终轮次的判断，会持续运行下去」。
+            #
+            # 触发条件：start_round > 0（继续模式） OR restored_from_snapshot（包含 start_over 模式）
+            # 修复策略：
+            #   - 快照恢复（继续 或 从头开始）：使用 total_rounds（已从 run_state.json 恢复，
+            #     可能已被原 max_rounds 截断）作为 --max-rounds
+            #   - 正常启动（无快照）：使用用户传入的 max_rounds 作为 --max-rounds
+            if start_round > 0 or restored_from_snapshot:
+                # 快照恢复：使用已恢复的 total_rounds（与 state.total_rounds 一致）
+                cmd.extend(["--max-rounds", str(total_rounds)])
+                if start_round > 0:
+                    cmd.extend(["--start-round", str(start_round)])
+                logger.info(
+                    f"快照恢复场景：传递 --max-rounds {total_rounds}"
+                    f"{' 和 --start-round ' + str(start_round) if start_round > 0 else '（start_over 模式，从头开始）'} "
+                    f"（脚本将基于 max_rounds 截断 total_rounds，确保与快照保存的轮数一致）"
+                )
+            elif max_rounds is not None and max_rounds > 0:
                 cmd.extend(["--max-rounds", str(max_rounds)])
-            
+
+            logger.info(f"构建启动命令: {' '.join(cmd[:5])}...")
+
             # 创建主日志文件，避免 stdout/stderr 管道缓冲区满导致进程阻塞
             main_log_path = os.path.join(sim_dir, "simulation.log")
             main_log_file = open(main_log_path, 'w', encoding='utf-8')
@@ -465,6 +720,7 @@ class SimulationRunner:
             
             # 设置工作目录为模拟目录（数据库等文件会生成在此）
             # 使用 start_new_session=True 创建新的进程组，确保可以通过 os.killpg 终止所有子进程
+            logger.info(f"准备启动子进程: cwd={sim_dir}")
             process = subprocess.Popen(
                 cmd,
                 cwd=sim_dir,
@@ -476,6 +732,7 @@ class SimulationRunner:
                 env=env,  # 传递带有 UTF-8 设置的环境变量
                 start_new_session=True,  # 创建新进程组，确保服务器关闭时能终止所有相关进程
             )
+            logger.info(f"子进程启动成功: pid={process.pid}")
             
             # 保存文件句柄以便后续关闭
             cls._stdout_files[simulation_id] = main_log_file
@@ -485,6 +742,22 @@ class SimulationRunner:
             state.runner_status = RunnerStatus.RUNNING
             cls._processes[simulation_id] = process
             cls._save_run_state(state)
+
+            # 关键修复：清掉 restored_at 标记
+            # restore_snapshot 写入的 restored_at 在新进程成功启动后失效，
+            # 否则下次普通启动会再次被误判为「快照恢复场景」并错误透传 max_rounds/start_round
+            # 直接修改 run_state.json（state 内存对象不持有这两个字段，下次 save 会覆盖）
+            try:
+                if os.path.exists(run_state_file):
+                    with open(run_state_file, 'r', encoding='utf-8') as f:
+                        _rs = json.load(f)
+                    if _rs.get("restored_at") or _rs.get("restored_snapshot_name"):
+                        _rs.pop("restored_at", None)
+                        _rs.pop("restored_snapshot_name", None)
+                        atomic_write_json(run_state_file, _rs)
+                        logger.info("已清掉 restored_at 标记（本次恢复已完成使命）")
+            except Exception as _e:
+                logger.warning(f"清掉 restored_at 失败: {_e}（下次启动可能误判，下次正常启动时也会被 _save_run_state 覆盖）")
             
             # Capture locale before spawning monitor thread
             current_locale = get_locale()
@@ -526,29 +799,56 @@ class SimulationRunner:
 
         twitter_position = 0
         reddit_position = 0
+        twitter_last_size = -1  # 性能优化：文件大小短路；未增长则跳过 read+parse
+        reddit_last_size = -1
         last_save_time = 0  # 上次保存时间戳
         save_interval = 5  # 至少间隔 5 秒才保存
+        # 优化 S1：周期性自动快照 —— 长跑模拟抗风险
+        # 每 SIMULATION_AUTO_SNAPSHOT_INTERVAL_ROUNDS 轮触发一次 snapshot
+        # 仅保留最近 SIMULATION_AUTO_SNAPSHOTS_KEEP 个 auto 快照
+        last_snapshot_round = -1  # 上次快照时的轮次（-1 表示尚未快照过）
 
         try:
             while process.poll() is None:  # 进程仍在运行
                 changed = False
                 # 读取 Twitter 动作日志
+                # 性能优化：先看文件大小，上次已读到文件末尾则跳过 open + read
+                # 依据：子进程 append-only 写，文件只增不减；position == size ⇒ 无新数据
                 if os.path.exists(twitter_actions_log):
-                    new_position = cls._read_action_log(
-                        twitter_actions_log, twitter_position, state, "twitter"
-                    )
-                    if new_position != twitter_position:
-                        twitter_position = new_position
-                        changed = True
+                    try:
+                        cur_size = os.path.getsize(twitter_actions_log)
+                    except OSError:
+                        cur_size = 0
+                    if cur_size != twitter_last_size:
+                        new_position = cls._read_action_log(
+                            twitter_actions_log, twitter_position, state, "twitter"
+                        )
+                        if new_position != twitter_position:
+                            twitter_position = new_position
+                            changed = True
+                        # 读完后用 size 更新 last_size，下次 size 不变即短路
+                        try:
+                            twitter_last_size = os.path.getsize(twitter_actions_log)
+                        except OSError:
+                            twitter_last_size = new_position
 
                 # 读取 Reddit 动作日志
                 if os.path.exists(reddit_actions_log):
-                    new_position = cls._read_action_log(
-                        reddit_actions_log, reddit_position, state, "reddit"
-                    )
-                    if new_position != reddit_position:
-                        reddit_position = new_position
-                        changed = True
+                    try:
+                        cur_size = os.path.getsize(reddit_actions_log)
+                    except OSError:
+                        cur_size = 0
+                    if cur_size != reddit_last_size:
+                        new_position = cls._read_action_log(
+                            reddit_actions_log, reddit_position, state, "reddit"
+                        )
+                        if new_position != reddit_position:
+                            reddit_position = new_position
+                            changed = True
+                        try:
+                            reddit_last_size = os.path.getsize(reddit_actions_log)
+                        except OSError:
+                            reddit_last_size = new_position
 
                 # 只在数据有变化时保存，且间隔至少 5 秒（减少磁盘 I/O）
                 current_time = time.time()
@@ -592,6 +892,17 @@ class SimulationRunner:
             # 同步更新 SimulationManager 的 state.json
             cls._sync_manager_state(simulation_id, state)
 
+            # 优化 S2：进程异常退出时自动 snapshot（崩溃抗风险）
+            # 仅在 exit_code != 0 时触发，0 是正常完成（已有前端 on_complete 快照）
+            # snapshot 失败不能阻塞原异常路径
+            if exit_code != 0:
+                try:
+                    snap_name = f"crash_r{state.current_round}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    cls.create_snapshot(simulation_id, snapshot_name=snap_name)
+                    logger.info(f"崩溃自动快照: {simulation_id} @ round {state.current_round}, exit_code={exit_code}")
+                except Exception as snap_err:
+                    logger.warning(f"崩溃快照失败（已跳过）: {snap_err}")
+
         except Exception as e:
             logger.error(f"监控线程异常: {simulation_id}, error={str(e)}")
             state.runner_status = RunnerStatus.FAILED
@@ -600,6 +911,14 @@ class SimulationRunner:
 
             # 同步更新 SimulationManager 的 state.json
             cls._sync_manager_state(simulation_id, state)
+
+            # 优化 S2：监控线程自身异常也尝试 snapshot（兜底抗风险）
+            try:
+                snap_name = f"crash_r{state.current_round}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                cls.create_snapshot(simulation_id, snapshot_name=snap_name)
+                logger.info(f"监控线程异常自动快照: {simulation_id} @ round {state.current_round}")
+            except Exception as snap_err:
+                logger.warning(f"监控异常快照失败（已跳过）: {snap_err}")
         
         finally:
             # 停止图谱记忆更新器
@@ -692,7 +1011,7 @@ class SimulationRunner:
                                 elif event_type == "round_end":
                                     round_num = action_data.get("round", 0)
                                     simulated_hours = action_data.get("simulated_hours", 0)
-                                    
+
                                     # 更新各平台独立的轮次和时间
                                     if platform == "twitter":
                                         if round_num > state.twitter_current_round:
@@ -702,13 +1021,28 @@ class SimulationRunner:
                                         if round_num > state.reddit_current_round:
                                             state.reddit_current_round = round_num
                                         state.reddit_simulated_hours = simulated_hours
-                                    
+
                                     # 总体轮次取两个平台的最大值
                                     if round_num > state.current_round:
                                         state.current_round = round_num
                                     # 总体时间取两个平台的最大值
                                     state.simulated_hours = max(state.twitter_simulated_hours, state.reddit_simulated_hours)
-                                
+
+                                    # 优化 S1：周期性自动快照（每 N 轮触发一次）
+                                    # 业务不变性：snapshot 是"过去数据"完整保存，恢复后从同 start_round 继续
+                                    if Config.SIMULATION_AUTO_SNAPSHOT_ENABLED:
+                                        interval = Config.SIMULATION_AUTO_SNAPSHOT_INTERVAL_ROUNDS
+                                        if interval > 0 and round_num > 0 and round_num - last_snapshot_round >= interval:
+                                            try:
+                                                snap_name = f"auto_r{round_num}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                                                cls.create_snapshot(state.simulation_id, snapshot_name=snap_name)
+                                                cls._cleanup_old_auto_snapshots(state.simulation_id)
+                                                last_snapshot_round = round_num
+                                                logger.info(f"周期性自动快照: {state.simulation_id} @ round {round_num}")
+                                            except Exception as snap_err:
+                                                # snapshot 失败不能阻塞模拟主流程
+                                                logger.warning(f"周期性快照失败（已跳过）: {snap_err}")
+
                                 continue
                             
                             action = AgentAction(
@@ -1152,35 +1486,41 @@ class SimulationRunner:
     def cleanup_simulation_logs(cls, simulation_id: str) -> Dict[str, Any]:
         """
         清理模拟的运行日志（用于强制重新开始模拟）
-        
+
         会删除以下文件：
         - run_state.json
         - twitter/actions.jsonl
         - reddit/actions.jsonl
         - simulation.log
         - stdout.log / stderr.log
-        - twitter_simulation.db（模拟数据库）
-        - reddit_simulation.db（模拟数据库）
+        - twitter_simulation.db / twitter_simulation_*.db（模拟数据库）
+        - reddit_simulation.db / reddit_simulation_*.db（模拟数据库）
         - env_status.json（环境状态）
-        
+        - snapshots/ 目录（清理历史快照）
+
         注意：不会删除配置文件（simulation_config.json）和 profile 文件
-        
+
+        清理范围与 create_snapshot 保持对称：
+        - 快照保存的文件会被 cleanup 清理
+        - 避免 force=true 时删除刚恢复的快照文件
+
         Args:
             simulation_id: 模拟ID
-            
+
         Returns:
             清理结果信息
         """
         import shutil
-        
+        import glob
+
         sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
-        
+
         if not os.path.exists(sim_dir):
             return {"success": True, "message": "模拟目录不存在，无需清理"}
-        
+
         cleaned_files = []
         errors = []
-        
+
         # 要删除的文件列表（包括数据库文件）
         files_to_delete = [
             "run_state.json",
@@ -1191,11 +1531,8 @@ class SimulationRunner:
             "reddit_simulation.db",   # Reddit 平台数据库
             "env_status.json",        # 环境状态文件
         ]
-        
-        # 要删除的目录列表（包含动作日志）
-        dirs_to_clean = ["twitter", "reddit"]
-        
-        # 删除文件
+
+        # 删除精确匹配的文件
         for filename in files_to_delete:
             file_path = os.path.join(sim_dir, filename)
             if os.path.exists(file_path):
@@ -1204,25 +1541,47 @@ class SimulationRunner:
                     cleaned_files.append(filename)
                 except Exception as e:
                     errors.append(f"删除 {filename} 失败: {str(e)}")
-        
+
+        # 删除 glob 匹配的数据库文件（与 create_snapshot 中的快照保存保持一致）
+        db_patterns = [
+            "twitter_simulation_*.db",
+            "reddit_simulation_*.db",
+        ]
+        for db_pattern in db_patterns:
+            matching_files = glob.glob(os.path.join(sim_dir, db_pattern))
+            for db_path in matching_files:
+                db_name = os.path.basename(db_path)
+                try:
+                    os.remove(db_path)
+                    cleaned_files.append(db_name)
+                except Exception as e:
+                    errors.append(f"删除 {db_name} 失败: {str(e)}")
+
         # 清理平台目录中的动作日志
+        dirs_to_clean = ["twitter", "reddit"]
         for dir_name in dirs_to_clean:
             dir_path = os.path.join(sim_dir, dir_name)
             if os.path.exists(dir_path):
-                actions_file = os.path.join(dir_path, "actions.jsonl")
-                if os.path.exists(actions_file):
-                    try:
-                        os.remove(actions_file)
-                        cleaned_files.append(f"{dir_name}/actions.jsonl")
-                    except Exception as e:
-                        errors.append(f"删除 {dir_name}/actions.jsonl 失败: {str(e)}")
-        
+                for file_in_dir in ["actions.jsonl", "profiles.json"]:
+                    actions_file = os.path.join(dir_path, file_in_dir)
+                    if os.path.exists(actions_file):
+                        try:
+                            os.remove(actions_file)
+                            cleaned_files.append(f"{dir_name}/{file_in_dir}")
+                        except Exception as e:
+                            errors.append(f"删除 {dir_name}/{file_in_dir} 失败: {str(e)}")
+
+        # 关键修复：清理 IPC 命令/响应残留（BUG-7/8）— 调用共享 helper
+        cls._cleanup_ipc_dirs(simulation_id)
+        cleaned_files.append("ipc_commands/")
+        cleaned_files.append("ipc_responses/")
+
         # 清理内存中的运行状态
         if simulation_id in cls._run_states:
             del cls._run_states[simulation_id]
-        
+
         logger.info(f"清理模拟日志完成: {simulation_id}, 删除文件: {cleaned_files}")
-        
+
         return {
             "success": len(errors) == 0,
             "cleaned_files": cleaned_files,
@@ -1299,8 +1658,8 @@ class SimulationRunner:
                                 state_data = json.load(f)
                             state_data['status'] = 'stopped'
                             state_data['updated_at'] = datetime.now().isoformat()
-                            with open(state_file, 'w', encoding='utf-8') as f:
-                                json.dump(state_data, f, indent=2, ensure_ascii=False)
+                            # 原子写入
+                            atomic_write_json(state_file, state_data)
                             logger.info(f"已更新 state.json 状态为 stopped: {simulation_id}")
                         else:
                             logger.warning(f"state.json 不存在: {state_file}")
@@ -1818,6 +2177,24 @@ class SimulationRunner:
     # ==================== 快照功能 ====================
 
     @classmethod
+    def _validate_snapshot_name(cls, snapshot_name: str) -> Optional[str]:
+        """
+        关键修复（RISK-2/6）：sanitize + 校验 snapshot_name
+        拒绝路径分隔符、NUL、.、..，并截断到 200 字符内。
+        返回 sanitize 后的名字（None 表示拒绝、调用方应返回 400）。
+        """
+        if not isinstance(snapshot_name, str):
+            return None
+        s = snapshot_name.strip()
+        if not s or s in (".", ".."):
+            return None
+        if '/' in s or '\\' in s or '\x00' in s:
+            return None
+        if len(s) > 200:
+            s = s[:200]
+        return s
+
+    @classmethod
     def create_snapshot(cls, simulation_id: str, snapshot_name: Optional[str] = None) -> Dict[str, Any]:
         """
         创建模拟快照（完整保存当前运行状态）
@@ -1848,7 +2225,14 @@ class SimulationRunner:
             }
 
         # 生成快照名称
-        if not snapshot_name:
+        if snapshot_name:
+            snapshot_name = cls._validate_snapshot_name(snapshot_name)
+            if snapshot_name is None:
+                return {
+                    "success": False,
+                    "error": "快照名称不合法（包含路径分隔符或为 . / ..）"
+                }
+        else:
             snapshot_name = f"snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
         snapshot_dir = os.path.join(sim_dir, "snapshots", snapshot_name)
@@ -1936,6 +2320,18 @@ class SimulationRunner:
         if run_state:
             metadata["run_state"] = run_state.to_dict()
 
+        # 记录快照时的当前轮次、总轮次和原始 max_rounds（用于恢复时从快照继续）
+        # total_rounds 代表整个模拟的总轮数（可能已被原 max_rounds 截断），不是剩余轮数，必须保存
+        # user_max_rounds 是用户原始传入的目标最大轮数（0 表示未设置），必须保存以便恢复时知道原始意图
+        if metadata["run_state"]:
+            metadata["current_round"] = metadata["run_state"].get("current_round", 0)
+            metadata["total_rounds"] = metadata["run_state"].get("total_rounds", 0)
+            metadata["user_max_rounds"] = metadata["run_state"].get("user_max_rounds", 0)
+        else:
+            metadata["current_round"] = 0
+            metadata["total_rounds"] = 0
+            metadata["user_max_rounds"] = 0
+
         metadata_path = os.path.join(snapshot_dir, "metadata.json")
         with open(metadata_path, 'w', encoding='utf-8') as f:
             json.dump(metadata, f, ensure_ascii=False, indent=2)
@@ -1949,6 +2345,55 @@ class SimulationRunner:
             "errors": errors if errors else None,
             "run_state": metadata["run_state"],
         }
+
+    @classmethod
+    def _cleanup_old_auto_snapshots(cls, simulation_id: str) -> int:
+        """
+        优化 S1：仅清理周期性 / 崩溃自动快照，保留最近 K 个；手动快照永不清理。
+
+        命名约定：
+        - auto snapshot: auto_r<round>_<timestamp>  ← 自动清理
+        - crash snapshot: crash_r<round>_<timestamp>  ← 自动清理
+        - 其它（用户手动）: 保留
+
+        Args:
+            simulation_id: 模拟ID
+
+        Returns:
+            实际删除的快照数量
+        """
+        import shutil
+        sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
+        snapshots_dir = os.path.join(sim_dir, "snapshots")
+        if not os.path.exists(snapshots_dir):
+            return 0
+
+        keep = Config.SIMULATION_AUTO_SNAPSHOTS_KEEP
+        # 收集所有 auto/crash 快照（按目录 mtime 降序 = 最新在前）
+        auto_snaps = []
+        for name in os.listdir(snapshots_dir):
+            full = os.path.join(snapshots_dir, name)
+            if not os.path.isdir(full):
+                continue
+            if name.startswith("auto_") or name.startswith("crash_"):
+                auto_snaps.append((os.path.getmtime(full), name, full))
+
+        auto_snaps.sort(reverse=True)  # 最新在前
+
+        deleted = 0
+        for i, (_, name, full) in enumerate(auto_snaps):
+            if i < keep:
+                continue  # 保留前 K 个
+            try:
+                shutil.rmtree(full)
+                deleted += 1
+                logger.debug(f"清理旧 auto snapshot: {name}")
+            except Exception as e:
+                logger.warning(f"清理快照失败 {name}: {e}")
+
+        if deleted > 0:
+            logger.info(f"清理 {deleted} 个旧 auto snapshot（保留最近 {keep} 个）")
+        return deleted
 
     @classmethod
     def list_snapshots(cls, simulation_id: str) -> Dict[str, Any]:
@@ -1985,6 +2430,18 @@ class SimulationRunner:
                 except Exception as e:
                     logger.error(f"读取快照元数据失败: {snapshot_name}, error: {e}")
 
+        # 关键修复：按 created_at 时间倒序（最新在前），避免字典序错位
+        # 旧实现使用 sorted(os.listdir(...)) 字典序，auto_r10_xxx < auto_r3_xxx，
+        # 导致 /health 的 latest_snapshot_name 实际指向较旧快照。
+        def _snap_sort_key(s: dict):
+            # 容错：created_at 缺失/解析失败时回退到 0，不会让整个列表崩溃
+            try:
+                from datetime import datetime as _dt
+                return _dt.fromisoformat(s.get("created_at", "")).timestamp()
+            except Exception:
+                return 0.0
+        snapshots.sort(key=_snap_sort_key, reverse=True)
+
         return {
             "success": True,
             "snapshots": snapshots
@@ -2010,6 +2467,15 @@ class SimulationRunner:
         """
         import shutil
 
+        # 关键修复（RISK-6）：在 runner 层兜底校验 snapshot_name
+        # 即使 API 层被绕过，也禁止路径分隔符 / NUL / . / ..
+        snapshot_name = cls._validate_snapshot_name(snapshot_name) if snapshot_name else None
+        if not snapshot_name:
+            return {
+                "success": False,
+                "error": "快照名称不合法"
+            }
+
         sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
         snapshot_dir = os.path.join(sim_dir, "snapshots", snapshot_name)
 
@@ -2033,6 +2499,14 @@ class SimulationRunner:
         restored_files = []
         errors = []
 
+        # 自检修复：恢复快照前先清理旧的子进程/监控线程
+        # （快照恢复典型路径：用户已停止模拟或希望从头开始。如果有旧进程未清理，
+        # 恢复后再启动会导致双进程并发写文件）
+        cls._cleanup_stale_simulation_resources(
+            simulation_id,
+            reason=f"恢复快照前清理: {snapshot_name}"
+        )
+
         # 恢复文件到模拟目录
         for filename in metadata.get("files", []):
             src = os.path.join(snapshot_dir, filename)
@@ -2047,11 +2521,109 @@ class SimulationRunner:
             except Exception as e:
                 errors.append(f"恢复 {filename} 失败: {str(e)}")
 
+        # 关键修复（BUG-7/8）：恢复快照后清理 IPC 命令/响应残留
+        # 避免旧命令被新子进程误处理
+        cls._cleanup_ipc_dirs(simulation_id)
+
+        # 自检修复：清理 actions.jsonl 中残留的 simulation_end 事件
+        # 原因：如果快照是从 COMPLETE 状态创建的，actions.jsonl 末尾会有 simulation_end 标记。
+        # 恢复后监控线程从位置 0 开始读，会先看到旧的 simulation_end 并设置 runner_status=COMPLETED，
+        # 导致新进程还没跑就被前端误判为已完成。
+        # 处理：找到每个平台 actions.jsonl 中最后一个 simulation_end，截掉它及其之后的所有内容。
+        # 这样旧的历史保留（前端仍能看到），但干扰新进程的 simulation_end 标记被清掉。
+        for platform in ("twitter", "reddit"):
+            actions_file = os.path.join(sim_dir, platform, "actions.jsonl")
+            if not os.path.exists(actions_file):
+                continue
+            try:
+                with open(actions_file, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+                # 找到最后一个 simulation_end 的行号
+                cut_index = len(lines)
+                for i in range(len(lines) - 1, -1, -1):
+                    try:
+                        data = json.loads(lines[i].strip())
+                        if data.get("event_type") == "simulation_end":
+                            cut_index = i
+                            break
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                if cut_index < len(lines):
+                    removed = len(lines) - cut_index
+                    with open(actions_file, 'w', encoding='utf-8') as f:
+                        f.writelines(lines[:cut_index])
+                    logger.info(
+                        f"清理 {platform}/actions.jsonl 末尾的 {removed} 行（含 simulation_end），"
+                        f"避免新进程启动时被旧标记干扰"
+                    )
+            except Exception as e:
+                logger.warning(f"清理 {platform}/actions.jsonl 失败: {e}")
+
+        # 修正 run_state.json 中的 runner_status（必须是 idle，因为模拟需要重新启动）
+        run_state_file = os.path.join(sim_dir, "run_state.json")
+        if os.path.exists(run_state_file):
+            try:
+                with open(run_state_file, 'r', encoding='utf-8') as f:
+                    run_state_data = json.load(f)
+                # 重置 runner_status 为 idle
+                run_state_data["runner_status"] = "idle"
+                # 如果 start_round > 0，保留 current_round；否则重置为 0
+                # 注意：start_round 参数由前端传递，这里检查 metadata 中的值
+                current_round = metadata.get("current_round", 0)
+                total_rounds = metadata.get("total_rounds", 0)
+                # 修复：恢复快照后，current_round 应该是快照时的轮次，runner_status 必须是 idle
+                # 同时必须保留 total_rounds，这是整个模拟的总轮数，不是剩余轮数
+                run_state_data["current_round"] = current_round
+                # 快照恢复时，优先使用快照中的 total_rounds 值
+                # 因为 total_rounds 代表整个模拟的总轮数，应该以快照时为准
+                if total_rounds > 0:
+                    run_state_data["total_rounds"] = total_rounds
+                    logger.info(f"从快照恢复 total_rounds: {total_rounds}")
+                # 【快照恢复标记】
+                # 写入 restored_at 时间戳，作为 _start_simulation_impl 判断"快照恢复场景"
+                # 的可靠信号。
+                # 旧实现仅依赖 runner_status == 'idle'，在崩溃/异常路径下不可靠
+                # （残留的 running/stopping 状态会让 restored_from_snapshot 判 False，
+                #  导致 --max-rounds 不透传，子脚本按 time_config 重算 total_rounds 多跑数轮）。
+                run_state_data["restored_at"] = datetime.now().isoformat()
+                run_state_data["restored_snapshot_name"] = snapshot_name
+                # 原子写入：避免快照恢复过程中前端读到半截 JSON
+                atomic_write_json(run_state_file, run_state_data)
+                logger.info(
+                    f"修正 run_state.json: runner_status -> idle, current_round -> {current_round}, "
+                    f"total_rounds -> {run_state_data.get('total_rounds', 'unchanged')}, "
+                    f"restored_at -> {run_state_data['restored_at']}"
+                )
+            except Exception as e:
+                logger.warning(f"修正 run_state.json 失败: {e}")
+
         # 清除内存中的运行状态（确保下次查询时从文件重新加载）
+        # 注意：进程/线程/文件句柄的清理已在函数开头通过 _cleanup_stale_simulation_resources 完成
         if simulation_id in cls._run_states:
             del cls._run_states[simulation_id]
 
-        logger.info(f"恢复快照完成: {simulation_id}/{snapshot_name}, 恢复文件: {len(restored_files)}")
+        logger.info(
+            "恢复快照完成: %s/%s, 恢复文件: %d, 快照轮次: %s",
+            simulation_id,
+            snapshot_name,
+            len(restored_files),
+            metadata.get("current_round", 0),
+        )
+
+        # 同步 SimulationManager 的 state.json 状态
+        # 注意：恢复快照后，状态应设置为 READY，因为模拟需要重新启动
+        try:
+            from .simulation_manager import SimulationManager, SimulationStatus
+            manager = SimulationManager()
+            sim_state = manager.get_simulation(simulation_id)
+            if sim_state:
+                # 恢复快照后模拟状态应为 READY，等待用户启动
+                sim_state.status = SimulationStatus.READY
+                sim_state.current_round = metadata.get("current_round", 0)
+                manager._save_simulation_state(sim_state)
+                logger.info(f"恢复快照后已同步 state.json: {simulation_id} -> {SimulationStatus.READY.value}")
+        except Exception as e:
+            logger.warning(f"恢复快照后同步 state.json 失败: {simulation_id}, error={e}")
 
         return {
             "success": len(errors) == 0,
@@ -2059,6 +2631,8 @@ class SimulationRunner:
             "simulation_id": simulation_id,
             "restored_files": restored_files,
             "errors": errors if errors else None,
+            "current_round": metadata.get("current_round", 0),
+            "total_rounds": metadata.get("total_rounds", 0),
         }
 
     @classmethod
@@ -2074,6 +2648,14 @@ class SimulationRunner:
             删除结果
         """
         import shutil
+
+        # 关键修复（RISK-6）：runner 层兜底校验
+        snapshot_name = cls._validate_snapshot_name(snapshot_name) if snapshot_name else None
+        if not snapshot_name:
+            return {
+                "success": False,
+                "error": "快照名称不合法"
+            }
 
         sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
         snapshot_dir = os.path.join(sim_dir, "snapshots", snapshot_name)

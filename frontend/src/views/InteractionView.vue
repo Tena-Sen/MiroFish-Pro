@@ -55,6 +55,7 @@
           :reportId="currentReportId"
           :simulationId="simulationId"
           :systemLogs="systemLogs"
+          @go-back="handleGoBack"
           @add-log="addLog"
           @update-status="updateStatus"
         />
@@ -126,6 +127,16 @@ const addLog = (msg) => {
   systemLogs.value.push({ time, msg })
   if (systemLogs.value.length > 200) {
     systemLogs.value.shift()
+  }
+}
+
+// --- Navigation ---
+const handleGoBack = () => {
+  // 返回到 Step 4 (报告生成)
+  if (currentReportId.value) {
+    router.push({ name: 'Report', params: { reportId: currentReportId.value } })
+  } else {
+    router.push('/')
   }
 }
 

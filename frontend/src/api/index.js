@@ -53,14 +53,19 @@ service.interceptors.response.use(
 )
 
 // 带重试的请求函数
+// 只对网络错误和超时重试，不对 4xx 客户端错误重试
 export const requestWithRetry = async (requestFn, maxRetries = 3, delay = 1000) => {
   for (let i = 0; i < maxRetries; i++) {
     try {
       return await requestFn()
     } catch (error) {
+      // 如果是 axios 响应错误（有 response 字段），说明是服务端返回的错误（如 400、500），不重试
+      if (error.response) {
+        return Promise.reject(error)
+      }
+      // 网络错误（如连接失败）才重试
       if (i === maxRetries - 1) throw error
-      
-      console.warn(`Request failed, retrying (${i + 1}/${maxRetries})...`)
+      console.warn(`Request failed (network error), retrying (${i + 1}/${maxRetries})...`)
       await new Promise(resolve => setTimeout(resolve, delay * Math.pow(2, i)))
     }
   }

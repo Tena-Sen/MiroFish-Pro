@@ -136,6 +136,15 @@
             </svg>
           </button>
 
+          <!-- Back Button - 返回到 Step 3 -->
+          <button v-if="isComplete" class="back-step-btn" @click="goBack">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="19" y1="12" x2="5" y2="12"></line>
+              <polyline points="12 19 5 12 12 5"></polyline>
+            </svg>
+            <span>{{ $t('common.back') }} to Step 3</span>
+          </button>
+
           <div class="workflow-divider"></div>
         </div>
 
@@ -404,13 +413,17 @@ const props = defineProps({
   systemLogs: Array
 })
 
-const emit = defineEmits(['add-log', 'update-status'])
+const emit = defineEmits(['add-log', 'update-status', 'go-back'])
 
 // Navigation
 const goToInteraction = () => {
   if (props.reportId) {
     router.push({ name: 'Interaction', params: { reportId: props.reportId } })
   }
+}
+
+const goBack = () => {
+  emit('go-back')
 }
 
 // State
@@ -2021,8 +2034,17 @@ const getLogLevelClass = (log) => {
 let agentLogTimer = null
 let consoleLogTimer = null
 
+let lastAgentLogTime = 0  // 上次获取 agent log 的时间戳
+let lastConsoleLogTime = 0  // 上次获取 console log 的时间戳
+const AGENT_LOG_COOLDOWN = 3000  // agent log 请求冷却时间（毫秒）
+const CONSOLE_LOG_COOLDOWN = 3000
 const fetchAgentLog = async () => {
   if (!props.reportId) return
+  const now = Date.now()
+  // 冷却检查：避免频繁请求空日志
+  if (now - lastAgentLogTime < AGENT_LOG_COOLDOWN) {
+    return
+  }
   
   try {
     const res = await getAgentLog(props.reportId, agentLogLine.value)
@@ -2059,13 +2081,23 @@ const fetchAgentLog = async () => {
             stopPolling()
             // 滚动逻辑统一在循环结束后的 nextTick 中处理
           }
-          
+
+          if (log.action === 'error') {
+            isComplete.value = true
+            currentSectionIndex.value = null  // 确保清除 loading 状态
+            emit('update-status', 'error')
+            stopPolling()
+          }
+
           if (log.action === 'report_start') {
             startTime.value = new Date(log.timestamp)
           }
         })
         
-        agentLogLine.value = res.data.from_line + newLogs.length
+        // Update timestamp even with no new logs
+      lastAgentLogTime = Date.now()
+      
+      agentLogLine.value = res.data.from_line + newLogs.length
         
         nextTick(() => {
           if (rightPanel.value) {
@@ -2131,23 +2163,31 @@ const extractFinalContent = (response) => {
 
 const fetchConsoleLog = async () => {
   if (!props.reportId) return
-  
+
+  const now = Date.now()
+  // 冷却检查：避免频繁请求空日志
+  if (now - lastConsoleLogTime < CONSOLE_LOG_COOLDOWN) {
+    return
+  }
+
   try {
     const res = await getConsoleLog(props.reportId, consoleLogLine.value)
     
     if (res.success && res.data) {
       const newLogs = res.data.logs || []
-      
+
       if (newLogs.length > 0) {
         consoleLogs.value.push(...newLogs)
         consoleLogLine.value = res.data.from_line + newLogs.length
-        
+
         nextTick(() => {
           if (logContent.value) {
             logContent.value.scrollTop = logContent.value.scrollHeight
           }
         })
       }
+
+      lastConsoleLogTime = Date.now()
     }
   } catch (err) {
     console.warn('Failed to fetch console log:', err)
@@ -2156,10 +2196,11 @@ const fetchConsoleLog = async () => {
 
 const startPolling = () => {
   if (agentLogTimer || consoleLogTimer) return
-  
+  if (isComplete.value) return
+
   fetchAgentLog()
   fetchConsoleLog()
-  
+
   agentLogTimer = setInterval(fetchAgentLog, 2000)
   consoleLogTimer = setInterval(fetchConsoleLog, 1500)
 }
@@ -3430,6 +3471,39 @@ watch(() => props.reportId, (newId) => {
 
 .next-step-btn:hover svg {
   transform: translateX(4px);
+}
+
+/* 返回按钮样式 */
+.back-step-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: calc(100% - 40px);
+  margin: 4px 20px 0 20px;
+  padding: 12px 20px;
+  font-size: 13px;
+  font-weight: 500;
+  color: #6B7280;
+  background: #F9FAFB;
+  border: 1px solid #E5E7EB;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.back-step-btn:hover {
+  background: #F3F4F6;
+  border-color: #D1D5DB;
+  color: #374151;
+}
+
+.back-step-btn svg {
+  transition: transform 0.2s ease;
+}
+
+.back-step-btn:hover svg {
+  transform: translateX(-4px);
 }
 
 /* Workflow Empty */

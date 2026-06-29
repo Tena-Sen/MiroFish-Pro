@@ -520,11 +520,12 @@ class RedditSimulationRunner:
         
         return active_agents
     
-    async def run(self, max_rounds: int = None):
+    async def run(self, max_rounds: int = None, start_round: int = 0):
         """运行Reddit模拟
-        
+
         Args:
             max_rounds: 最大模拟轮数（可选，用于截断过长的模拟）
+            start_round: 从指定轮次开始（0=从头开始）
         """
         print("=" * 60)
         print("OASIS Reddit模拟")
@@ -532,12 +533,16 @@ class RedditSimulationRunner:
         print(f"模拟ID: {self.config.get('simulation_id', 'unknown')}")
         print(f"等待命令模式: {'启用' if self.wait_for_commands else '禁用'}")
         print("=" * 60)
-        
+
         time_config = self.config.get("time_config", {})
         total_hours = time_config.get("total_simulation_hours", 72)
         minutes_per_round = time_config.get("minutes_per_round", 30)
         total_rounds = (total_hours * 60) // minutes_per_round
-        
+
+        # 如果指定了起始轮次，跳过已执行的轮次
+        if start_round > 0:
+            print(f"\n从轮次 {start_round + 1} 开始（已跳过 {start_round} 轮初始事件）")
+
         # 如果指定了最大轮数，则截断
         if max_rounds is not None and max_rounds > 0:
             original_rounds = total_rounds
@@ -623,7 +628,7 @@ class RedditSimulationRunner:
         print("\n开始模拟循环...")
         start_time = datetime.now()
         
-        for round_num in range(total_rounds):
+        for round_num in range(start_round, total_rounds):
             simulated_minutes = round_num * minutes_per_round
             simulated_hour = (simulated_minutes // 60) % 24
             simulated_day = simulated_minutes // (60 * 24) + 1
@@ -707,6 +712,12 @@ async def main():
         help='最大模拟轮数（可选，用于截断过长的模拟）'
     )
     parser.add_argument(
+        '--start-round',
+        type=int,
+        default=0,
+        help='从指定轮次开始（用于快照恢复后继续）'
+    )
+    parser.add_argument(
         '--no-wait',
         action='store_true',
         default=False,
@@ -731,7 +742,7 @@ async def main():
         config_path=args.config,
         wait_for_commands=not args.no_wait
     )
-    await runner.run(max_rounds=args.max_rounds)
+    await runner.run(max_rounds=args.max_rounds, start_round=args.start_round)
 
 
 def setup_signal_handlers():

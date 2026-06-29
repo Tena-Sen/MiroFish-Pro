@@ -92,8 +92,16 @@
           <span class="card-progress" :class="getProgressClass(project)">
             <span class="status-dot">●</span> {{ formatRounds(project) }}
           </span>
+          <!-- 删除按钮 -->
+          <button
+            class="delete-btn"
+            :title="$t('history.deleteSimulation')"
+            @click.stop="confirmDelete(project)"
+          >
+            ×
+          </button>
         </div>
-        
+
         <!-- 底部装饰线 (hover时展开) -->
         <div class="card-bottom-line"></div>
       </div>
@@ -187,6 +195,43 @@
         </div>
       </Transition>
     </Teleport>
+
+    <!-- 删除确认弹窗 -->
+    <Teleport to="body">
+      <Transition name="modal">
+        <div v-if="showDeleteConfirm" class="modal-overlay" @click.self="showDeleteConfirm = false">
+          <div class="modal-content delete-modal">
+            <div class="modal-header">
+              <div class="modal-title-section">
+                <span class="modal-id">{{ $t('history.deleteConfirmTitle') }}</span>
+              </div>
+              <button class="modal-close" @click="showDeleteConfirm = false">×</button>
+            </div>
+            <div class="modal-body">
+              <div class="modal-section">
+                <div class="modal-label">{{ $t('history.deleteConfirmMessage') }}</div>
+                <div class="delete-warning">
+                  ⚠ {{ $t('history.deleteWarning') }}
+                </div>
+                <div class="delete-target">
+                  {{ formatSimulationId(deleteTarget?.simulation_id) }}
+                </div>
+              </div>
+            </div>
+            <div class="modal-actions">
+              <button class="modal-btn btn-cancel" @click="showDeleteConfirm = false">
+                <span class="btn-icon">✕</span>
+                <span class="btn-text">{{ $t('common.cancel') }}</span>
+              </button>
+              <button class="modal-btn btn-delete" @click="executeDelete" :disabled="deleting">
+                <span class="btn-icon">🗑</span>
+                <span class="btn-text">{{ deleting ? $t('common.loading') : $t('common.confirm') }}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
   </div>
 </template>
 
@@ -194,7 +239,7 @@
 import { ref, computed, onMounted, onUnmounted, onActivated, watch, nextTick } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { getSimulationHistory } from '../api/simulation'
+import { getSimulationHistory, deleteSimulation } from '../api/simulation'
 
 const router = useRouter()
 const route = useRoute()
@@ -207,6 +252,9 @@ const isExpanded = ref(false)
 const hoveringCard = ref(null)
 const historyContainer = ref(null)
 const selectedProject = ref(null)  // 当前选中的项目（用于弹窗）
+const showDeleteConfirm = ref(false)  // 删除确认弹窗
+const deleteTarget = ref(null)  // 待删除的项目
+const deleting = ref(false)  // 删除中状态
 let observer = null
 let isAnimating = false  // 动画锁，防止闪烁
 let expandDebounceTimer = null  // 防抖定时器
@@ -401,6 +449,39 @@ const navigateToProject = (simulation) => {
 // 关闭弹窗
 const closeModal = () => {
   selectedProject.value = null
+}
+
+// 删除相关功能
+const confirmDelete = (project) => {
+  deleteTarget.value = project
+  showDeleteConfirm.value = true
+}
+
+const executeDelete = async () => {
+  if (!deleteTarget.value?.simulation_id) return
+  
+  deleting.value = true
+  try {
+    const response = await deleteSimulation(deleteTarget.value.simulation_id)
+    if (response.success) {
+      // 从列表中移除
+      projects.value = projects.value.filter(p => p.simulation_id !== deleteTarget.value.simulation_id)
+      showDeleteConfirm.value = false
+      deleteTarget.value = null
+    } else {
+      alert(response.error || t('common.error'))
+      showDeleteConfirm.value = false
+      deleteTarget.value = null
+    }
+  } catch (error) {
+    console.error('删除推演失败:', error)
+    const errorMsg = error?.response?.data?.error || error?.message || t('common.error')
+    alert(errorMsg)
+    showDeleteConfirm.value = false
+    deleteTarget.value = null
+  } finally {
+    deleting.value = false
+  }
 }
 
 // 导航到图谱构建页面（Project）
@@ -953,6 +1034,37 @@ onUnmounted(() => {
 .card-footer .card-progress.in-progress { color: #F59E0B; }
 .card-footer .card-progress.not-started { color: #9CA3AF; }
 
+/* 删除按钮 */
+.delete-btn {
+  position: absolute;
+  top: -8px;
+  right: -8px;
+  width: 20px;
+  height: 20px;
+  background: #EF4444;
+  color: white;
+  border: 2px solid white;
+  border-radius: 50%;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: all 0.3s ease;
+  z-index: 10;
+}
+
+.project-card:hover .delete-btn {
+  opacity: 1;
+}
+
+.delete-btn:hover {
+  background: #DC2626;
+  transform: scale(1.2);
+}
+
 /* 底部装饰线 */
 .card-bottom-line {
   position: absolute;
@@ -1338,5 +1450,65 @@ onUnmounted(() => {
   letter-spacing: 0.3px;
   text-align: center;
   line-height: 1.5;
+}
+
+/* 删除弹窗样式 */
+.delete-modal {
+  border: 1px solid #EF4444;
+  box-shadow: 0 10px 25px rgba(239, 68, 68, 0.15);
+}
+
+.delete-warning {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  color: #EF4444;
+  background: #FEF2F2;
+  padding: 12px 16px;
+  border-radius: 6px;
+  border: 1px solid #FECACA;
+  margin: 12px 0;
+}
+
+.delete-target {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85rem;
+  color: #1F2937;
+  font-weight: 600;
+  padding: 8px 12px;
+  background: #F9FAFB;
+  border-radius: 4px;
+  margin-top: 8px;
+}
+
+.btn-delete {
+  background: #EF4444 !important;
+  border-color: #EF4444 !important;
+}
+
+.btn-delete .btn-text {
+  color: white !important;
+}
+
+.btn-delete:hover:not(:disabled) {
+  background: #DC2626 !important;
+  border-color: #DC2626 !important;
+}
+
+.btn-cancel {
+  border-color: #E5E7EB !important;
+}
+
+.btn-cancel .btn-text {
+  color: #6B7280 !important;
+}
+
+.btn-cancel:hover {
+  border-color: #9CA3AF !important;
+  background: #F9FAFB !important;
+}
+
+.btn-delete:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 </style>

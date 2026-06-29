@@ -158,14 +158,22 @@
         <div class="card-content">
           <p class="api-note">POST /api/simulation/create</p>
           <p class="description">{{ $t('step1.buildCompleteDesc') }}</p>
-          <button 
-            class="action-btn" 
-            :disabled="currentPhase < 2 || creatingSimulation"
-            @click="handleEnterEnvSetup"
-          >
-            <span v-if="creatingSimulation" class="spinner-sm"></span>
-            {{ creatingSimulation ? $t('step1.creating') : $t('step1.enterEnvSetup') + ' ➝' }}
-          </button>
+          <div class="action-buttons">
+            <button
+              class="action-btn back-btn"
+              @click="$emit('go-back')"
+            >
+              ← {{ $t('common.back') }}
+            </button>
+            <button
+              class="action-btn"
+              :disabled="currentPhase < 2 || creatingSimulation"
+              @click="handleEnterEnvSetup"
+            >
+              <span v-if="creatingSimulation" class="spinner-sm"></span>
+              {{ creatingSimulation ? $t('step1.creating') : $t('step1.enterEnvSetup') + ' ➝' }}
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -204,7 +212,7 @@ const props = defineProps({
   systemLogs: { type: Array, default: () => [] }
 })
 
-defineEmits(['next-step'])
+defineEmits(['next-step', 'go-back'])
 
 const selectedOntologyItem = ref(null)
 const logContent = ref(null)
@@ -601,8 +609,13 @@ watch(() => props.systemLogs.length, () => {
 }
 
 /* Step 03 Button */
+.action-buttons {
+  display: flex;
+  gap: 12px;
+}
+
 .action-btn {
-  width: 100%;
+  flex: 1;
   background: #000;
   color: #FFF;
   border: none;
@@ -612,6 +625,17 @@ watch(() => props.systemLogs.length, () => {
   font-weight: 600;
   cursor: pointer;
   transition: opacity 0.2s;
+}
+
+.back-btn {
+  background: #F5F5F5;
+  color: #333;
+  border: 1px solid #E0E0E0;
+}
+
+.back-btn:hover {
+  background: #E0E0E0;
+  opacity: 1;
 }
 
 .action-btn:hover:not(:disabled) {

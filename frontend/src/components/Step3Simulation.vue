@@ -362,7 +362,7 @@
           <div class="restore-choice-options">
             <label class="restore-choice-option">
               <input type="radio" name="restoreMode" value="continue" v-model="restoreMode" />
-              <span class="option-label">{{ $t('log.snapshotRestoreContinueFromSnapshot', { round: (selectedSnapshot?.run_state?.current_round || 0) + 1 }) }}</span>
+              <span class="option-label">{{ $t('log.snapshotRestoreContinueFromSnapshot', { round: selectedSnapshot?.run_state?.current_round || 0 }) }}</span>
             </label>
             <label class="restore-choice-option">
               <input type="radio" name="restoreMode" value="start_over" v-model="restoreMode" />
@@ -996,7 +996,7 @@ const doRestoreSnapshot = async () => {
 
   if (isContinue) {
     addLog(t('log.snapshotRestoring', { name: snapshot.snapshot_name }))
-    addLog(t('log.snapshotRestoreContinueFromSnapshot', { round: startRound }))
+    addLog(t('log.snapshotRestoreContinueFromSnapshot', { round: startRound + 1 }))
     // 保存 start_round 供后续 doStartSimulation 使用
     restoreStartRound.value = startRound
   } else {
