@@ -326,6 +326,12 @@
     "envFreshTriggered": "No snapshot available, starting a fresh simulation...",
     "restoring": "Restoring...",
     "freshStarting": "Starting...",
+    "envRestoreSingle": "Found single world snapshot ({name}), auto-restoring",
+    "envRestoreChosen": "Selected snapshot: {name}",
+    "envRestoreCancelled": "Restore cancelled",
+    "snapshotPickerTitle": "Choose a world snapshot to restore",
+    "snapshotPickerHint": "Multiple complete-round snapshots detected (sorted by round desc). Click one to restore.",
+    "snapshotPickerFresh": "Fresh Start",
     "envUnknown": "Environment status unknown"
   },
   "graph": {

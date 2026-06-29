@@ -188,7 +188,7 @@
               <!-- 优化 S5：env 关闭时给出明确指引 + 一键恢复入口 -->
               <!-- 智能判断：优先恢复快照（final_/fail_）回到之前世界状态 -->
               <button
-                v-if="envStatus === 'stopped' && !envStatusLoading"
+                v-if="envStatus === 'stopped' && !envStatusLoading && !showSnapshotPicker"
                 class="env-status-action"
                 :disabled="isRestarting"
                 @click="handleEnvStoppedAction"
@@ -199,6 +199,36 @@
                 <span v-else-if="restartMode === 'fresh'">{{ $t('step5.freshStarting') }}</span>
                 <span v-else>{{ $t('step5.envStoppedAction') }}</span>
               </button>
+
+              <!-- 多快照选择器：当检测到 ≥2 个 final_/fail_ 快照时展开 -->
+              <div v-if="showSnapshotPicker && availableSnapshots.length > 0" class="snapshot-picker">
+                <div class="snapshot-picker-title">{{ $t('step5.snapshotPickerTitle') }}</div>
+                <div class="snapshot-picker-hint">{{ $t('step5.snapshotPickerHint') }}</div>
+                <div class="snapshot-picker-list">
+                  <div
+                    v-for="snap in availableSnapshots"
+                    :key="snap.snapshot_name"
+                    class="snapshot-picker-item"
+                    @click="chooseSnapshot(snap)"
+                  >
+                    <div class="snapshot-picker-item-name">{{ snap.snapshot_name }}</div>
+                    <div class="snapshot-picker-item-meta">
+                      <span v-if="snap.run_state?.current_round !== undefined">
+                        R{{ snap.run_state.current_round }}
+                      </span>
+                      <span v-if="snap.created_at">{{ snap.created_at.split('T')[0] }} {{ snap.created_at.split('T')[1]?.substring(0, 5) }}</span>
+                    </div>
+                  </div>
+                </div>
+                <div class="snapshot-picker-actions">
+                  <button class="snapshot-picker-btn fresh" @click="chooseFreshStart">
+                    {{ $t('step5.snapshotPickerFresh') }}
+                  </button>
+                  <button class="snapshot-picker-btn cancel" @click="cancelPickSnapshot">
+                    {{ $t('common.cancel') }}
+                  </button>
+                </div>
+              </div>
             </div>
             <div v-if="showToolsDetail" class="tools-card-body">
               <div class="tools-grid">
@@ -477,78 +507,143 @@ const refreshEnvStatus = async () => {
 // 优化 S5：env 关闭时的智能恢复入口
 // 用户期望：恢复之前的模拟世界状态（不是 force 重启）
 // 策略：
-//   1. 优先检测 final_/fail_ 快照 → restore_snapshot + startSimulation(continue)
-//   2. 没有快照 → fallback 到 force=true 全新启动
+//   1. 检测所有 final_/fail_ 快照
+//   2. 只有 1 个 → 自动用它恢复
+//   3. 有 ≥2 个 → 让用户选（按 current_round 倒序）
+//   4. 没有快照 → fallback 到 force=true 全新启动
 const isRestarting = ref(false)
 const restartMode = ref(null) // 'restore' | 'fresh' | null
+const showSnapshotPicker = ref(false)  // 多快照选择器展开状态
+const availableSnapshots = ref([])  // 可恢复的快照列表
+const pendingSnapshotResolve = ref(null)  // Promise resolver for picker
 
 const handleEnvStoppedAction = async () => {
   if (!props.simulationId || isRestarting.value) return
   isRestarting.value = true
   addLog(t('step5.envStoppedActionHint'))
   try {
-    // Step 1：检测是否有 final_/fail_ 快照（之前的模拟世界状态）
+    // Step 1：检测所有 final_/fail_ 快照
     const snapRes = await listSnapshots(props.simulationId)
-    const snapshots = snapRes?.data?.snapshots || []
-    // 按创建时间排序，取最新
-    snapshots.sort((a, b) => {
-      const ta = new Date(a.created_at || 0).getTime()
-      const tb = new Date(b.created_at || 0).getTime()
-      return tb - ta
-    })
-    const latest = snapshots[0]
-    const isMeaningfulSnapshot = latest && (
-      latest.snapshot_name.startsWith('final_') ||
-      latest.snapshot_name.startsWith('fail_')
-    )
-
-    if (isMeaningfulSnapshot) {
-      // Step 2a：恢复快照回到之前的模拟世界状态
-      restartMode.value = 'restore'
-      addLog(t('step5.envRestoreTriggered', { name: latest.snapshot_name }))
-      const restoreRes = await restoreSnapshot(props.simulationId, {
-        snapshot_name: latest.snapshot_name
+    const allSnapshots = snapRes?.data?.snapshots || []
+    // 过滤有意义的快照，按轮次从高到低排序
+    const meaningful = allSnapshots
+      .filter(s => s.snapshot_name && (
+        s.snapshot_name.startsWith('final_') ||
+        s.snapshot_name.startsWith('fail_')
+      ))
+      .sort((a, b) => {
+        // 优先按 current_round 倒序；同轮次按 created_at 倒序
+        const ra = a.run_state?.current_round || 0
+        const rb = b.run_state?.current_round || 0
+        if (rb !== ra) return rb - ra
+        return new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime()
       })
-      if (!restoreRes.success) {
-        addLog(t('step5.envRestoreFailed', { error: restoreRes.error || '' }))
+
+    availableSnapshots.value = meaningful
+
+    // Step 2：决定恢复路径
+    let targetSnapshot = null
+    if (meaningful.length === 0) {
+      // 0 个快照 → force 全新启动
+      await doFreshStart()
+      return
+    } else if (meaningful.length === 1) {
+      // 1 个快照 → 自动用
+      targetSnapshot = meaningful[0]
+      addLog(t('step5.envRestoreSingle', { name: targetSnapshot.snapshot_name }))
+    } else {
+      // ≥2 个快照 → 让用户选
+      const choice = await pickSnapshotInteractively(meaningful)
+      if (choice === '__FRESH__') {
+        await doFreshStart()
+        return
+      } else if (!choice) {
+        // 取消
+        addLog(t('step5.envRestoreCancelled'))
         return
       }
-      // 恢复成功 → 启动模拟（continue 模式：start_round=current_round）
-      const startRes = await startSimulation({
-        simulation_id: props.simulationId,
-        platform: 'parallel',
-        start_round: restoreRes.data?.current_round || 0,
-        enable_graph_memory_update: true
-        // 注意：不传 force，恢复的文件已包含 run_state
-      })
-      if (startRes.success) {
-        addLog(t('step5.envRestartTriggered'))
-        await waitForEnvAlive()
-      } else {
-        addLog(t('step5.envRestartFailed', { error: startRes.error || '' }))
-      }
+      targetSnapshot = choice
+      addLog(t('step5.envRestoreChosen', { name: targetSnapshot.snapshot_name }))
+    }
+
+    // Step 3：恢复选中的快照
+    restartMode.value = 'restore'
+    const restoreRes = await restoreSnapshot(props.simulationId, {
+      snapshot_name: targetSnapshot.snapshot_name
+    })
+    if (!restoreRes.success) {
+      addLog(t('step5.envRestoreFailed', { error: restoreRes.error || '' }))
+      return
+    }
+    // Step 4：启动模拟（continue 模式：start_round=current_round）
+    addLog(t('step5.envRestartTriggered'))
+    const startRes = await startSimulation({
+      simulation_id: props.simulationId,
+      platform: 'parallel',
+      start_round: restoreRes.data?.current_round || 0,
+      enable_graph_memory_update: true
+    })
+    if (startRes.success) {
+      await waitForEnvAlive()
     } else {
-      // Step 2b：没有快照 → force 全新启动（保留世界定义 / 清进度）
-      restartMode.value = 'fresh'
-      addLog(t('step5.envFreshTriggered'))
-      const res = await startSimulation({
-        simulation_id: props.simulationId,
-        platform: 'parallel',
-        force: true,
-        enable_graph_memory_update: true
-      })
-      if (res.success) {
-        addLog(t('step5.envRestartTriggered'))
-        await waitForEnvAlive()
-      } else {
-        addLog(t('step5.envRestartFailed', { error: res.error || '' }))
-      }
+      addLog(t('step5.envRestartFailed', { error: startRes.error || '' }))
     }
   } catch (err) {
     addLog(t('step5.envRestartException', { error: err.message }))
   } finally {
     isRestarting.value = false
     restartMode.value = null
+    showSnapshotPicker.value = false
+  }
+}
+
+// 多个快照时弹出选择器，让用户选
+const pickSnapshotInteractively = (snapshots) => {
+  showSnapshotPicker.value = true
+  return new Promise((resolve) => {
+    pendingSnapshotResolve.value = resolve
+  })
+}
+
+// 用户点击某个快照
+const chooseSnapshot = (snapshot) => {
+  if (pendingSnapshotResolve.value) {
+    pendingSnapshotResolve.value(snapshot)
+    pendingSnapshotResolve.value = null
+  }
+}
+
+// 用户点击"全新启动"（不用快照）
+const chooseFreshStart = () => {
+  if (pendingSnapshotResolve.value) {
+    pendingSnapshotResolve.value('__FRESH__')
+    pendingSnapshotResolve.value = null
+  }
+}
+
+// 用户取消
+const cancelPickSnapshot = () => {
+  if (pendingSnapshotResolve.value) {
+    pendingSnapshotResolve.value(null)
+    pendingSnapshotResolve.value = null
+  }
+}
+
+// force 全新启动（无快照恢复时使用）
+const doFreshStart = async () => {
+  restartMode.value = 'fresh'
+  addLog(t('step5.envFreshTriggered'))
+  const res = await startSimulation({
+    simulation_id: props.simulationId,
+    platform: 'parallel',
+    force: true,
+    enable_graph_memory_update: true
+  })
+  if (res.success) {
+    addLog(t('step5.envRestartTriggered'))
+    await waitForEnvAlive()
+  } else {
+    addLog(t('step5.envRestartFailed', { error: res.error || '' }))
   }
 }
 
@@ -2861,6 +2956,97 @@ onUnmounted(() => {
 .env-status-action:hover {
   background: #FFE0B2;
   border-color: #FB8C00;
+}
+
+/* 多快照选择器（≥2 个 final_/fail_ 快照时） */
+.snapshot-picker {
+  margin: 0 16px 12px;
+  padding: 12px;
+  background: #FFF8E1;
+  border: 1px solid #FFB74D;
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.snapshot-picker-title {
+  font-weight: 600;
+  color: #E65100;
+  margin-bottom: 4px;
+}
+
+.snapshot-picker-hint {
+  color: #666;
+  margin-bottom: 8px;
+  font-size: 11px;
+}
+
+.snapshot-picker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.snapshot-picker-item {
+  padding: 8px 10px;
+  background: #FFF;
+  border: 1px solid #FFE0B2;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.snapshot-picker-item:hover {
+  background: #FFF3E0;
+  border-color: #FB8C00;
+}
+
+.snapshot-picker-item-name {
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 500;
+  color: #333;
+}
+
+.snapshot-picker-item-meta {
+  font-size: 11px;
+  color: #888;
+  display: flex;
+  gap: 8px;
+}
+
+.snapshot-picker-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.snapshot-picker-btn {
+  padding: 4px 12px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  border: 1px solid #DDD;
+  background: #FFF;
+  color: #666;
+  transition: all 0.15s;
+}
+
+.snapshot-picker-btn:hover {
+  background: #F5F5F5;
+}
+
+.snapshot-picker-btn.fresh {
+  border-color: #FF9800;
+  color: #E65100;
+}
+
+.snapshot-picker-btn.cancel {
+  border-color: #DDD;
+  color: #999;
 }
 
 .env-status-bar.stopped {

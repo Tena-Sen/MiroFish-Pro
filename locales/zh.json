@@ -326,6 +326,12 @@
     "envFreshTriggered": "没有可用快照，将全新启动模拟...",
     "restoring": "恢复中...",
     "freshStarting": "启动中...",
+    "envRestoreSingle": "检测到唯一的世界快照 ({name})，自动恢复",
+    "envRestoreChosen": "已选择快照: {name}",
+    "envRestoreCancelled": "已取消恢复",
+    "snapshotPickerTitle": "选择要恢复的世界快照",
+    "snapshotPickerHint": "检测到多个完整轮次快照（按轮次从高到低），点击要恢复的那个",
+    "snapshotPickerFresh": "全新启动",
     "envUnknown": "环境状态未知"
   },
   "graph": {
