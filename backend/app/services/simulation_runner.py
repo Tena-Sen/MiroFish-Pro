@@ -1834,11 +1834,15 @@ class SimulationRunner:
         return running
     
     # ============== Interview 功能 ==============
-    
+
     @classmethod
     def check_env_alive(cls, simulation_id: str) -> bool:
         """
         检查模拟环境是否存活（可以接收Interview命令）
+
+        必修 9：除了 env_status.json 还要验证 _processes 中的实际进程
+        原因：env_status.json 是心跳文件，子进程可能心跳后立即崩溃，
+        但 status 文件还显示 alive，导致 IPC 必超时 504。
 
         Args:
             simulation_id: 模拟ID
@@ -1851,7 +1855,31 @@ class SimulationRunner:
             return False
 
         ipc_client = SimulationIPCClient(sim_dir)
-        return ipc_client.check_env_alive()
+        # Step 1：先看 env_status.json（保留 8d35047 的快速判定）
+        file_says_alive = ipc_client.check_env_alive()
+        if not file_says_alive:
+            return False
+
+        # Step 2：必修 9 — 验证实际进程存活
+        # _processes 是 SimulationRunner 维护的进程字典
+        # 如果该 simulation_id 不在字典里，说明后端重启过 / 进程被外部清理
+        process = cls._processes.get(simulation_id)
+        if process is None:
+            logger.warning(
+                f"check_env_alive: env_status.json 说 alive 但 _processes 中没有 {simulation_id}，"
+                f"判定 dead（可能后端重启后子进程未拉起）"
+            )
+            return False
+
+        # 如果进程在字典里但已经退出（returncode != None），也算 dead
+        if process.poll() is not None:
+            logger.warning(
+                f"check_env_alive: 子进程 PID={process.pid} 已退出 (returncode={process.returncode})，"
+                f"env_status.json 仍显示 alive 但实际已 dead"
+            )
+            return False
+
+        return True
 
     @classmethod
     def get_env_status_detail(cls, simulation_id: str) -> Dict[str, Any]:
