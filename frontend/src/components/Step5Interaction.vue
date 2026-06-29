@@ -185,6 +185,16 @@
                 <template v-else-if="envStatus === 'stopped'">{{ $t('step5.envStopped') }}</template>
                 <template v-else>{{ $t('step5.envUnknown') }}</template>
               </span>
+              <!-- 优化 S5：env 关闭时给出明确指引 + 操作入口 -->
+              <!-- 之前只显示"环境已关闭"让用户疑惑为什么；现在根据 simulation 状态给出上下文 -->
+              <button
+                v-if="envStatus === 'stopped' && !envStatusLoading"
+                class="env-status-action"
+                @click="handleEnvStoppedAction"
+                :title="$t('step5.envStoppedHint')"
+              >
+                {{ $t('step5.envStoppedAction') }}
+              </button>
             </div>
             <div v-if="showToolsDetail" class="tools-card-body">
               <div class="tools-grid">
@@ -458,6 +468,15 @@ const refreshEnvStatus = async () => {
   } finally {
     envStatusLoading.value = false
   }
+}
+
+// 优化 S5：env 关闭时的恢复入口
+// 用户刷新第五章看到"环境已关闭"时不再无路可走，而是直接返回 Step3 重启模拟
+const handleEnvStoppedAction = () => {
+  // 区分两种回退：常规 'go-back' 回到 Step 4，env_stopped 走 Step 3 重启
+  // emit payload 让父组件 InteractionView 能差异化处理
+  addLog(t('step5.envStoppedActionHint'))
+  emit('go-back', 'env_stopped')
 }
 
 // 环境未运行错误检测
@@ -2736,6 +2755,24 @@ onUnmounted(() => {
 .env-status-bar.alive {
   background: #E8F5E9;
   color: #2E7D32;
+}
+
+.env-status-action {
+  margin-left: auto;
+  padding: 4px 10px;
+  border: 1px solid #FFB74D;
+  background: #FFF3E0;
+  color: #E65100;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.env-status-action:hover {
+  background: #FFE0B2;
+  border-color: #FB8C00;
 }
 
 .env-status-bar.stopped {

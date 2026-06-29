@@ -312,6 +312,9 @@
     "checkingEnv": "检查环境...",
     "envAlive": "环境运行中",
     "envStopped": "环境已关闭",
+    "envStoppedHint": "模拟进程已结束或崩溃，返回 Step3 重新启动模拟后可继续采访",
+    "envStoppedAction": "返回重启",
+    "envStoppedActionHint": "正在返回 Step3 重启模拟...",
     "envUnknown": "环境状态未知"
   },
   "graph": {
@@ -627,6 +630,7 @@
     "autoSnapshotException": "✗ 自动快照异常：{error}",
     "autoFinalSnapshotCreating": "自动创建最终快照：R{round}",
     "autoFinalSnapshotCreated": "✓ 最终快照已创建：{name}",
+    "hasPreviousSnapshot": "发现上一次模拟快照 {name}，是否恢复后继续？",
     "snapshotRestoreChooseTitle": "选择恢复模式",
     "snapshotRestoreContinueFromSnapshot": "从快照节点继续（从第 {round} 轮开始）",
     "snapshotRestoreStartOver": "从头开始（重新运行所有轮次）"

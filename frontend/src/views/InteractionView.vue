@@ -131,7 +131,13 @@ const addLog = (msg) => {
 }
 
 // --- Navigation ---
-const handleGoBack = () => {
+const handleGoBack = (reason) => {
+  // 优化 S5：env_stopped 走 Step3 重启模拟，普通回退走 Step 4
+  // 修复：之前第五章 env 已关闭时点击"返回重启"按钮仍然只去 Step 4（同样的死局）
+  if (reason === 'env_stopped' && simulationId.value) {
+    router.push({ name: 'SimulationRun', params: { simulationId: simulationId.value } })
+    return
+  }
   // 返回到 Step 4 (报告生成)
   if (currentReportId.value) {
     router.push({ name: 'Report', params: { reportId: currentReportId.value } })

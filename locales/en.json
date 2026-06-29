@@ -312,6 +312,9 @@
     "checkingEnv": "Checking env...",
     "envAlive": "Environment running",
     "envStopped": "Environment stopped",
+    "envStoppedHint": "Simulation process has ended or crashed. Return to Step 3 to restart it.",
+    "envStoppedAction": "Restart",
+    "envStoppedActionHint": "Returning to Step 3 to restart the simulation...",
     "envUnknown": "Environment status unknown"
   },
   "graph": {
@@ -627,6 +630,7 @@
     "autoSnapshotException": "✗ Auto-snapshot error: {error}",
     "autoFinalSnapshotCreating": "Auto-creating final snapshot: R{round}",
     "autoFinalSnapshotCreated": "✓ Final snapshot created: {name}",
+    "hasPreviousSnapshot": "Previous simulation snapshot found: {name}. Would you like to restore and continue?",
     "snapshotRestoreChooseTitle": "Choose Restore Mode",
     "snapshotRestoreContinueFromSnapshot": "Continue from snapshot (start from round {round})",
     "snapshotRestoreStartOver": "Start over (re-run all rounds)"
