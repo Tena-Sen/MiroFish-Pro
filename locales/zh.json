@@ -313,8 +313,14 @@
     "envAlive": "环境运行中",
     "envStopped": "环境已关闭",
     "envStoppedHint": "模拟进程已结束或崩溃，返回 Step3 重新启动模拟后可继续采访",
-    "envStoppedAction": "返回重启",
-    "envStoppedActionHint": "正在返回 Step3 重启模拟...",
+    "envStoppedAction": "一键重启",
+    "envStoppedActionHint": "正在重启模拟环境...",
+    "envRestarting": "重启中...",
+    "envRestartTriggered": "重启已触发，等待子进程启动...",
+    "envRestartSuccess": "模拟环境已上线，可继续采访",
+    "envRestartTimeout": "重启超时（30s），请重试",
+    "envRestartFailed": "重启失败: {error}",
+    "envRestartException": "重启异常: {error}",
     "envUnknown": "环境状态未知"
   },
   "graph": {

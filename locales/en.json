@@ -314,7 +314,13 @@
     "envStopped": "Environment stopped",
     "envStoppedHint": "Simulation process has ended or crashed. Return to Step 3 to restart it.",
     "envStoppedAction": "Restart",
-    "envStoppedActionHint": "Returning to Step 3 to restart the simulation...",
+    "envStoppedActionHint": "Restarting simulation environment...",
+    "envRestarting": "Restarting...",
+    "envRestartTriggered": "Restart triggered, waiting for subprocess...",
+    "envRestartSuccess": "Simulation environment is online, you may continue interviewing",
+    "envRestartTimeout": "Restart timeout (30s), please retry",
+    "envRestartFailed": "Restart failed: {error}",
+    "envRestartException": "Restart exception: {error}",
     "envUnknown": "Environment status unknown"
   },
   "graph": {

@@ -185,15 +185,17 @@
                 <template v-else-if="envStatus === 'stopped'">{{ $t('step5.envStopped') }}</template>
                 <template v-else>{{ $t('step5.envUnknown') }}</template>
               </span>
-              <!-- 优化 S5：env 关闭时给出明确指引 + 操作入口 -->
-              <!-- 之前只显示"环境已关闭"让用户疑惑为什么；现在根据 simulation 状态给出上下文 -->
+              <!-- 优化 S5：env 关闭时给出明确指引 + 一键重启入口 -->
+              <!-- 之前只显示"环境已关闭"让用户疑惑为什么；现在点击直接重启 -->
               <button
                 v-if="envStatus === 'stopped' && !envStatusLoading"
                 class="env-status-action"
+                :disabled="isRestarting"
                 @click="handleEnvStoppedAction"
                 :title="$t('step5.envStoppedHint')"
               >
-                {{ $t('step5.envStoppedAction') }}
+                <span v-if="isRestarting">{{ $t('step5.envRestarting') }}</span>
+                <span v-else>{{ $t('step5.envStoppedAction') }}</span>
               </button>
             </div>
             <div v-if="showToolsDetail" class="tools-card-body">
@@ -447,7 +449,7 @@
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { chatWithReport, getReport, getAgentLog } from '../api/report'
-import { interviewAgents, getSimulationProfilesRealtime, getEnvStatus } from '../api/simulation'
+import { interviewAgents, getSimulationProfilesRealtime, getEnvStatus, startSimulation } from '../api/simulation'
 
 const { t } = useI18n()
 
@@ -470,13 +472,52 @@ const refreshEnvStatus = async () => {
   }
 }
 
-// 优化 S5：env 关闭时的恢复入口
-// 用户刷新第五章看到"环境已关闭"时不再无路可走，而是直接返回 Step3 重启模拟
-const handleEnvStoppedAction = () => {
-  // 区分两种回退：常规 'go-back' 回到 Step 4，env_stopped 走 Step 3 重启
-  // emit payload 让父组件 InteractionView 能差异化处理
+// 优化 S5：env 关闭时的智能恢复入口
+// 用户刷新第五章看到"环境已关闭"时不再需要跳到 Step3，
+// 而是直接在当前页调用 /start API（force=true）重启模拟
+const isRestarting = ref(false)
+
+const handleEnvStoppedAction = async () => {
+  if (!props.simulationId || isRestarting.value) return
+  isRestarting.value = true
   addLog(t('step5.envStoppedActionHint'))
-  emit('go-back', 'env_stopped')
+  try {
+    // 直接调用 start API，force=true 会清理旧状态并启动子进程
+    // profiles.json + simulation_config.json 都已存在（之前 Step3 创建过）
+    // 所以 start_simulation 不会失败
+    const res = await startSimulation({
+      simulation_id: props.simulationId,
+      platform: 'parallel',
+      force: true,
+      enable_graph_memory_update: true
+    })
+    if (res.success) {
+      addLog(t('step5.envRestartTriggered'))
+      // 启动后轮询 env_status，等 alive 后切换
+      await waitForEnvAlive()
+    } else {
+      addLog(t('step5.envRestartFailed', { error: res.error || '' }))
+    }
+  } catch (err) {
+    addLog(t('step5.envRestartException', { error: err.message }))
+  } finally {
+    isRestarting.value = false
+  }
+}
+
+// 等待 env 状态变 alive
+const waitForEnvAlive = async (maxWaitSec = 30) => {
+  const startTime = Date.now()
+  while (Date.now() - startTime < maxWaitSec * 1000) {
+    await new Promise(r => setTimeout(r, 1000))
+    await refreshEnvStatus()
+    if (envStatus.value === 'alive') {
+      addLog(t('step5.envRestartSuccess'))
+      return true
+    }
+  }
+  addLog(t('step5.envRestartTimeout'))
+  return false
 }
 
 // 环境未运行错误检测
