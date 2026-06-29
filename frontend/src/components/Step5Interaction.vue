@@ -200,7 +200,7 @@
                 <span v-else>{{ $t('step5.envStoppedAction') }}</span>
               </button>
 
-              <!-- 多快照选择器：当检测到 ≥2 个 final_/fail_ 快照时展开 -->
+              <!-- 快照选择器：1 个或多个 final_/fail_ 快照时都展开 -->
               <div v-if="showSnapshotPicker && availableSnapshots.length > 0" class="snapshot-picker">
                 <div class="snapshot-picker-title">{{ $t('step5.snapshotPickerTitle') }}</div>
                 <div class="snapshot-picker-hint">{{ $t('step5.snapshotPickerHint') }}</div>
@@ -213,8 +213,8 @@
                   >
                     <div class="snapshot-picker-item-name">{{ snap.snapshot_name }}</div>
                     <div class="snapshot-picker-item-meta">
-                      <span v-if="snap.run_state?.current_round !== undefined">
-                        R{{ snap.run_state.current_round }}
+                      <span v-if="(snap.current_round ?? snap.run_state?.current_round) !== undefined">
+                        R{{ snap.current_round ?? snap.run_state?.current_round }}
                       </span>
                       <span v-if="snap.created_at">{{ snap.created_at.split('T')[0] }} {{ snap.created_at.split('T')[1]?.substring(0, 5) }}</span>
                     </div>
@@ -547,12 +547,9 @@ const handleEnvStoppedAction = async () => {
       // 0 个快照 → force 全新启动
       await doFreshStart()
       return
-    } else if (meaningful.length === 1) {
-      // 1 个快照 → 自动用
-      targetSnapshot = meaningful[0]
-      addLog(t('step5.envRestoreSingle', { name: targetSnapshot.snapshot_name }))
-    } else {
-      // ≥2 个快照 → 让用户选
+    } else if (meaningful.length >= 1) {
+      // 1 个或多个快照 → 让用户看到可用快照并选择
+      // （即使是 1 个也展示，让用户知道系统发现了什么 + 提供"全新启动"备选）
       const choice = await pickSnapshotInteractively(meaningful)
       if (choice === '__FRESH__') {
         await doFreshStart()
