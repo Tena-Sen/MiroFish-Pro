@@ -1552,13 +1552,14 @@ class SimulationRunner:
         - twitter_simulation.db / twitter_simulation_*.db（模拟数据库）
         - reddit_simulation.db / reddit_simulation_*.db（模拟数据库）
         - env_status.json（环境状态）
-        - snapshots/ 目录（清理历史快照）
+        - ipc_commands/ ipc_responses/ 中的所有 .json（IPC 残留）
 
-        注意：不会删除配置文件（simulation_config.json）和 profile 文件
+        注意：不会删除：
+        - snapshots/ 目录（用户快照保留，让用户能从快照恢复）
+        - 配置文件（simulation_config.json）和 profile 文件
 
-        清理范围与 create_snapshot 保持对称：
-        - 快照保存的文件会被 cleanup 清理
-        - 避免 force=true 时删除刚恢复的快照文件
+        修复：原 docstring 说"清理历史快照"是错的，实际实现保留快照。
+        这是合理的业务行为：用户 force 重启后，可能想从某个快照恢复进度。
 
         Args:
             simulation_id: 模拟ID
