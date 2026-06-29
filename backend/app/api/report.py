@@ -58,21 +58,24 @@ def generate_report():
             }), 400
 
         force_regenerate = data.get('force_regenerate', False)
-        
+        # 优化 R3：可选 start_from_section（高级用法）
+        # 默认 None = 自动断点续传；显式传 N = 从第 N 节开始（重做指定节起）
+        start_from_section = data.get('start_from_section')
+
         # 获取模拟信息
         manager = SimulationManager()
         state = manager.get_simulation(simulation_id)
-        
+
         if not state:
             return jsonify({
                 "success": False,
                 "error": t('api.simulationNotFound', id=simulation_id)
             }), 404
 
-        # 检查是否已有报告
-        if not force_regenerate:
-            existing_report = ReportManager.get_report_by_simulation(simulation_id)
-            if existing_report and existing_report.status == ReportStatus.COMPLETED:
+        # 优化 R2：状态机补全 —— 防并发 / 智能恢复
+        existing_report = ReportManager.get_report_by_simulation(simulation_id)
+        if existing_report and not force_regenerate:
+            if existing_report.status == ReportStatus.COMPLETED:
                 return jsonify({
                     "success": True,
                     "data": {
@@ -83,6 +86,27 @@ def generate_report():
                         "already_generated": True
                     }
                 })
+
+            if existing_report.status == ReportStatus.GENERATING:
+                # R2：正在生成中 → 拒绝重启，返回现有报告 ID 让前端继续轮询
+                logger.info(f"[R2] 报告 {existing_report.report_id} 正在生成中，拒绝并发")
+                return jsonify({
+                    "success": True,
+                    "data": {
+                        "simulation_id": simulation_id,
+                        "report_id": existing_report.report_id,
+                        "status": "generating",
+                        "message": "报告正在生成中，请等待",
+                        "already_generating": True
+                    }
+                })
+
+            # FAILED 状态 → 默认进入恢复模式（继续生成未完成的章节）
+            # R2/R3：只有显式 force_regenerate=true 才彻底重来
+            if existing_report.status == ReportStatus.FAILED:
+                logger.info(f"[R2] 检测到失败报告 {existing_report.report_id}，进入恢复模式")
+                # 复用已有 report_id，让 R1 的断点检测能找到磁盘上的 section 文件
+                report_id = existing_report.report_id
         
         # 获取项目信息
         project = ProjectManager.get_project(state.project_id)
@@ -107,8 +131,10 @@ def generate_report():
             }), 400
         
         # 提前生成 report_id，以便立即返回给前端
-        import uuid
-        report_id = f"report_{uuid.uuid4().hex[:12]}"
+        # 注意：FAILED 恢复模式下复用现有 report_id（已在上面赋值）
+        if 'report_id' not in locals() or report_id is None:
+            import uuid
+            report_id = f"report_{uuid.uuid4().hex[:12]}"
         
         # 创建异步任务
         task_manager = TaskManager()
@@ -150,14 +176,22 @@ def generate_report():
                         message=f"[{stage}] {message}"
                     )
                 
-                # 生成报告（传入预先生成的 report_id）
+                # 生成报告（传入预先生成的 report_id + Phase 3 wave_size）
+                from ..config import Config
+                wave_size = data.get('wave_size') or Config.REPORT_DEFAULT_WAVE_SIZE
+                wave_size = max(1, min(int(wave_size), Config.REPORT_MAX_WAVE_SIZE))
                 report = agent.generate_report(
                     progress_callback=progress_callback,
-                    report_id=report_id
+                    report_id=report_id,
+                    wave_size=wave_size,
+                    start_from_section=start_from_section,
                 )
-                
-                # 保存报告
-                ReportManager.save_report(report)
+
+                # 修复（诊断 4）：删除冗余的 ReportManager.save_report(report) 调用
+                # agent.generate_report() 内部 line 2025 已经调用了 save_report，
+                # 这里再调用一次是冗余的，并且会触发 save_report 内部的 save_outline
+                # 导致"大纲已保存"+"报告已保存"重复打印两次
+                # 修复：信任 generate_report 内部的保存语义，调用方不重复保存
                 
                 if report.status == ReportStatus.COMPLETED:
                     task_manager.complete_task(
@@ -542,12 +576,27 @@ def chat_with_report_agent():
         simulation_requirement = project.simulation_requirement or ""
         
         # 创建Agent并进行对话
-        agent = ReportAgent(
-            graph_id=graph_id,
-            simulation_id=simulation_id,
-            simulation_requirement=simulation_requirement
-        )
-        
+        # 优化 C1：按 (simulation_id, graph_id) 缓存 ReportAgent 实例
+        # 业务不变性：LLMClient / ZepToolsService 均无 per-call 状态，可安全复用
+        global _report_agent_cache
+        try:
+            _report_agent_cache
+        except NameError:
+            _report_agent_cache = {}
+
+        cache_key = (simulation_id, graph_id)
+        agent = _report_agent_cache.get(cache_key)
+        if agent is None:
+            agent = ReportAgent(
+                graph_id=graph_id,
+                simulation_id=simulation_id,
+                simulation_requirement=simulation_requirement
+            )
+            _report_agent_cache[cache_key] = agent
+            logger.debug(f"[C1] 新建 ReportAgent 缓存: {cache_key}")
+        else:
+            logger.debug(f"[C1] 命中 ReportAgent 缓存: {cache_key}")
+
         result = agent.chat(message=message, chat_history=chat_history)
         
         return jsonify({
@@ -707,32 +756,68 @@ def get_single_section(report_id: str, section_index: int):
 @report_bp.route('/check/<simulation_id>', methods=['GET'])
 def check_report_status(simulation_id: str):
     """
-    检查模拟是否有报告，以及报告状态
-    
-    用于前端判断是否解锁Interview功能
-    
+    检查模拟是否有报告，以及报告状态 + 断点续传信息
+
+    优化 R5：扩展返回 completed_sections / total_sections / resumable，
+    前端用此判断 "恢复并继续" 按钮是否可点击。
+
     返回：
         {
             "success": true,
             "data": {
                 "simulation_id": "sim_xxxx",
                 "has_report": true,
-                "report_status": "completed",
+                "report_status": "completed | generating | failed | pending | planning",
                 "report_id": "report_xxxx",
-                "interview_unlocked": true
+                "interview_unlocked": true,
+                "completed_sections": 3,   # 已生成的章节数（磁盘上 section_NN.md 数）
+                "total_sections": 5,       # 总章节数（从 outline.json 读取）
+                "resumable": true          # 有部分章节可恢复
             }
         }
     """
     try:
         report = ReportManager.get_report_by_simulation(simulation_id)
-        
+
         has_report = report is not None
         report_status = report.status.value if report else None
         report_id = report.report_id if report else None
-        
+
         # 只有报告完成后才解锁interview
         interview_unlocked = has_report and report.status == ReportStatus.COMPLETED
-        
+
+        # R5：断点续传信息
+        completed_sections = 0
+        total_sections = 0
+        resumable = False
+
+        if has_report:
+            # 统计磁盘上已存在的 section_NN.md
+            try:
+                from ..config import Config
+                folder = ReportManager._get_report_folder(report.report_id)
+                if os.path.isdir(folder):
+                    completed_sections = sum(
+                        1 for f in os.listdir(folder)
+                        if f.startswith("section_") and f.endswith(".md")
+                    )
+            except Exception:
+                pass
+
+            # 总章节数从 outline.json 读
+            try:
+                outline = ReportManager._get_outline_path(report.report_id)
+                if os.path.exists(outline):
+                    with open(outline, 'r', encoding='utf-8') as f:
+                        outline_data = json.load(f)
+                    total_sections = len(outline_data.get("sections", []))
+            except Exception:
+                pass
+
+            # 可恢复条件：有 outline + 有部分完成 + 状态非 completed
+            if total_sections > 0 and completed_sections < total_sections and report.status != ReportStatus.COMPLETED:
+                resumable = True
+
         return jsonify({
             "success": True,
             "data": {
@@ -740,10 +825,13 @@ def check_report_status(simulation_id: str):
                 "has_report": has_report,
                 "report_status": report_status,
                 "report_id": report_id,
-                "interview_unlocked": interview_unlocked
+                "interview_unlocked": interview_unlocked,
+                "completed_sections": completed_sections,
+                "total_sections": total_sections,
+                "resumable": resumable,
             }
         })
-        
+
     except Exception as e:
         logger.error(f"检查报告状态失败: {str(e)}")
         return jsonify({
