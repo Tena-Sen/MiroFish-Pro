@@ -30,6 +30,11 @@
               <span class="stat-value mono">{{ runStatus.twitter_actions_count || 0 }}</span>
             </span>
           </div>
+          <!-- T1：本轮增量（仅当有新增时显示） -->
+          <div v-if="twitterRoundDelta > 0" class="round-delta-pill twitter">
+            <span class="round-delta-icon">▲</span>
+            <span class="round-delta-text">+{{ twitterRoundDelta }} this round</span>
+          </div>
           <!-- 可用动作提示 -->
           <div class="actions-tooltip">
             <div class="tooltip-title">Available Actions</div>
@@ -70,6 +75,11 @@
               <span class="stat-label">ACTS</span>
               <span class="stat-value mono">{{ runStatus.reddit_actions_count || 0 }}</span>
             </span>
+          </div>
+          <!-- T1：本轮增量 -->
+          <div v-if="redditRoundDelta > 0" class="round-delta-pill reddit">
+            <span class="round-delta-icon">▲</span>
+            <span class="round-delta-text">+{{ redditRoundDelta }} this round</span>
           </div>
           <!-- 可用动作提示 -->
           <div class="actions-tooltip">
@@ -113,6 +123,36 @@
             <polyline points="7 3 7 8 15 8"></polyline>
           </svg>
           {{ $t('step3.snapshots') }}
+        </button>
+      </div>
+    </div>
+
+    <!-- 后端异常横幅：连续失败 ≥ 3 次时显示 -->
+    <div v-if="pollErrorBanner" class="poll-error-banner">
+      <span class="banner-icon">⚠️</span>
+      <span class="banner-text">{{ pollErrorBanner }}</span>
+      <button class="banner-dismiss" @click="pollErrorBanner = ''">✕</button>
+    </div>
+
+    <!-- 自动恢复提示 — 当检测到有上一次完成的模拟快照时显示 -->
+    <div class="auto-restore-prompt" v-if="showAutoRestorePrompt && latestSnapshotForRestore">
+      <div class="prompt-content">
+        <svg class="prompt-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10"></circle>
+          <line x1="12" y1="8" x2="12" y2="12"></line>
+          <line x1="12" y1="16" x2="12.01" y2="16"></line>
+        </svg>
+        <div class="prompt-text">
+          <span class="prompt-title">发现上一次模拟快照</span>
+          <span class="prompt-desc">检测到上次模拟的快照 <strong>{{ latestSnapshotForRestore.snapshot_name }}</strong>，是否恢复后继续？</span>
+        </div>
+      </div>
+      <div class="prompt-actions">
+        <button class="prompt-btn primary" @click="handleContinueAutoRestore">
+          恢复并继续
+        </button>
+        <button class="prompt-btn secondary" @click="handleIgnoreAutoRestore">
+          忽略
         </button>
       </div>
     </div>
@@ -354,7 +394,7 @@
         </div>
       </div>
 
-      <!-- Restore Choice Dialog -->
+      <!-- Restore Choice Dialog - 独立于快照面板，始终可见当 showRestoreChoice 为 true 时 -->
       <div v-if="showRestoreChoice" class="restore-choice-overlay">
         <div class="restore-choice-dialog">
           <h3>{{ $t('log.snapshotRestoreChooseTitle') }}</h3>
@@ -370,26 +410,35 @@
             </label>
           </div>
           <div class="restore-choice-actions">
-            <button class="btn-cancel" @click="showRestoreChoice = false">{{ $t('common.cancel') }}</button>
+            <button class="btn-cancel" @click="handleCancelRestore">{{ $t('common.cancel') }}</button>
             <button class="btn-confirm" @click="doRestoreSnapshot">{{ $t('common.confirm') }}</button>
           </div>
         </div>
       </div>
-
-      <!-- Empty State -->
-      <div v-else class="snapshot-empty">
-        {{ $t('step3.snapshotEmpty') }}
-      </div>
     </div>
 
-    <!-- Bottom Info / Logs -->
+    <!-- Snapshot Empty State - 只在快照面板显示且没有快照时显示 -->
+    <div v-if="showSnapshotPanel && snapshots.length === 0" class="snapshot-empty">
+      {{ $t('step3.snapshotEmpty') }}
+    </div>
+
+    <!-- Bottom Info / Logs — T2 重构：分类 + 折叠 -->
     <div class="system-logs">
       <div class="log-header">
         <span class="log-title">SIMULATION MONITOR</span>
         <span class="log-id">{{ simulationId || 'NO_SIMULATION' }}</span>
+        <button v-if="hiddenCount > 0" class="log-toggle-btn" @click="showHidden = !showHidden">
+          {{ showHidden ? '▾ 隐藏静态信息' : `▸ 显示 ${hiddenCount} 条静态信息` }}
+        </button>
       </div>
       <div class="log-content" ref="logContent">
-        <div class="log-line" v-for="(log, idx) in systemLogs" :key="idx">
+        <div
+          v-for="(log, idx) in visibleLogs"
+          :key="idx"
+          class="log-line"
+          :class="['log-line--' + log.category]"
+        >
+          <span class="log-icon">{{ log.icon }}</span>
           <span class="log-time">{{ log.time }}</span>
           <span class="log-msg">{{ log.msg }}</span>
         </div>
@@ -399,7 +448,7 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, nextTick, shallowRef } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import {
@@ -439,8 +488,11 @@ const isStarting = ref(false)
 const isStopping = ref(false)
 const startError = ref(null)
 const runStatus = ref({})
+// 错误监控：连续失败 N 次触发可见提示（后端静默报错的兜底）
+const pollErrorCount = ref(0)
+const pollErrorBanner = ref('')  // 非空时显示横幅
 const allActions = ref([]) // 所有动作（增量累积）
-const actionIds = ref(new Set()) // 用于去重的动作ID集合
+const actionIds = shallowRef(new Set()) // 用于去重的动作ID集合（shallowRef 保证 Set 响应式）
 const scrollContainer = ref(null)
 
 // 快照相关状态
@@ -455,6 +507,8 @@ const restoreMode = ref('continue')
 const selectedSnapshot = ref(null)
 const restoreStartRound = ref(null) // 恢复快照时指定的 start_round
 const wasRestored = ref(false) // 标记是否刚从快照恢复
+const showAutoRestorePrompt = ref(false) // 自动检测到的可恢复快照提示
+const latestSnapshotForRestore = ref(null) // 自动检测到的最新快照
 
 // Computed
 // 按时间顺序显示动作（最新的在最后面，即底部）
@@ -496,16 +550,27 @@ const addLog = (msg) => {
 }
 
 // 重置所有状态（用于重新启动模拟）
-const resetAllState = () => {
-  phase.value = 0
+// preserveRestore 为 true 时保留快照恢复相关的状态（wasRestored / restoreStartRound）
+const resetAllState = (preserveRestore = false) => {
+  phase.value = 0  // 0: 未开始, 1: 运行中, 2: 已完成
   runStatus.value = {}
   allActions.value = []
   actionIds.value = new Set()
   prevTwitterRound.value = 0
   prevRedditRound.value = 0
+  prevTwitterActions.value = 0
+  prevRedditActions.value = 0
+  twitterRoundDelta.value = 0
+  redditRoundDelta.value = 0
   startError.value = null
   isStarting.value = false
   isStopping.value = false
+  // 重置完成状态标志
+  emit('update-status', 'processing')  // 重置为 processing 状态
+  if (!preserveRestore) {
+    restoreStartRound.value = null
+    wasRestored.value = false
+  }
   stopPolling()  // 停止之前可能存在的轮询
 }
 
@@ -516,20 +581,31 @@ const doStartSimulation = async () => {
     return
   }
 
+  // 快照恢复场景下：不清除恢复相关状态，但要清空前端展示数据
+  const isFromRestore = wasRestored.value
   // 先重置所有状态，确保不会受到上一次模拟的影响
-  resetAllState()
-  
+  resetAllState(isFromRestore)
+
   isStarting.value = true
   startError.value = null
   addLog(t('log.startingDualSim'))
   emit('update-status', 'processing')
-  
+
+  let simulationStarted = false  // 标记模拟是否成功启动
+
   try {
     const params = {
       simulation_id: props.simulationId,
       platform: 'parallel',
-      force: true,  // 强制重新开始
       enable_graph_memory_update: true  // 开启动态图谱更新
+    }
+
+    // force 策略：
+    // - 快照恢复（无论继续/从头开始）：不传 force，保留恢复的文件
+    //   OASIS 脚本会自动删除已存在的 DB 文件并重新创建
+    // - 非快照恢复：传 force=true，强制清除旧状态
+    if (!isFromRestore) {
+      params.force = true
     }
 
     // 如果从快照恢复并选择了继续模式，传递 start_round
@@ -537,35 +613,42 @@ const doStartSimulation = async () => {
       params.start_round = restoreStartRound.value
       addLog(`  └─ 使用快照恢复的 start_round: ${restoreStartRound.value}`)
       restoreStartRound.value = null  // 消费后清除
+    } else {
+      addLog(`  └─ start_round 未设置或为 0，将从头开始`)
     }
 
     // 仅非快照恢复模式传 max_rounds
     // 快照恢复后 total_rounds 已由快照恢复，不应再被 max_rounds 截断
-    if (!wasRestored.value && props.maxRounds) {
+    if (!isFromRestore && props.maxRounds) {
       params.max_rounds = props.maxRounds
       addLog(t('log.setMaxRounds', { rounds: props.maxRounds }))
     }
-    // 快照恢复完成后清除标志
-    if (wasRestored.value) {
-      wasRestored.value = false
-    }
-    
+
     addLog(t('log.graphMemoryUpdateEnabled'))
-    
+
     const res = await startSimulation(params)
-    
+
     if (res.success && res.data) {
       if (res.data.force_restarted) {
         addLog(t('log.oldSimCleared'))
       }
       addLog(t('log.engineStarted'))
       addLog(`  ├─ PID: ${res.data.process_pid || '-'}`)
-      
+      addLog(`  ├─ total_rounds: ${res.data.total_rounds || 'null'}`)
+      addLog(`  ├─ current_round: ${res.data.current_round || 0}`)
+
       phase.value = 1
       runStatus.value = res.data
-      
+
       startStatusPolling()
       startDetailPolling()
+
+      simulationStarted = true
+
+      // 只有模拟成功启动后才清除恢复标记
+      if (isFromRestore) {
+        wasRestored.value = false
+      }
     } else {
       startError.value = res.error || '启动失败'
       addLog(t('log.startFailed', { error: res.error || t('common.unknownError') }))
@@ -577,6 +660,10 @@ const doStartSimulation = async () => {
     emit('update-status', 'error')
   } finally {
     isStarting.value = false
+    // 如果模拟启动失败，恢复 wasRestored 标记，允许用户重试
+    if (!simulationStarted && isFromRestore) {
+      wasRestored.value = true
+    }
   }
 }
 
@@ -660,6 +747,47 @@ const stopPolling = () => {
 // 追踪各平台的上一次轮次，用于检测变化并输出日志
 const prevTwitterRound = ref(0)
 const prevRedditRound = ref(0)
+// T1：本轮活跃度增量（每轮变更时更新）
+const prevTwitterActions = ref(0)
+const prevRedditActions = ref(0)
+const twitterRoundDelta = ref(0)
+const redditRoundDelta = ref(0)
+
+// T2：日志分类与折叠
+const showHidden = ref(false)
+const categorizedLogs = computed(() => {
+  const logs = props.systemLogs || []
+  return logs.map((log) => {
+    const msg = log.msg || ''
+    let category = 'info'
+    let icon = '·'
+    if (msg.includes('失败') || msg.toLowerCase().includes('error') || msg.includes('❌')) {
+      category = 'error'; icon = '⚠'
+    } else if (msg.startsWith('[✅ R') || msg.includes(' 完成 ')) {
+      category = 'round'; icon = '✅'
+    } else if (msg.includes('[Detail-Poll]')) {
+      // 调试日志已在前面迁移到 console.debug，正常情况不会出现
+      category = 'debug'; icon = '·'
+    } else if (
+      msg.includes('启动') || msg.includes('初始化') || msg.includes('设置') ||
+      msg.includes('加载') || msg.includes('配置') || msg.includes('清理') ||
+      msg.includes('自定义模拟') || msg.includes('开启动态') || msg.includes('已启动') ||
+      msg.includes('✅ 模拟引擎') || msg.includes('✓ 已清理') || msg.includes('PID:')
+    ) {
+      category = 'config'; icon = '⚙'
+    } else if (msg.includes('└─') || msg.includes('├─')) {
+      category = 'config'; icon = ' '
+    }
+    return { ...log, category, icon }
+  })
+})
+const visibleLogs = computed(() => {
+  if (showHidden.value) return categorizedLogs.value
+  return categorizedLogs.value.filter((l) => l.category !== 'config' && l.category !== 'debug')
+})
+const hiddenCount = computed(() =>
+  categorizedLogs.value.filter((l) => l.category === 'config' || l.category === 'debug').length
+)
 
 const fetchRunStatus = async () => {
   if (!props.simulationId) return
@@ -671,15 +799,28 @@ const fetchRunStatus = async () => {
       const data = res.data
       
       runStatus.value = data
-      
-      // 分别检测各平台的轮次变化并输出日志
-      if (data.twitter_current_round > prevTwitterRound.value) {
-        addLog(`[Plaza] R${data.twitter_current_round}/${data.total_rounds} | T:${data.twitter_simulated_hours || 0}h | A:${data.twitter_actions_count}`)
+
+      // T4：轮次合并日志 —— 把双平台的轮次变更合并为单条结构化日志
+      // 业务不变：仅 UI 聚合；后端数据来源不变
+      const twChanged = data.twitter_current_round > prevTwitterRound.value
+      const rdChanged = data.reddit_current_round > prevRedditRound.value
+      if (twChanged && rdChanged) {
+        addLog(`[✅ R${data.current_round}/${data.total_rounds}] Plaza A:${data.twitter_actions_count} | Community A:${data.reddit_actions_count} | T:${data.simulated_hours || 0}h`)
+        twitterRoundDelta.value = Math.max(0, data.twitter_actions_count - prevTwitterActions.value)
+        redditRoundDelta.value = Math.max(0, data.reddit_actions_count - prevRedditActions.value)
+        prevTwitterActions.value = data.twitter_actions_count
+        prevRedditActions.value = data.reddit_actions_count
         prevTwitterRound.value = data.twitter_current_round
-      }
-      
-      if (data.reddit_current_round > prevRedditRound.value) {
-        addLog(`[Community] R${data.reddit_current_round}/${data.total_rounds} | T:${data.reddit_simulated_hours || 0}h | A:${data.reddit_actions_count}`)
+        prevRedditRound.value = data.reddit_current_round
+      } else if (twChanged) {
+        addLog(`[✅ R${data.twitter_current_round}/${data.total_rounds}] Plaza A:${data.twitter_actions_count} | T:${data.twitter_simulated_hours || 0}h`)
+        twitterRoundDelta.value = Math.max(0, data.twitter_actions_count - prevTwitterActions.value)
+        prevTwitterActions.value = data.twitter_actions_count
+        prevTwitterRound.value = data.twitter_current_round
+      } else if (rdChanged) {
+        addLog(`[✅ R${data.reddit_current_round}/${data.total_rounds}] Community A:${data.reddit_actions_count} | T:${data.reddit_simulated_hours || 0}h`)
+        redditRoundDelta.value = Math.max(0, data.reddit_actions_count - prevRedditActions.value)
+        prevRedditActions.value = data.reddit_actions_count
         prevRedditRound.value = data.reddit_current_round
       }
       
@@ -711,9 +852,20 @@ const fetchRunStatus = async () => {
       }
 
       return false  // 模拟未完成，继续轮询
+    } else if (res?.success) {
+      // 成功但 data 缺失：重置错误计数 + 横幅
+      if (pollErrorCount.value > 0) {
+        pollErrorBanner.value = ''
+        pollErrorCount.value = 0
+      }
     }
   } catch (err) {
     console.warn('获取运行状态失败:', err)
+    pollErrorCount.value++
+    if (pollErrorCount.value >= 3 && !pollErrorBanner.value) {
+      pollErrorBanner.value = `后端持续无响应（${pollErrorCount.value} 次）— 模拟可能已异常退出。请检查后端日志或刷新页面。`
+      addLog(`[⚠️ 后端异常] 连续 ${pollErrorCount.value} 次轮询失败`)
+    }
   }
   return false
 }
@@ -744,20 +896,24 @@ const checkPlatformsCompleted = (data) => {
 
 const fetchRunStatusDetail = async () => {
   if (!props.simulationId) return
-  
+
+  // 稳态调试信息：不再刷屏进 UI 面板，改走 console（F12 才能看到）
+  // 业务行为完全不变：仍每 3s 轮询，仍增量拉取，仍新增动作去重
+  console.debug(`[Detail-Poll] tick @ ${new Date().toLocaleTimeString()}`)
   try {
     const res = await getRunStatusDetail(props.simulationId)
-    
+    console.debug(`[Detail-Poll] success=${res?.success} all_actions=${(res?.data?.all_actions || []).length} idsSet=${actionIds.value.size} allActions=${allActions.value.length}`)
     if (res.success && res.data) {
       // 使用 all_actions 获取完整的动作列表
       const serverActions = res.data.all_actions || []
-      
+
       // 增量添加新动作（去重）
       let newActionsAdded = 0
+      let firstNewAction = null
       serverActions.forEach(action => {
         // 生成唯一ID
         const actionId = action.id || `${action.timestamp}-${action.platform}-${action.agent_id}-${action.action_type}`
-        
+
         if (!actionIds.value.has(actionId)) {
           actionIds.value.add(actionId)
           allActions.value.push({
@@ -765,14 +921,24 @@ const fetchRunStatusDetail = async () => {
             _uniqueId: actionId
           })
           newActionsAdded++
+          if (!firstNewAction) firstNewAction = `R${action.round_num} ${action.platform}/${action.action_type}/${action.agent_name}`
         }
       })
-      
+      // 仅在真的有新动作时才往 UI 面板打一行（其它时候完全静默）
+      if (newActionsAdded > 0) {
+        addLog(`[Detail-Poll] +${newActionsAdded} new | first: ${firstNewAction}`)
+      }
+
       // 不自动滚动，让用户自由查看时间轴
       // 新动作会在底部追加
     }
   } catch (err) {
     console.warn('获取详细状态失败:', err)
+    // detail-poll 失败不计入主错误计数器（detail 是次要数据）
+    // 但若 detail 也持续失败 ≥ 6 次（≈30s），也提示用户
+    if (pollErrorCount.value >= 6) {
+      addLog(`[⚠️ Detail-Poll 持续失败] ${pollErrorCount.value} 次`)
+    }
   }
 }
 
@@ -836,20 +1002,45 @@ const handleNextStep = async () => {
     addLog(t('log.reportRequestSent'))
     return
   }
-  
+
   isGeneratingReport.value = true
   addLog(t('log.startingReportGen'))
-  
+
+  // 优化 R2/R4：智能判断 force_regenerate
+  // 1. 先查报告状态（无报告 / completed / generating / failed）
+  // 2. 默认进入恢复模式（不传 force_regenerate），让后端 R1+R2 自动跳过已有章节
+  // 3. 只有用户显式点"强制重新生成"才传 force_regenerate=true
   try {
-    const res = await generateReport({
-      simulation_id: props.simulationId,
-      force_regenerate: true
-    })
-    
+    const { checkReportStatus } = await import('../api/report')
+    const checkRes = await checkReportStatus(props.simulationId)
+
+    let params = { simulation_id: props.simulationId }
+
+    if (checkRes.success && checkRes.data) {
+      const status = checkRes.data.report_status
+      const resumable = checkRes.data.resumable
+      const completed = checkRes.data.completed_sections || 0
+      const total = checkRes.data.total_sections || 0
+
+      if (status === 'completed') {
+        // 已完成 → 直接跳转到 Report 页（后端会返回 already_generated）
+        addLog(`报告已存在 (${checkRes.data.report_id})，直接进入查看`)
+      } else if (status === 'generating') {
+        // 正在生成中 → 直接跳转，让用户看到进度
+        addLog(`报告正在生成中，进入查看页面`)
+      } else if (status === 'failed' && resumable) {
+        // 失败且可恢复 → 默认走恢复模式（不传 force_regenerate），R1 会跳过已有章节
+        addLog(`检测到失败报告，已生成 ${completed}/${total} 章节，进入恢复模式`)
+      }
+      // 其他情况（无报告 / pending / planning）走默认 params（不传 force_regenerate）
+    }
+
+    const res = await generateReport(params)
+
     if (res.success && res.data) {
       const reportId = res.data.report_id
       addLog(t('log.reportGenTaskStarted', { reportId }))
-      
+
       // 跳转到报告页面
       router.push({ name: 'Report', params: { reportId } })
     } else {
@@ -875,6 +1066,8 @@ watch(() => props.systemLogs?.length, () => {
 onMounted(() => {
   addLog(t('log.step3Init'))
   if (props.simulationId) {
+    // 检测是否有可恢复的快照（模拟已完成/失败，但尚未重新启动）
+    checkAndPromptRestoreSnapshot()
     doStartSimulation()
   }
 })
@@ -958,6 +1151,41 @@ const handleCreateSnapshot = async () => {
   }
 }
 
+// 检测并提示恢复最后快照
+// 当用户从第四章回退到第三章时，如果模拟已完成/失败且有快照，自动提示
+const checkAndPromptRestoreSnapshot = async () => {
+  if (!props.simulationId) return
+
+  try {
+    const res = await listSnapshots(props.simulationId)
+
+    if (res.success && res.data?.snapshots?.length > 0) {
+      // 按创建时间排序，取最新的快照
+      const snapshots = [...res.data.snapshots].sort((a, b) => {
+        const timeA = new Date(a.created_at || 0).getTime()
+        const timeB = new Date(b.created_at || 0).getTime()
+        return timeB - timeA
+      })
+
+      const latest = snapshots[0]
+
+      // 判断这个最新快照是否是"有意义的"（不是空的）
+      // 有意义的快照：final_ 前缀（成功完成）或 fail_ 前缀（失败）
+      const isFinalSnapshot = latest.snapshot_name.startsWith('final_')
+      const isFailSnapshot = latest.snapshot_name.startsWith('fail_')
+
+      if (isFinalSnapshot || isFailSnapshot) {
+        addLog(t('log.hasPreviousSnapshot', { name: latest.snapshot_name }))
+        // 显示一个可点击的提示，让用户选择是否恢复
+        showAutoRestorePrompt.value = true
+        latestSnapshotForRestore.value = latest
+      }
+    }
+  } catch (err) {
+    console.warn('检测可恢复快照失败:', err)
+  }
+}
+
 // 列出快照
 const handleListSnapshots = async () => {
   if (!props.simulationId) return
@@ -968,6 +1196,8 @@ const handleListSnapshots = async () => {
     if (res.success) {
       snapshots.value = res.data.snapshots || []
       showSnapshotPanel.value = true
+      // 关闭恢复选择对话框，避免显示不一致的状态
+      showRestoreChoice.value = false
     }
   } catch (err) {
     console.error('获取快照列表失败:', err)
@@ -983,6 +1213,28 @@ const handleRestoreSnapshot = async (snapshot) => {
   showRestoreChoice.value = true
 }
 
+// 从自动恢复提示中继续
+const handleContinueAutoRestore = () => {
+  if (!latestSnapshotForRestore.value) return
+  selectedSnapshot.value = latestSnapshotForRestore.value
+  restoreMode.value = 'continue'
+  showRestoreChoice.value = true
+  showAutoRestorePrompt.value = false
+}
+
+// 忽略自动恢复提示
+const handleIgnoreAutoRestore = () => {
+  showAutoRestorePrompt.value = false
+  latestSnapshotForRestore.value = null
+}
+
+// 取消恢复操作
+const handleCancelRestore = () => {
+  showRestoreChoice.value = false
+  selectedSnapshot.value = null
+  restoreMode.value = 'continue'
+}
+
 // 执行恢复（从弹窗确认）
 const doRestoreSnapshot = async () => {
   const snapshot = selectedSnapshot.value
@@ -992,33 +1244,34 @@ const doRestoreSnapshot = async () => {
   isRestoringSnapshot.value = true
 
   const isContinue = restoreMode.value === 'continue'
-  const startRound = isContinue ? (snapshot.run_state?.current_round || 0) : 0
-
-  if (isContinue) {
-    addLog(t('log.snapshotRestoring', { name: snapshot.snapshot_name }))
-    addLog(t('log.snapshotRestoreContinueFromSnapshot', { round: startRound + 1 }))
-    // 保存 start_round 供后续 doStartSimulation 使用
-    restoreStartRound.value = startRound
-  } else {
-    addLog(t('log.snapshotRestoring', { name: snapshot.snapshot_name }))
-    addLog(t('log.snapshotRestoreStartOver'))
-    // 清除 start_round，确保从头开始
-    restoreStartRound.value = null
-  }
-
-  // 标记已从快照恢复，防止 doStartSimulation 误传 max_rounds
-  wasRestored.value = true
 
   try {
+    addLog(t('log.snapshotRestoring', { name: snapshot.snapshot_name }))
+
     const res = await restoreSnapshot(props.simulationId, {
       snapshot_name: snapshot.snapshot_name,
-      start_round: startRound,
     })
 
     if (res.success) {
+      // 使用后端返回的 current_round，而不是本地计算的值
+      const restoredCurrentRound = res.data.current_round || 0
+      const startRound = isContinue ? restoredCurrentRound : 0
+
       addLog(t('log.snapshotRestored', { name: res.data.snapshot_name }))
-      // 刷新运行状态
-      await fetchRunStatus()
+      if (isContinue) {
+        addLog(t('log.snapshotRestoreContinueFromSnapshot', { round: startRound + 1 }))
+      } else {
+        addLog(t('log.snapshotRestoreStartOver'))
+      }
+
+      // 设置恢复标记，阻止 doStartSimulation 误传 max_rounds
+      wasRestored.value = true
+      restoreStartRound.value = isContinue && startRound > 0 ? startRound : null
+
+      // 恢复文件后，调用 doStartSimulation 启动模拟进程
+      // doStartSimulation 内部会先 resetAllState 清空前端数据，然后调用后端 start_simulation
+      // 后端会使用恢复的 run_state.json 和 actions.jsonl 数据
+      await doStartSimulation()
       showSnapshotPanel.value = false
     } else {
       addLog(t('log.snapshotRestoreFailed', { error: res.error || t('common.unknownError') }))
@@ -1080,12 +1333,16 @@ const handleDeleteSnapshot = async (snapshotName) => {
   align-items: center;
   border-bottom: 1px solid #EAEAEA;
   z-index: 10;
-  height: 64px;
+  min-height: 64px;
+  flex-wrap: wrap;
+  gap: 12px;
 }
 
 .status-group {
   display: flex;
   gap: 12px;
+  flex-wrap: wrap;
+  align-items: stretch;
 }
 
 /* Platform Status Cards */
@@ -1099,7 +1356,7 @@ const handleDeleteSnapshot = async (snapshotName) => {
   border: 1px solid #EAEAEA;
   opacity: 0.7;
   transition: all 0.3s;
-  min-width: 140px;
+  min-width: 200px;
   position: relative;
   cursor: pointer;
 }
@@ -1197,7 +1454,46 @@ const handleDeleteSnapshot = async (snapshotName) => {
 
 .platform-stats {
   display: flex;
-  gap: 10px;
+  gap: 12px;
+  flex-wrap: wrap;
+  align-items: baseline;
+}
+
+/* T1：本轮增量 pill */
+.round-delta-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+  padding: 3px 8px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  border-radius: 3px;
+  width: fit-content;
+  animation: roundDeltaFadeIn 0.4s ease-out;
+}
+.round-delta-pill.twitter {
+  background: rgba(255, 107, 53, 0.12);
+  color: #FF5722;
+  border: 1px solid rgba(255, 87, 34, 0.35);
+}
+.round-delta-pill.reddit {
+  background: rgba(0, 78, 137, 0.12);
+  color: #004E89;
+  border: 1px solid rgba(0, 78, 137, 0.35);
+}
+.round-delta-icon {
+  font-size: 9px;
+}
+.round-delta-text {
+  font-size: 10px;
+}
+@keyframes roundDeltaFadeIn {
+  from { opacity: 0; transform: translateY(2px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 .stat {
@@ -1238,6 +1534,50 @@ const handleDeleteSnapshot = async (snapshotName) => {
   display: flex;
   align-items: center;
   gap: 12px;
+  flex-shrink: 0;
+}
+
+/* 后端异常横幅 */
+.poll-error-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 24px;
+  background: linear-gradient(180deg, rgba(255, 87, 34, 0.08), rgba(255, 87, 34, 0.04));
+  border-bottom: 1px solid rgba(255, 87, 34, 0.25);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: #FF5722;
+  animation: pollErrorFadeIn 0.3s ease-out;
+}
+.poll-error-banner .banner-icon {
+  font-size: 14px;
+}
+.poll-error-banner .banner-text {
+  flex: 1;
+  font-weight: 600;
+}
+.poll-error-banner .banner-dismiss {
+  background: transparent;
+  border: 1px solid rgba(255, 87, 34, 0.4);
+  color: #FF5722;
+  width: 22px;
+  height: 22px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s ease;
+}
+.poll-error-banner .banner-dismiss:hover {
+  background: rgba(255, 87, 34, 0.15);
+  border-color: #FF5722;
+}
+@keyframes pollErrorFadeIn {
+  from { opacity: 0; transform: translateY(-2px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 /* Action Button */
@@ -1620,6 +1960,37 @@ const handleDeleteSnapshot = async (snapshotName) => {
 
 .log-time { color: #555; min-width: 75px; }
 .log-msg { color: #BBB; word-break: break-all; }
+
+/* T2：日志分类 */
+.log-icon {
+  display: inline-block;
+  min-width: 14px;
+  font-size: 10px;
+  text-align: center;
+}
+.log-line--round .log-icon { color: #1A936F; }
+.log-line--round .log-msg { color: #DDD; font-weight: 500; }
+.log-line--config .log-time { color: #444; }
+.log-line--config .log-msg { color: #888; }
+.log-line--error .log-icon { color: #FF5722; }
+.log-line--error .log-time { color: #FF5722; }
+.log-line--error .log-msg { color: #FFAB91; }
+.log-toggle-btn {
+  margin-left: auto;
+  padding: 2px 8px;
+  background: transparent;
+  border: 1px solid #444;
+  color: #888;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  cursor: pointer;
+  border-radius: 2px;
+  transition: all 0.15s ease;
+}
+.log-toggle-btn:hover {
+  color: #FFF;
+  border-color: #888;
+}
 .mono { font-family: 'JetBrains Mono', monospace; }
 
 /* Loading spinner for button */
@@ -1841,6 +2212,91 @@ const handleDeleteSnapshot = async (snapshotName) => {
   color: #999;
   font-size: 13px;
   font-style: italic;
+}
+
+/* 自动恢复提示 */
+.auto-restore-prompt {
+  background: linear-gradient(135deg, #FFF9E6 0%, #FFF3CC 100%);
+  border: 1px solid #FFD700;
+  border-radius: 8px;
+  padding: 16px 20px;
+  margin: 12px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.prompt-content {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  flex: 1;
+  min-width: 0;
+}
+
+.prompt-icon {
+  flex-shrink: 0;
+  color: #E6A800;
+  margin-top: 2px;
+}
+
+.prompt-text {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.prompt-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #333;
+}
+
+.prompt-desc {
+  font-size: 12px;
+  color: #666;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.prompt-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.prompt-btn {
+  padding: 6px 14px;
+  border-radius: 4px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: all 0.2s;
+}
+
+.prompt-btn.primary {
+  background: #0066CC;
+  color: #FFF;
+  border-color: #0066CC;
+}
+
+.prompt-btn.primary:hover {
+  background: #0052AA;
+}
+
+.prompt-btn.secondary {
+  background: #FFF;
+  color: #666;
+  border-color: #DDD;
+}
+
+.prompt-btn.secondary:hover {
+  background: #F5F5F5;
+  border-color: #CCC;
 }
 
 .btn-icon {
