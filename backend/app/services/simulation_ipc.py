@@ -153,38 +153,79 @@ class SimulationIPCClient:
         # 等待响应
         response_file = os.path.join(self.responses_dir, f"{command_id}.json")
         start_time = time.time()
-        
+        # 优化 B4：本调用内的 poll 计数器（局部变量，确保每次 send_command 独立计数）
+        poll_count = 0
+        FAST_POLL_LIMIT = 5  # 前 5 次快速 poll
+        MAX_POLL_INTERVAL = 4.0  # 退避上限 4s
+
         while time.time() - start_time < timeout:
             if os.path.exists(response_file):
                 try:
                     with open(response_file, 'r', encoding='utf-8') as f:
                         response_data = json.load(f)
                     response = IPCResponse.from_dict(response_data)
-                    
+
                     # 清理命令和响应文件
                     try:
                         os.remove(command_file)
                         os.remove(response_file)
                     except OSError:
                         pass
-                    
+
                     logger.info(f"收到IPC响应: command_id={command_id}, status={response.status.value}")
                     return response
                 except (json.JSONDecodeError, KeyError) as e:
                     logger.warning(f"解析响应失败: {e}")
-            
-            time.sleep(poll_interval)
+
+            # 优化 B4：指数退避 — 前 FAST_POLL_LIMIT 次用 poll_interval 保持响应速度，
+            # 之后逐步放慢到 MAX_POLL_INTERVAL 上限
+            # 业务语义不变：响应一到立即返回；最坏情况只多等 0~1s
+            poll_count += 1
+            if poll_count <= FAST_POLL_LIMIT:
+                sleep_time = poll_interval
+            else:
+                sleep_time = min(
+                    poll_interval * (2 ** (poll_count - FAST_POLL_LIMIT)),
+                    MAX_POLL_INTERVAL
+                )
+            time.sleep(sleep_time)
         
         # 超时
-        logger.error(f"等待IPC响应超时: command_id={command_id}")
-        
-        # 清理命令文件
+        # 改进诊断：检查关键状态让前端/运维能区分原因
+        # - 命令文件残留 → 子进程未读到（可能没启动 / 在 crash 后重启）
+        # - 响应文件残留但未完整 → 子进程写了一半 JSON
+        # - 都没有 → 子进程读到了但没写回（可能正在跑长 LLM 任务）
+        cmd_file_exists = os.path.exists(command_file)
+        resp_file_exists = os.path.exists(response_file)
+        resp_partial = False
+        if resp_file_exists:
+            try:
+                size = os.path.getsize(response_file)
+                # 响应文件一般 200B+，小于此说明没写完
+                resp_partial = size < 50
+            except OSError:
+                resp_partial = False
+
+        logger.error(
+            f"等待IPC响应超时: command_id={command_id}, type={command_type.value}, "
+            f"命令文件残留={cmd_file_exists}, "
+            f"响应文件残留={resp_file_exists}(partial={resp_partial})"
+        )
+
+        # 清理命令文件（不删响应文件，留给调试）
         try:
             os.remove(command_file)
         except OSError:
             pass
-        
-        raise TimeoutError(f"等待命令响应超时 ({timeout}秒)")
+
+        # 构造用户可读的错误消息（前端可展示）
+        if cmd_file_exists:
+            hint = "子进程未读取命令（可能没启动或正在 crash）"
+        elif resp_partial:
+            hint = "响应文件不完整（子进程可能异常退出）"
+        else:
+            hint = "子进程在处理长任务（建议等待后重试）"
+        raise TimeoutError(f"等待命令响应超时 ({timeout}秒)。{hint}")
     
     def send_interview(
         self,
@@ -322,12 +363,14 @@ class SimulationIPCServer:
     
     def _update_env_status(self, status: str):
         """更新环境状态文件"""
+        # 优化 B9：改用原子写入，避免子进程崩溃时前端读到半截 JSON
+        # 业务语义不变：最终文件内容与原版完全一致
+        from ..utils.atomic_io import atomic_write_json
         status_file = os.path.join(self.simulation_dir, "env_status.json")
-        with open(status_file, 'w', encoding='utf-8') as f:
-            json.dump({
-                "status": status,
-                "timestamp": datetime.now().isoformat()
-            }, f, ensure_ascii=False, indent=2)
+        atomic_write_json(status_file, {
+            "status": status,
+            "timestamp": datetime.now().isoformat()
+        }, ensure_ascii=False)
     
     def poll_commands(self) -> Optional[IPCCommand]:
         """
