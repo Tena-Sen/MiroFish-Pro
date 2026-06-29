@@ -414,7 +414,7 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { generateOntology, getProject, buildGraph, getTaskStatus, getGraphData } from '../api/graph'
+import { generateOntology, getProject, buildGraph, getTaskStatus, getGraphData, getGraphDataSummary } from '../api/graph'
 import { getPendingUpload, clearPendingUpload } from '../store/pendingUpload'
 import * as d3 from 'd3'
 
@@ -714,11 +714,43 @@ let graphPollTimer = null
 const startGraphPolling = () => {
   // 立即获取一次
   fetchGraphData()
-  
+
   // 每 10 秒自动获取一次图谱数据
+  // 优化 B3：先查 /summary（轻量 O(1)），仅当计数变化才拉 /data 全量
   graphPollTimer = setInterval(async () => {
-    await fetchGraphData()
+    await pollGraphIfChanged()
   }, 10000)
+}
+
+// 轻量轮询：仅当节点/边计数变化时才拉取完整图谱
+const pollGraphIfChanged = async () => {
+  try {
+    const graphId = projectData.value?.graph_id
+    if (!graphId) {
+      await fetchGraphData()  // 还没拿到 graph_id 时走老路径
+      return
+    }
+
+    const summaryRes = await getGraphDataSummary(graphId)
+    if (!summaryRes.success || !summaryRes.data) {
+      await fetchGraphData()
+      return
+    }
+
+    const { node_count: newNodeCount, edge_count: newEdgeCount } = summaryRes.data
+    const oldNodeCount = graphData.value?.node_count || graphData.value?.nodes?.length || 0
+    const oldEdgeCount = graphData.value?.edge_count || graphData.value?.edges?.length || 0
+
+    // 计数有变 → 才拉全量（保持原 fetchGraphData 的渲染逻辑）
+    if (newNodeCount !== oldNodeCount || newEdgeCount !== oldEdgeCount) {
+      console.debug(`Graph changed (nodes ${oldNodeCount}→${newNodeCount}, edges ${oldEdgeCount}→${newEdgeCount}), fetching full data`)
+      await fetchGraphData()
+    }
+  } catch (err) {
+    console.warn('Light poll failed, fallback:', err.message)
+    // 兜底：拉一次全量，避免卡在过期数据
+    await fetchGraphData()
+  }
 }
 
 // 手动刷新图谱
@@ -753,9 +785,9 @@ const fetchGraphData = async () => {
         const newData = graphResponse.data
         const newNodeCount = newData.node_count || newData.nodes?.length || 0
         const oldNodeCount = graphData.value?.node_count || graphData.value?.nodes?.length || 0
-        
-        console.log('Fetching graph data, nodes:', newNodeCount, 'edges:', newData.edge_count || newData.edges?.length || 0)
-        
+
+        // 静默更新，不打 INFO/LOG（高频轮询）
+
         // 数据有变化时更新渲染
         if (newNodeCount !== oldNodeCount || !graphData.value) {
           graphData.value = newData
@@ -765,7 +797,7 @@ const fetchGraphData = async () => {
       }
     }
   } catch (err) {
-    console.log('Graph data fetch:', err.message || 'not ready')
+    console.warn('Graph data fetch:', err.message || 'not ready')
   }
 }
 
@@ -794,11 +826,11 @@ const pollTaskStatus = async (taskId) => {
         message: task.message || '处理中...'
       }
       
-      console.log('Task status:', task.status, 'Progress:', task.progress)
-      
+      console.debug('Task status:', task.status, 'Progress:', task.progress)
+
       if (task.status === 'completed') {
-        console.log('✅ 图谱构建完成，正在加载完整数据...')
-        
+        // 静默：完成事件由 buildProgress.value 显示，不需要日志
+
         stopPolling()
         stopGraphPolling()
         currentPhase.value = 2
@@ -816,9 +848,8 @@ const pollTaskStatus = async (taskId) => {
           
           // 最终加载完整图谱数据
           if (projectResponse.data.graph_id) {
-            console.log('📊 加载完整图谱:', projectResponse.data.graph_id)
+            // 静默：loadGraph 内部已有 console.debug
             await loadGraph(projectResponse.data.graph_id)
-            console.log('✅ 图谱加载完成')
           }
         }
         
@@ -864,41 +895,41 @@ const loadGraph = async (graphId) => {
 // 渲染图谱 (D3.js)
 const renderGraph = () => {
   if (!graphSvg.value || !graphData.value) {
-    console.log('Cannot render: svg or data missing')
+    console.debug('Cannot render: svg or data missing')
     return
   }
-  
+
   const container = graphContainer.value
   if (!container) {
-    console.log('Cannot render: container missing')
+    console.debug('Cannot render: container missing')
     return
   }
-  
+
   // 获取容器尺寸
   const rect = container.getBoundingClientRect()
   const width = rect.width || 800
   const height = (rect.height || 600) - 60
-  
+
   if (width <= 0 || height <= 0) {
-    console.log('Cannot render: invalid dimensions', width, height)
+    console.debug('Cannot render: invalid dimensions', width, height)
     return
   }
-  
-  console.log('Rendering graph:', width, 'x', height)
-  
+
+  console.debug('Rendering graph:', width, 'x', height)
+
   const svg = d3.select(graphSvg.value)
     .attr('width', width)
     .attr('height', height)
     .attr('viewBox', `0 0 ${width} ${height}`)
-  
+
   svg.selectAll('*').remove()
-  
+
   // 处理节点数据
   const nodesData = graphData.value.nodes || []
   const edgesData = graphData.value.edges || []
-  
+
   if (nodesData.length === 0) {
-    console.log('No nodes to render')
+    // 静默：前端已有空状态 UI，不需要日志
     // 显示空状态
     svg.append('text')
       .attr('x', width / 2)
@@ -908,23 +939,23 @@ const renderGraph = () => {
       .text('等待图谱数据...')
     return
   }
-  
+
   // 创建节点映射用于查找名称
   const nodeMap = {}
   nodesData.forEach(n => {
     nodeMap[n.uuid] = n
   })
-  
+
   const nodes = nodesData.map(n => ({
     id: n.uuid,
     name: n.name || '未命名',
     type: n.labels?.find(l => l !== 'Entity' && l !== 'Node') || 'Entity',
     rawData: n // 保存原始数据
   }))
-  
+
   // 创建节点ID集合用于过滤有效边
   const nodeIds = new Set(nodes.map(n => n.id))
-  
+
   const edges = edgesData
     .filter(e => nodeIds.has(e.source_node_uuid) && nodeIds.has(e.target_node_uuid))
     .map(e => ({
@@ -937,8 +968,8 @@ const renderGraph = () => {
         target_name: nodeMap[e.target_node_uuid]?.name || '未知'
       }
     }))
-  
-  console.log('Nodes:', nodes.length, 'Edges:', edges.length)
+
+  console.debug('Nodes:', nodes.length, 'Edges:', edges.length)
   
   // 颜色映射
   const types = [...new Set(nodes.map(n => n.type))]
