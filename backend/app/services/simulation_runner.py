@@ -131,14 +131,22 @@ class SimulationRunState:
     # 平台完成状态（通过检测 actions.jsonl 中的 simulation_end 事件）
     twitter_completed: bool = False
     reddit_completed: bool = False
-    
+
+    # 周期性自动快照追踪：上次触发快照的轮次
+    # 修复（NameError）：之前 last_snapshot_round 是 _monitor_simulation 的闭包变量，
+    # 被 @classmethod _read_action_log 引用，Python 抛 UnboundLocalError。
+    # 修复：移到 state 对象上，跨方法可见、且能被 to_dict 序列化到 run_state.json
+    # 业务语义不变：-1 = 尚未快照过；>=0 = 上一轮触发了快照
+    _last_snapshot_round: int = -1
+
     # 每轮摘要
     rounds: List[RoundSummary] = field(default_factory=list)
 
     # 最近动作（用于前端实时展示）
     # 优化 B6：用 deque(maxlen=50) 替代 list，appendleft + 自动截断 O(1)
     # 业务语义不变：仍按"最新在前"顺序，max 50 条
-    max_recent_actions: int = 50
+    # 注意：maxlen 直接在 deque 构造里硬编码 50；旧版本独立字段 max_recent_actions
+    # 已被移除（无任何代码读取，纯死字段）
     recent_actions: "deque" = field(default_factory=lambda: deque(maxlen=50))
 
     # 优化 B2：脏标记 —— state 字段被改动后置 True，由 _save_run_state_if_dirty 统一落盘
@@ -192,6 +200,8 @@ class SimulationRunState:
             "twitter_actions_count": self.twitter_actions_count,
             "reddit_actions_count": self.reddit_actions_count,
             "total_actions_count": self.twitter_actions_count + self.reddit_actions_count,
+            # 必修 1：持久化 _last_snapshot_round（避免重启后立刻又触发一次 auto-snapshot）
+            "_last_snapshot_round": self._last_snapshot_round,
             "started_at": self.started_at,
             "updated_at": self.updated_at,
             "completed_at": self.completed_at,
@@ -293,11 +303,14 @@ class SimulationRunner:
             )
             
             # 加载最近动作（JSON 按 [新→旧] 顺序存，deque 也需保持此顺序）
-            # 优化 B6：直接用 appendleft 与运行时一致；deque 自动按 maxlen 截断
-            # 业务语义不变：deque 左端是最新动作
+            # 修复（必修 14）：用 append（不是 appendleft）保持磁盘顺序
+            # 旧实现用 appendleft 反而把方向反了 — 加载后 deque 左端是最旧而非最新，
+            # 后续 add_action 又往左 append，会导致"左端是最新还是最旧"取决于是否经历过 load，
+            # 跨重启时 recent_actions 顺序完全错乱
+            # 业务语义：磁盘 [新, 第二新, ..., 最旧] → deque [新, 第二新, ..., 最旧]（左端最新）
             actions_data = data.get("recent_actions", [])
             for a in actions_data:
-                state.recent_actions.appendleft(AgentAction(
+                state.recent_actions.append(AgentAction(
                     round_num=a.get("round_num", 0),
                     timestamp=a.get("timestamp", ""),
                     platform=a.get("platform", ""),
@@ -308,7 +321,13 @@ class SimulationRunner:
                     result=a.get("result"),
                     success=a.get("success", True),
                 ))
-            
+
+            # 必修 1：恢复 _last_snapshot_round
+            # 旧实现不持久化 → 重启后总是 -1 → 周期性自动快照会立刻重跑一次（浪费磁盘）
+            # 用 max() 兜底：即使 JSON 中值是 -1 也接受（边界情况，意思相同）
+            if hasattr(state, "_last_snapshot_round"):
+                state._last_snapshot_round = int(data.get("_last_snapshot_round", -1))
+
             return state
         except Exception as e:
             logger.error(f"加载运行状态失败: {str(e)}")
@@ -806,7 +825,9 @@ class SimulationRunner:
         # 优化 S1：周期性自动快照 —— 长跑模拟抗风险
         # 每 SIMULATION_AUTO_SNAPSHOT_INTERVAL_ROUNDS 轮触发一次 snapshot
         # 仅保留最近 SIMULATION_AUTO_SNAPSHOTS_KEEP 个 auto 快照
-        last_snapshot_round = -1  # 上次快照时的轮次（-1 表示尚未快照过）
+        # 修复（NameError）：之前在 _monitor_simulation 闭包里定义，_read_action_log 是
+        # @classmethod 拿不到。现在统一在 state._last_snapshot_round 上追踪
+        state._last_snapshot_round = -1
 
         try:
             while process.poll() is None:  # 进程仍在运行
@@ -1030,14 +1051,17 @@ class SimulationRunner:
 
                                     # 优化 S1：周期性自动快照（每 N 轮触发一次）
                                     # 业务不变性：snapshot 是"过去数据"完整保存，恢复后从同 start_round 继续
+                                    # 修复（NameError + 持久化）：从 state._last_snapshot_round 读取
+                                    # 该字段已在 dataclass 声明（默认 -1），且 to_dict 持久化 + _load_run_state 恢复
+                                    # 这里不再做 hasattr 防御，避免死代码
                                     if Config.SIMULATION_AUTO_SNAPSHOT_ENABLED:
                                         interval = Config.SIMULATION_AUTO_SNAPSHOT_INTERVAL_ROUNDS
-                                        if interval > 0 and round_num > 0 and round_num - last_snapshot_round >= interval:
+                                        if interval > 0 and round_num > 0 and round_num - state._last_snapshot_round >= interval:
                                             try:
                                                 snap_name = f"auto_r{round_num}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                                                 cls.create_snapshot(state.simulation_id, snapshot_name=snap_name)
                                                 cls._cleanup_old_auto_snapshots(state.simulation_id)
-                                                last_snapshot_round = round_num
+                                                state._last_snapshot_round = round_num
                                                 logger.info(f"周期性自动快照: {state.simulation_id} @ round {round_num}")
                                             except Exception as snap_err:
                                                 # snapshot 失败不能阻塞模拟主流程
