@@ -908,12 +908,18 @@ class ReportAgent:
         self.graph_id = graph_id
         self.simulation_id = simulation_id
         self.simulation_requirement = simulation_requirement
-        
+
         self.llm = llm_client or LLMClient()
         self.zep_tools = zep_tools or ZepToolsService()
-        
+
         # 工具定义
         self.tools = self._define_tools()
+
+        # 优化 C2：缓存 chat() 用的 report_content + meta.json mtime
+        # 业务不变性：报告内容稳定时直接复用；meta.json mtime 变化时刷新
+        # report 状态：仅当 report 内容发生变化时刷新缓存
+        self._cached_report_content: str = ""
+        self._cached_report_mtime: Optional[float] = None
         
         # 日志记录器（在 generate_report 中初始化）
         self.report_logger: Optional[ReportLogger] = None
@@ -1225,30 +1231,33 @@ class ReportAgent:
             )
     
     def _generate_section_react(
-        self, 
+        self,
         section: ReportSection,
         outline: ReportOutline,
         previous_sections: List[str],
         progress_callback: Optional[Callable] = None,
-        section_index: int = 0
+        section_index: int = 0,
+        previous_summaries: Optional[List[str]] = None,
     ) -> str:
         """
         使用ReACT模式生成单个章节内容
-        
+
         ReACT循环：
         1. Thought（思考）- 分析需要什么信息
         2. Action（行动）- 调用工具获取信息
         3. Observation（观察）- 分析工具返回结果
         4. 重复直到信息足够或达到最大次数
         5. Final Answer（最终回答）- 生成章节内容
-        
+
         Args:
             section: 要生成的章节
             outline: 完整大纲
-            previous_sections: 之前章节的内容（用于保持连贯性）
+            previous_sections: 之前章节的内容（用于保持连贯性）—— 默认 4000 字/章节
             progress_callback: 进度回调
             section_index: 章节索引（用于日志记录）
-            
+            previous_summaries: （Phase 3 新增）之前章节的摘要，传入时优先使用—— 默认 400 字/章节。
+                用于 wave 并行模式：避免 prompt 过大导致 LLM 响应变慢，同时保留跨章节连贯性。
+
         Returns:
             章节内容（Markdown格式）
         """
@@ -1268,7 +1277,15 @@ class ReportAgent:
         system_prompt = f"{system_prompt}\n\n{get_language_instruction()}"
 
         # 构建用户prompt - 每个已完成章节各传入最大4000字
-        if previous_sections:
+        # Phase 3: 如果传入了 previous_summaries，优先使用（wave 模式：摘要代替全文，prompt 更短）
+        if previous_summaries:
+            # 摘要模式：每条最多 400 字（远小于全文 4000 字），适合 wave 并行
+            summary_parts = []
+            for sm in previous_summaries:
+                truncated = sm[:400] + "..." if len(sm) > 400 else sm
+                summary_parts.append(truncated)
+            previous_content = "\n\n---\n\n".join(summary_parts)
+        elif previous_sections:
             previous_parts = []
             for sec in previous_sections:
                 # 每个章节最多4000字
@@ -1532,17 +1549,108 @@ class ReportAgent:
                 content=final_answer,
                 tool_calls_count=tool_calls_count
             )
-        
+
         return final_answer
-    
+
+    # =========================================================================
+    # Phase 3: 章节摘要 + Wave 并行调度
+    # =========================================================================
+
+    def _summarize_section_sync(self, section_title: str, section_content: str) -> str:
+        """
+        把已生成的章节压缩成 200-400 字摘要（用于 wave 并行模式下的 previous_summaries）。
+
+        调用一次 LLM（temperature=0.3 保持确定性），与原章节内容一一对应。
+        失败时回退到 content 截断到 400 字。
+        """
+        if not section_content:
+            return ""
+        # 内容过长时先截断再让 LLM 摘要，节省 token
+        truncated_input = section_content[:6000] if len(section_content) > 6000 else section_content
+        prompt_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是一个内容摘要助手。请将用户提供的章节内容压缩成 200-400 字的摘要，"
+                    "保留关键事实、数据、结论和与其他章节的关联信息。"
+                    "不要添加原文中没有的信息，不要使用 markdown 格式，直接输出纯文本。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"章节标题：{section_title}\n\n章节内容：\n{truncated_input}",
+            },
+        ]
+        try:
+            summary = self.llm.chat(
+                messages=prompt_messages,
+                temperature=0.3,
+                max_tokens=800,
+            )
+            summary = (summary or "").strip()
+            # 兜底：返回空就 fallback
+            if not summary:
+                return truncated_input[:400] + ("..." if len(truncated_input) > 400 else "")
+            return summary
+        except Exception as e:
+            logger.warning(f"章节摘要生成失败（{section_title}）: {e}，回退到截断")
+            return truncated_input[:400] + ("..." if len(truncated_input) > 400 else "")
+
+    def _generate_section_in_wave(
+        self,
+        section: 'ReportSection',
+        section_num: int,
+        outline: 'ReportOutline',
+        previous_summaries: List[str],
+        previous_full_for_logging: List[str],
+        wave_start_index: int,
+        total_sections: int,
+        report_id: str,
+        completed_section_titles: List[str],
+        progress_callback: Optional[Callable] = None,
+    ) -> str:
+        """
+        wave 并行模式下生成单个章节的包装。
+        由 ThreadPoolExecutor 调度，并发执行（wave_size 决定单批内并行度）。
+
+        与原 _generate_section_react 调用相同，但 previous_summaries 替代 previous_sections，
+        让 prompt 更短（每章节 400 字 vs 4000 字），并支持跨章节连贯性。
+        """
+        base_progress = 20 + int((wave_start_index / total_sections) * 70)
+        ReportManager.update_progress(
+            report_id, "generating", base_progress,
+            t('progress.generatingSection', title=section.title, current=section_num, total=total_sections),
+            current_section=section.title,
+            completed_sections=list(completed_section_titles),
+        )
+        if progress_callback:
+            progress_callback(
+                "generating", base_progress,
+                t('progress.generatingSection', title=section.title, current=section_num, total=total_sections),
+            )
+
+        content = self._generate_section_react(
+            section=section,
+            outline=outline,
+            previous_sections=previous_full_for_logging,  # 兼容字段（值为空时不影响）
+            progress_callback=lambda stage, prog, msg:
+                progress_callback(stage, base_progress + int(prog * 0.7 / total_sections), msg)
+                if progress_callback else None,
+            section_index=section_num,
+            previous_summaries=previous_summaries or None,
+        )
+        return content
+
     def generate_report(
-        self, 
+        self,
         progress_callback: Optional[Callable[[str, int, str], None]] = None,
-        report_id: Optional[str] = None
+        report_id: Optional[str] = None,
+        wave_size: int = 1,
+        start_from_section: Optional[int] = None,
     ) -> Report:
         """
         生成完整报告（分章节实时输出）
-        
+
         每个章节生成完成后立即保存到文件夹，不需要等待整个报告完成。
         文件结构：
         reports/{report_id}/
@@ -1553,11 +1661,17 @@ class ReportAgent:
             section_02.md   - 第2章节
             ...
             full_report.md  - 完整报告
-        
+
         Args:
             progress_callback: 进度回调函数 (stage, progress, message)
             report_id: 报告ID（可选，如果不传则自动生成）
-            
+            wave_size: （Phase 3）wave 并行度。1=完全串行（原行为）；N=每 N 个章节一组并行生成（提速 ~Nx）。
+                      章节之间用「摘要」而非全文注入 prompt，prompt 更短、并行更快。
+                      推荐 2-3；>3 时连贯性可能下降。
+            start_from_section: 优化 R3 — 显式从指定章节开始（1-indexed）。
+                                None = 自动断点续传（默认行为，跳过已有 section_NN.md）
+                                N = 强制从第 N 节开始（重新生成第 N 节及其后续）
+
         Returns:
             Report: 完整报告
         """
@@ -1635,71 +1749,254 @@ class ReportAgent:
             
             # 阶段2: 逐章节生成（分章节保存）
             report.status = ReportStatus.GENERATING
-            
+
             total_sections = len(outline.sections)
             generated_sections = []  # 保存内容用于上下文
-            
-            for i, section in enumerate(outline.sections):
-                section_num = i + 1
-                base_progress = 20 + int((i / total_sections) * 70)
-                
-                # 更新进度
-                ReportManager.update_progress(
-                    report_id, "generating", base_progress,
-                    t('progress.generatingSection', title=section.title, current=section_num, total=total_sections),
-                    current_section=section.title,
-                    completed_sections=completed_section_titles
-                )
+            generated_summaries: List[str] = []  # Phase 3: wave 模式下用摘要注入
+            wave_size = max(1, int(wave_size))
 
-                if progress_callback:
-                    progress_callback(
-                        "generating",
-                        base_progress,
-                        t('progress.generatingSection', title=section.title, current=section_num, total=total_sections)
+            # Phase 3: wave 并行调度
+            # wave_size=1 → 完全等价原行为（章节严格顺序，previous_sections 注入全文）
+            # wave_size=N → 每 N 个章节一组并行（线程池），后续章节用 previous_summaries 注入
+            if wave_size == 1:
+                # === 原行为：章节严格顺序 ===
+                for i, section in enumerate(outline.sections):
+                    section_num = i + 1
+                    base_progress = 20 + int((i / total_sections) * 70)
+
+                    # 优化 R3：start_from_section 模式下，前 N-1 节强制视为"已有"
+                    # 业务不变性：仅影响是否调 LLM，内容字段保持不变
+                    force_skip = (
+                        start_from_section is not None
+                        and section_num < start_from_section
                     )
-                
-                # 生成主章节内容
-                section_content = self._generate_section_react(
-                    section=section,
-                    outline=outline,
-                    previous_sections=generated_sections,
-                    progress_callback=lambda stage, prog, msg:
+
+                    # 优化 R1：断点续传 —— 检查磁盘上是否已有该章节
+                    # 业务不变性：已有章节直接复用（不调 LLM），内容、字段与原版完全一致
+                    existing = None if force_skip else ReportManager.load_existing_section(report_id, section_num, section.title)
+                    if existing is not None:
+                        logger.info(f"[R1] 跳过已有章节 {section_num}/{total_sections}: {section.title}")
+                        section.content = existing["content"]
+                        generated_sections.append(existing["markdown"])
+                        completed_section_titles.append(section.title)
+                        # 更新进度，让前端感知到"这一节已完成"
+                        ReportManager.update_progress(
+                            report_id, "generating",
+                            base_progress + int(70 / total_sections),
+                            t('progress.sectionDone', title=section.title),
+                            current_section=None,
+                            completed_sections=completed_section_titles
+                        )
+                        if self.report_logger:
+                            self.report_logger.log_section_full_complete(
+                                section_title=section.title,
+                                section_index=section_num,
+                                full_content=existing["markdown"],
+                            )
+                        continue
+
+                    # 更新进度
+                    ReportManager.update_progress(
+                        report_id, "generating", base_progress,
+                        t('progress.generatingSection', title=section.title, current=section_num, total=total_sections),
+                        current_section=section.title,
+                        completed_sections=completed_section_titles
+                    )
+
+                    if progress_callback:
                         progress_callback(
-                            stage, 
-                            base_progress + int(prog * 0.7 / total_sections),
-                            msg
-                        ) if progress_callback else None,
-                    section_index=section_num
-                )
-                
-                section.content = section_content
-                generated_sections.append(f"## {section.title}\n\n{section_content}")
+                            "generating",
+                            base_progress,
+                            t('progress.generatingSection', title=section.title, current=section_num, total=total_sections)
+                        )
 
-                # 保存章节
-                ReportManager.save_section(report_id, section_num, section)
-                completed_section_titles.append(section.title)
-
-                # 记录章节完成日志
-                full_section_content = f"## {section.title}\n\n{section_content}"
-
-                if self.report_logger:
-                    self.report_logger.log_section_full_complete(
-                        section_title=section.title,
-                        section_index=section_num,
-                        full_content=full_section_content.strip()
+                    # 生成主章节内容
+                    section_content = self._generate_section_react(
+                        section=section,
+                        outline=outline,
+                        previous_sections=generated_sections,
+                        progress_callback=lambda stage, prog, msg:
+                            progress_callback(
+                                stage,
+                                base_progress + int(prog * 0.7 / total_sections),
+                                msg
+                            ) if progress_callback else None,
+                        section_index=section_num
                     )
 
-                logger.info(t('report.sectionSaved', reportId=report_id, sectionNum=f"{section_num:02d}"))
-                
-                # 更新进度
-                ReportManager.update_progress(
-                    report_id, "generating", 
-                    base_progress + int(70 / total_sections),
-                    t('progress.sectionDone', title=section.title),
-                    current_section=None,
-                    completed_sections=completed_section_titles
-                )
-            
+                    section.content = section_content
+                    generated_sections.append(f"## {section.title}\n\n{section_content}")
+
+                    # 保存章节
+                    ReportManager.save_section(report_id, section_num, section)
+                    completed_section_titles.append(section.title)
+
+                    # 记录章节完成日志
+                    full_section_content = f"## {section.title}\n\n{section_content}"
+
+                    if self.report_logger:
+                        self.report_logger.log_section_full_complete(
+                            section_title=section.title,
+                            section_index=section_num,
+                            full_content=full_section_content.strip()
+                        )
+
+                    logger.info(t('report.sectionSaved', reportId=report_id, sectionNum=f"{section_num:02d}"))
+
+                    # 更新进度
+                    ReportManager.update_progress(
+                        report_id, "generating",
+                        base_progress + int(70 / total_sections),
+                        t('progress.sectionDone', title=section.title),
+                        current_section=None,
+                        completed_sections=completed_section_titles
+                    )
+            else:
+                # === Phase 3: wave 并行模式 ===
+                import concurrent.futures
+                logger.info(f"启用 wave 并行模式：wave_size={wave_size}（{total_sections} 章节将分 {((total_sections + wave_size - 1) // wave_size)} 批）")
+
+                for wave_start in range(0, total_sections, wave_size):
+                    wave_end = min(wave_start + wave_size, total_sections)
+                    wave = list(enumerate(outline.sections[wave_start:wave_end], start=wave_start))
+
+                    # 当前 wave 内的所有章节共享 previous_summaries（来自已完成 wave 的摘要）
+                    # 同一 wave 内的章节互相不可见（保持 wave 内并行独立性）
+                    prev_summaries_snapshot = list(generated_summaries)
+                    prev_full_snapshot = list(generated_sections)  # 兼容字段（实际只用 summary）
+
+                    logger.info(
+                        f"开始 wave [{wave_start+1}-{wave_end}/{total_sections}]，"
+                        f"previous_summaries 数: {len(prev_summaries_snapshot)}"
+                    )
+
+                    # 优化 R1（wave 路径）：本 wave 内对每个 section 先做断点检测，
+                    # 已有的直接跳过 LLM 调用；未有的才进 executor
+                    # 业务不变性：复用磁盘已有内容，prompt / LLM 行为不变
+                    pending_wave = []  # [(idx_in_wave, i_global, section)]
+                    wave_results = [None] * len(wave)
+
+                    for idx, (i, section) in enumerate(wave):
+                        section_num = i + 1
+                        # 优化 R3：start_from_section 模式下，前 N-1 节强制视为"已有"
+                        force_skip = (
+                            start_from_section is not None
+                            and section_num < start_from_section
+                        )
+                        existing = None if force_skip else ReportManager.load_existing_section(report_id, section_num, section.title)
+                        if existing is not None:
+                            logger.info(f"[R1] wave 跳过已有章节 {section_num}/{total_sections}: {section.title}")
+                            section.content = existing["content"]
+                            generated_sections.append(existing["markdown"])
+                            completed_section_titles.append(section.title)
+                            wave_results[idx] = (i, section, existing["content"])
+                            if self.report_logger:
+                                self.report_logger.log_section_full_complete(
+                                    section_title=section.title,
+                                    section_index=section_num,
+                                    full_content=existing["markdown"],
+                                )
+                            ReportManager.update_progress(
+                                report_id, "generating",
+                                20 + int(((i + 1) / total_sections) * 70),
+                                t('progress.sectionDone', title=section.title),
+                                current_section=None,
+                                completed_sections=completed_section_titles,
+                            )
+                        else:
+                            pending_wave.append((idx, i, section))
+
+                    if not pending_wave:
+                        # 整个 wave 全是已有章节，跳过 executor
+                        continue
+
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=min(wave_size, len(pending_wave))) as executor:
+                        future_to_section = {
+                            executor.submit(
+                                self._generate_section_in_wave,
+                                section=section,
+                                section_num=i + 1,
+                                outline=outline,
+                                previous_summaries=prev_summaries_snapshot,
+                                previous_full_for_logging=[],  # wave 模式不传 full
+                                wave_start_index=i,
+                                total_sections=total_sections,
+                                report_id=report_id,
+                                completed_section_titles=completed_section_titles,
+                                progress_callback=progress_callback,
+                            ): (idx, i, section)
+                            for idx, i, section in pending_wave
+                        }
+
+                        # 收集结果（保持章节顺序）
+                        for future in concurrent.futures.as_completed(future_to_section):
+                            idx, i, section = future_to_section[future]
+                            try:
+                                content = future.result()
+                                wave_results[idx] = (i, section, content)
+                            except Exception as e:
+                                logger.error(f"章节 {section.title} 生成失败: {e}")
+                                # 失败时回退到占位内容
+                                placeholder = t('report.sectionGenFailedContent', error=str(e))
+                                wave_results[idx] = (i, section, placeholder)
+
+                    # 持久化当前 wave 的所有章节（按 i 顺序）
+                    for slot in wave_results:
+                        if slot is None:
+                            continue
+                        i, section, content = slot
+                        section_num = i + 1
+                        section.content = content
+                        generated_sections.append(f"## {section.title}\n\n{content}")
+                        ReportManager.save_section(report_id, section_num, section)
+                        completed_section_titles.append(section.title)
+                        if self.report_logger:
+                            self.report_logger.log_section_full_complete(
+                                section_title=section.title,
+                                section_index=section_num,
+                                full_content=f"## {section.title}\n\n{content}".strip(),
+                            )
+                        logger.info(t('report.sectionSaved', reportId=report_id, sectionNum=f"{section_num:02d}"))
+                        ReportManager.update_progress(
+                            report_id, "generating",
+                            20 + int(((i + 1) / total_sections) * 70),
+                            t('progress.sectionDone', title=section.title),
+                            current_section=None,
+                            completed_sections=completed_section_titles,
+                        )
+
+                    # 当前 wave 全部完成后，串行生成摘要（用于下一 wave 的 previous_summaries）
+                    # 这些串行 LLM 调用通常很快（一次 800 token 输出），但仍能并行加速
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=min(wave_size, 4)) as executor:
+                        summary_futures = {
+                            executor.submit(
+                                self._summarize_section_sync,
+                                section.title,
+                                content,
+                            ): section
+                            for section, (_, _, content) in zip(
+                                [s for (_, s, _) in wave_results if s is not None],
+                                [r for r in wave_results if r is not None],
+                            )
+                        }
+                        # 按章节顺序收集摘要（保证 generated_summaries 与 generated_sections 一一对应）
+                        ordered_summaries = [None] * len(wave)
+                        for future in concurrent.futures.as_completed(summary_futures):
+                            section = summary_futures[future]
+                            try:
+                                sm = future.result()
+                            except Exception as e:
+                                logger.warning(f"摘要失败 {section.title}: {e}，用空字符串兜底")
+                                sm = ""
+                            # 反查 index
+                            for idx, (i, s, _) in enumerate(wave_results):
+                                if s is section:
+                                    ordered_summaries[idx] = sm
+                                    break
+                        for sm in ordered_summaries:
+                            if sm is not None:
+                                generated_summaries.append(sm)
+
             # 阶段3: 组装完整报告
             if progress_callback:
                 progress_callback("generating", 95, t('progress.assemblingReport'))
@@ -1795,14 +2092,37 @@ class ReportAgent:
         chat_history = chat_history or []
         
         # 获取已生成的报告内容
+        # 优化 C2：缓存 report_content，仅当 meta.json mtime 变化时刷新
+        # 业务不变性：报告稳定时直接复用；报告重新生成后自动失效
         report_content = ""
         try:
             report = ReportManager.get_report_by_simulation(self.simulation_id)
             if report and report.markdown_content:
-                # 限制报告长度，避免上下文过长
-                report_content = report.markdown_content[:15000]
-                if len(report.markdown_content) > 15000:
-                    report_content += "\n\n... [报告内容已截断] ..."
+                # 修复（必修 5）：删除方法内冗余的 `from .report_agent import ReportManager`
+                # Python 闭包规则：函数体内任何位置对名字的赋值（即使是 import）会让该名字
+                # 在整个函数内被视为 local。所以 line 2099 的 ReportManager.get_report_by_simulation
+                # 在 line 2102 的 import 还没执行时就已经触发 UnboundLocalError。
+                # 修复：ReportManager 与本方法在同一个文件，class-level 可见，直接用即可
+                meta_path = ReportManager._get_report_path(report.report_id)
+                current_mtime = os.path.getmtime(meta_path) if os.path.exists(meta_path) else None
+
+                if (
+                    self._cached_report_content
+                    and self._cached_report_mtime is not None
+                    and current_mtime == self._cached_report_mtime
+                ):
+                    # 缓存命中
+                    report_content = self._cached_report_content
+                else:
+                    # 缓存未命中或失效，重新加载
+                    raw = report.markdown_content
+                    # 优化 C7：截断长度做成配置
+                    max_chars = Config.REPORT_CHAT_CONTEXT_MAX_CHARS
+                    report_content = raw[:max_chars]
+                    if len(raw) > max_chars:
+                        report_content += "\n\n... [报告内容已截断] ..."
+                    self._cached_report_content = report_content
+                    self._cached_report_mtime = current_mtime
         except Exception as e:
             logger.warning(t('report.fetchReportFailed', error=e))
         
@@ -2134,6 +2454,37 @@ class ReportManager:
         logger.info(t('report.sectionFileSaved', reportId=report_id, fileSuffix=file_suffix))
         return file_path
     
+    @classmethod
+    def load_existing_section(cls, report_id: str, section_index: int, section_title: str) -> Optional[Dict[str, str]]:
+        """
+        优化 R1：从磁盘读取已保存的章节（用于断点续传）。
+
+        返回 dict {"content": str, "markdown": str}：
+        - content: 去掉 "## Title" 标题行的纯内容
+        - markdown: 包含标题的完整 markdown（用于 previous_sections 注入）
+
+        文件不存在或读取失败返回 None。
+        业务不变性：内容、字段、格式与原 save_section 完全一致。
+        """
+        file_path = cls._get_section_path(report_id, section_index)
+        if not os.path.exists(file_path):
+            return None
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                md = f.read().strip()
+            if not md:
+                return None
+
+            # 移除开头 "## {title}\n\n" 标题行（与 save_section 的写入格式严格对齐）
+            content = md
+            title_prefix = f"## {section_title}"
+            if content.startswith(title_prefix):
+                content = content[len(title_prefix):].lstrip("\n").rstrip()
+            return {"content": content, "markdown": md}
+        except Exception as e:
+            logger.warning(f"[R1] 读取已保存章节失败: {file_path}, {e}")
+            return None
+
     @classmethod
     def _clean_section_content(cls, content: str, section_title: str) -> str:
         """
