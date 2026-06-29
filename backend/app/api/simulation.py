@@ -2016,12 +2016,16 @@ def stop_simulation():
             }), 400
         
         run_state = SimulationRunner.stop_simulation(simulation_id)
-        
+
         # 更新模拟状态
+        # 修复（必修 2）：写 STOPPED 而不是 PAUSED
+        # 旧实现写 PAUSED 与 runner 内部 _sync_manager_state 映射（RunnerStatus.STOPPED →
+        # SimulationStatus.STOPPED）冲突。两条路径竞争覆盖，最终 state.json 状态取决于
+        # 调用顺序，导致 UI 状态不一致。统一为 STOPPED。
         manager = SimulationManager()
         state = manager.get_simulation(simulation_id)
         if state:
-            state.status = SimulationStatus.PAUSED
+            state.status = SimulationStatus.STOPPED
             manager._save_simulation_state(state)
         
         return jsonify({
