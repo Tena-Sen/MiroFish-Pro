@@ -456,6 +456,18 @@ class SimulationRunner:
         # 在启动新进程前清掉旧 IPC 命令，避免新子进程 IPC server 读到旧命令
         cls._cleanup_ipc_dirs(simulation_id)
 
+        # 6. 必修 8：同时更新 env_status.json 到 stopped
+        # 旧实现：清理旧资源时 env_status.json 保留 stale 'alive' 状态
+        # 导致启动新进程前 check_env_alive 误判（必修 7 时间戳兜底 60s 延迟）
+        # 这里直接更新到 stopped，让 check_env_alive 立即识别
+        try:
+            sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
+            from .simulation_ipc import SimulationIPCClient
+            ipc_client = SimulationIPCClient(sim_dir)
+            ipc_client._update_env_status("stopped")
+        except Exception:
+            pass  # 兜底，不影响 cleanup 主流程
+
     @classmethod
     def _sync_manager_state(cls, simulation_id: str, run_state: SimulationRunState):
         """
@@ -913,6 +925,18 @@ class SimulationRunner:
             # 同步更新 SimulationManager 的 state.json
             cls._sync_manager_state(simulation_id, state)
 
+            # 必修 8：进程退出时同步更新 env_status.json 到 stopped
+            # 旧实现：子进程退出后 env_status.json 仍保留 stale 'alive' 状态
+            # 导致 check_env_alive 误判 alive（必修 7 已有时间戳兜底延迟 60s）
+            # 这里显式更新到 stopped，让 API 立即识别"子进程已死"，走 offline fallback
+            try:
+                from .simulation_ipc import SimulationIPCClient
+                ipc_client = SimulationIPCClient(sim_dir)
+                ipc_client._update_env_status("stopped")
+                logger.debug(f"已更新 env_status.json: {simulation_id} -> stopped")
+            except Exception as e:
+                logger.warning(f"更新 env_status.json 失败（不影响主流程）: {e}")
+
             # 优化 S2：进程异常退出时自动 snapshot（崩溃抗风险）
             # 仅在 exit_code != 0 时触发，0 是正常完成（已有前端 on_complete 快照）
             # snapshot 失败不能阻塞原异常路径
@@ -932,6 +956,14 @@ class SimulationRunner:
 
             # 同步更新 SimulationManager 的 state.json
             cls._sync_manager_state(simulation_id, state)
+
+            # 必修 8：监控线程异常退出时也更新 env_status 到 stopped
+            try:
+                from .simulation_ipc import SimulationIPCClient
+                ipc_client = SimulationIPCClient(sim_dir)
+                ipc_client._update_env_status("stopped")
+            except Exception:
+                pass  # 已 try/except 包裹，吞掉避免影响 finally
 
             # 优化 S2：监控线程自身异常也尝试 snapshot（兜底抗风险）
             try:
