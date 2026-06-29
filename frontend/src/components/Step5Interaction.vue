@@ -185,8 +185,8 @@
                 <template v-else-if="envStatus === 'stopped'">{{ $t('step5.envStopped') }}</template>
                 <template v-else>{{ $t('step5.envUnknown') }}</template>
               </span>
-              <!-- 优化 S5：env 关闭时给出明确指引 + 一键重启入口 -->
-              <!-- 之前只显示"环境已关闭"让用户疑惑为什么；现在点击直接重启 -->
+              <!-- 优化 S5：env 关闭时给出明确指引 + 一键恢复入口 -->
+              <!-- 智能判断：优先恢复快照（final_/fail_）回到之前世界状态 -->
               <button
                 v-if="envStatus === 'stopped' && !envStatusLoading"
                 class="env-status-action"
@@ -195,6 +195,8 @@
                 :title="$t('step5.envStoppedHint')"
               >
                 <span v-if="isRestarting">{{ $t('step5.envRestarting') }}</span>
+                <span v-else-if="restartMode === 'restore'">{{ $t('step5.restoring') }}</span>
+                <span v-else-if="restartMode === 'fresh'">{{ $t('step5.freshStarting') }}</span>
                 <span v-else>{{ $t('step5.envStoppedAction') }}</span>
               </button>
             </div>
@@ -449,7 +451,7 @@
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { chatWithReport, getReport, getAgentLog } from '../api/report'
-import { interviewAgents, getSimulationProfilesRealtime, getEnvStatus, startSimulation } from '../api/simulation'
+import { interviewAgents, getSimulationProfilesRealtime, getEnvStatus, startSimulation, listSnapshots, restoreSnapshot } from '../api/simulation'
 
 const { t } = useI18n()
 
@@ -473,35 +475,80 @@ const refreshEnvStatus = async () => {
 }
 
 // 优化 S5：env 关闭时的智能恢复入口
-// 用户刷新第五章看到"环境已关闭"时不再需要跳到 Step3，
-// 而是直接在当前页调用 /start API（force=true）重启模拟
+// 用户期望：恢复之前的模拟世界状态（不是 force 重启）
+// 策略：
+//   1. 优先检测 final_/fail_ 快照 → restore_snapshot + startSimulation(continue)
+//   2. 没有快照 → fallback 到 force=true 全新启动
 const isRestarting = ref(false)
+const restartMode = ref(null) // 'restore' | 'fresh' | null
 
 const handleEnvStoppedAction = async () => {
   if (!props.simulationId || isRestarting.value) return
   isRestarting.value = true
   addLog(t('step5.envStoppedActionHint'))
   try {
-    // 直接调用 start API，force=true 会清理旧状态并启动子进程
-    // profiles.json + simulation_config.json 都已存在（之前 Step3 创建过）
-    // 所以 start_simulation 不会失败
-    const res = await startSimulation({
-      simulation_id: props.simulationId,
-      platform: 'parallel',
-      force: true,
-      enable_graph_memory_update: true
+    // Step 1：检测是否有 final_/fail_ 快照（之前的模拟世界状态）
+    const snapRes = await listSnapshots(props.simulationId)
+    const snapshots = snapRes?.data?.snapshots || []
+    // 按创建时间排序，取最新
+    snapshots.sort((a, b) => {
+      const ta = new Date(a.created_at || 0).getTime()
+      const tb = new Date(b.created_at || 0).getTime()
+      return tb - ta
     })
-    if (res.success) {
-      addLog(t('step5.envRestartTriggered'))
-      // 启动后轮询 env_status，等 alive 后切换
-      await waitForEnvAlive()
+    const latest = snapshots[0]
+    const isMeaningfulSnapshot = latest && (
+      latest.snapshot_name.startsWith('final_') ||
+      latest.snapshot_name.startsWith('fail_')
+    )
+
+    if (isMeaningfulSnapshot) {
+      // Step 2a：恢复快照回到之前的模拟世界状态
+      restartMode.value = 'restore'
+      addLog(t('step5.envRestoreTriggered', { name: latest.snapshot_name }))
+      const restoreRes = await restoreSnapshot(props.simulationId, {
+        snapshot_name: latest.snapshot_name
+      })
+      if (!restoreRes.success) {
+        addLog(t('step5.envRestoreFailed', { error: restoreRes.error || '' }))
+        return
+      }
+      // 恢复成功 → 启动模拟（continue 模式：start_round=current_round）
+      const startRes = await startSimulation({
+        simulation_id: props.simulationId,
+        platform: 'parallel',
+        start_round: restoreRes.data?.current_round || 0,
+        enable_graph_memory_update: true
+        // 注意：不传 force，恢复的文件已包含 run_state
+      })
+      if (startRes.success) {
+        addLog(t('step5.envRestartTriggered'))
+        await waitForEnvAlive()
+      } else {
+        addLog(t('step5.envRestartFailed', { error: startRes.error || '' }))
+      }
     } else {
-      addLog(t('step5.envRestartFailed', { error: res.error || '' }))
+      // Step 2b：没有快照 → force 全新启动（保留世界定义 / 清进度）
+      restartMode.value = 'fresh'
+      addLog(t('step5.envFreshTriggered'))
+      const res = await startSimulation({
+        simulation_id: props.simulationId,
+        platform: 'parallel',
+        force: true,
+        enable_graph_memory_update: true
+      })
+      if (res.success) {
+        addLog(t('step5.envRestartTriggered'))
+        await waitForEnvAlive()
+      } else {
+        addLog(t('step5.envRestartFailed', { error: res.error || '' }))
+      }
     }
   } catch (err) {
     addLog(t('step5.envRestartException', { error: err.message }))
   } finally {
     isRestarting.value = false
+    restartMode.value = null
   }
 }
 

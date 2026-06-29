@@ -321,6 +321,11 @@
     "envRestartTimeout": "重启超时（30s），请重试",
     "envRestartFailed": "重启失败: {error}",
     "envRestartException": "重启异常: {error}",
+    "envRestoreTriggered": "检测到之前的世界快照 ({name})，恢复中...",
+    "envRestoreFailed": "快照恢复失败: {error}",
+    "envFreshTriggered": "没有可用快照，将全新启动模拟...",
+    "restoring": "恢复中...",
+    "freshStarting": "启动中...",
     "envUnknown": "环境状态未知"
   },
   "graph": {

@@ -321,6 +321,11 @@
     "envRestartTimeout": "Restart timeout (30s), please retry",
     "envRestartFailed": "Restart failed: {error}",
     "envRestartException": "Restart exception: {error}",
+    "envRestoreTriggered": "Found previous world snapshot ({name}), restoring...",
+    "envRestoreFailed": "Snapshot restore failed: {error}",
+    "envFreshTriggered": "No snapshot available, starting a fresh simulation...",
+    "restoring": "Restoring...",
+    "freshStarting": "Starting...",
     "envUnknown": "Environment status unknown"
   },
   "graph": {
