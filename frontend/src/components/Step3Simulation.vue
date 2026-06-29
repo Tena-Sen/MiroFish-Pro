@@ -449,7 +449,7 @@
 
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, shallowRef } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRouter, useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import {
   startSimulation,
@@ -462,6 +462,8 @@ import {
   deleteSnapshot
 } from '../api/simulation'
 import { generateReport } from '../api/report'
+
+const route = useRoute()
 
 const { t } = useI18n()
 
@@ -1066,8 +1068,18 @@ watch(() => props.systemLogs?.length, () => {
 onMounted(() => {
   addLog(t('log.step3Init'))
   if (props.simulationId) {
-    // 检测是否有可恢复的快照（模拟已完成/失败，但尚未重新启动）
-    checkAndPromptRestoreSnapshot()
+    // 检测入口：是否从 Step5 重启过来
+    // ?from=step5_restart 表示用户主动重启，跳过"恢复快照"提示
+    // （因为 force=true 会清掉旧状态，恢复快照是反向操作）
+    const fromStep5Restart = route.query.from === 'step5_restart'
+
+    if (!fromStep5Restart) {
+      // 普通入口（首次进入 / 从 Step4 回退）：显示自动恢复提示
+      checkAndPromptRestoreSnapshot()
+    } else {
+      addLog(t('log.step3RestartFromStep5'))
+    }
+    // 无论哪种入口，都自动启动（doStartSimulation 内部 force=true 清理旧状态）
     doStartSimulation()
   }
 })

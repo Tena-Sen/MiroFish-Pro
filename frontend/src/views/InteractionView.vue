@@ -135,7 +135,13 @@ const handleGoBack = (reason) => {
   // 优化 S5：env_stopped 走 Step3 重启模拟，普通回退走 Step 4
   // 修复：之前第五章 env 已关闭时点击"返回重启"按钮仍然只去 Step 4（同样的死局）
   if (reason === 'env_stopped' && simulationId.value) {
-    router.push({ name: 'SimulationRun', params: { simulationId: simulationId.value } })
+    // 携带 ?from=step5_restart query 参数，让 Step3 知道这是重启场景
+    // Step3 会跳过"自动恢复快照"提示（因为即将 force 重启，无需恢复）
+    router.push({
+      name: 'SimulationRun',
+      params: { simulationId: simulationId.value },
+      query: { from: 'step5_restart' }
+    })
     return
   }
   // 返回到 Step 4 (报告生成)
