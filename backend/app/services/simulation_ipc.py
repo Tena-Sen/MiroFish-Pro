@@ -95,10 +95,15 @@ class IPCResponse:
 class SimulationIPCClient:
     """
     模拟IPC客户端（Flask端使用）
-    
+
     用于向模拟进程发送命令并等待响应
     """
-    
+
+    # 必修 7：env_status.json 心跳过期阈值（秒）
+    # 子进程每 ~1s 心跳一次 alive，超过此窗口即视为 dead
+    # 设置为 60s 给长 LLM 调用留余量，但短于 IPC 默认 timeout (180s)
+    ENV_ALIVE_MAX_AGE_SECONDS: int = 60
+
     def __init__(self, simulation_dir: str):
         """
         初始化IPC客户端
@@ -311,17 +316,39 @@ class SimulationIPCClient:
     def check_env_alive(self) -> bool:
         """
         检查模拟环境是否存活
-        
-        通过检查 env_status.json 文件来判断
+
+        通过 env_status.json 判断，关键：同时检查 status 字段 + timestamp 新鲜度
+        原因：子进程崩溃时不一定能更新 env_status.json 到 "stopped"，
+        只看 status 字段会误判 alive，导致 IPC 必超时
+        修复：timestamp 超过 ENV_ALIVE_MAX_AGE_SECONDS 视为 dead（让 API 走离线 fallback）
         """
         status_file = os.path.join(self.simulation_dir, "env_status.json")
         if not os.path.exists(status_file):
             return False
-        
+
         try:
             with open(status_file, 'r', encoding='utf-8') as f:
                 status = json.load(f)
-            return status.get("status") == "alive"
+            if status.get("status") != "alive":
+                return False
+            # 必修 7：检查 timestamp 新鲜度
+            # 子进程死前最后一次"alive"心跳，超过此窗口即视为 dead
+            ts_str = status.get("timestamp")
+            if ts_str:
+                try:
+                    from datetime import datetime
+                    last_dt = datetime.fromisoformat(ts_str)
+                    age = (datetime.now() - last_dt).total_seconds()
+                    if age > self.ENV_ALIVE_MAX_AGE_SECONDS:
+                        logger.warning(
+                            f"env_status.json 心跳过期 ({age:.0f}s > {self.ENV_ALIVE_MAX_AGE_SECONDS}s)，"
+                            f"判定子进程 dead，建议走 offline 路径"
+                        )
+                        return False
+                except (ValueError, TypeError):
+                    # timestamp 解析失败视为不可信，按 dead 处理
+                    return False
+            return True
         except (json.JSONDecodeError, OSError):
             return False
 
