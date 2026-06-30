@@ -6,9 +6,9 @@
 </br>
 <em>A Simple and Universal Swarm Intelligence Engine, Predicting Anything</em>
 
-[![GitHub Stars](https://img.shields.io/github/stars/{GITHUB_USER}/MiroFish-Pro?style=flat-square&color=DAA520)](https://github.com/{GITHUB_USER}/MiroFish-Pro/stargazers)
-[![GitHub Watchers](https://img.shields.io/github/watchers/{GITHUB_USER}/MiroFish-Pro?style=flat-square)](https://github.com/{GITHUB_USER}/MiroFish-Pro/watchers)
-[![GitHub Forks](https://img.shields.io/github/forks/{GITHUB_USER}/MiroFish-Pro?style=flat-square)](https://github.com/{GITHUB_USER}/MiroFish-Pro/network)
+[![GitHub Stars](https://img.shields.io/github/stars/Hdwing/MiroFish-Pro?style=flat-square&color=DAA520)](https://github.com/Hdwing/MiroFish-Pro/stargazers)
+[![GitHub Watchers](https://img.shields.io/github/watchers/Hdwing/MiroFish-Pro?style=flat-square)](https://github.com/Hdwing/MiroFish-Pro/watchers)
+[![GitHub Forks](https://img.shields.io/github/forks/Hdwing/MiroFish-Pro?style=flat-square)](https://github.com/Hdwing/MiroFish-Pro/network)
 
 [English](./README.md) | [中文文档](./README-ZH.md)
 
@@ -24,7 +24,7 @@
 >
 > - **Original author / 原作者**：[666ghj](https://github.com/666ghj) & [Shanda Group](https://www.shanda.com/)
 > - **Source / 源仓库**：[github.com/666ghj/MiroFish](https://github.com/666ghj/MiroFish)
-> - **This fork / 本仓库**：[github.com/{GITHUB_USER}/MiroFish-Pro](https://github.com/{GITHUB_USER}/MiroFish-Pro)
+> - **This fork / 本仓库**：[github.com/Hdwing/MiroFish-Pro](https://github.com/Hdwing/MiroFish-Pro)
 >
 > ⭐ All credits for the original design, vision, and core engine go to the original authors. Please star their repo to show appreciation.
 >
@@ -150,7 +150,7 @@ From serious predictions to playful simulations, every "what if" sees its outcom
 ### 1. Clone & Configure
 
 ```bash
-git clone https://github.com/{GITHUB_USER}/MiroFish-Pro.git
+git clone https://github.com/Hdwing/MiroFish-Pro.git
 cd MiroFish-Pro
 
 # Copy the example configuration file
