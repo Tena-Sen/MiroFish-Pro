@@ -1519,8 +1519,33 @@ async def run_reddit_simulation(
     result.total_actions = total_actions
     elapsed = (datetime.now() - start_time).total_seconds()
     log_info(f"模拟循环完成! 耗时: {elapsed:.1f}秒, 总动作: {total_actions}")
-    
+
     return result
+
+
+async def _env_status_heartbeat_loop(simulation_dir: str):
+    """
+    后台心跳任务:每 30s 刷一次 env_status.json 的 timestamp。
+    让前端 check_env_alive(60s 过期窗口)在 rounds 长时间跑期间也返回 True。
+    修 #27:Step 5 进入发现 env_status 过期的根因。
+    """
+    try:
+        from app.services.simulation_ipc import SimulationIPCClient
+    except Exception:
+        return
+
+    ipc_client = SimulationIPCClient(simulation_dir)
+    try:
+        while True:
+            await asyncio.sleep(30)
+            try:
+                ipc_client._update_env_status("alive")
+            except Exception:
+                # 心跳失败不要让 task 死掉 —— 下一轮再试
+                pass
+    except asyncio.CancelledError:
+        # 收到取消信号(主流程退出),静默退出
+        pass
 
 
 async def main():
@@ -1611,11 +1636,27 @@ async def main():
     log_manager.info("=" * 60)
     
     start_time = datetime.now()
-    
+
     # 存储两个平台的模拟结果
     twitter_result: Optional[PlatformSimulation] = None
     reddit_result: Optional[PlatformSimulation] = None
-    
+
+    # 优化 #27:env_status 早期 alive + 后台心跳
+    # 之前只在 wait_for_commands 阶段调用 update_status("alive"),rounds 期间(可能跑几十分钟)
+    # env_status.json 没有 timestamp 刷新,前端 check_env_alive 会因为 timestamp 过期返回 False
+    # → IPC 命令堆积 / Step5 504 / 用户以为死了
+    # 修法:rounds 一开始就写 alive + 启动后台心跳每 30s 刷一次 timestamp
+    heartbeat_task: Optional[asyncio.Task] = None
+    if wait_for_commands:
+        try:
+            from app.services.simulation_ipc import SimulationIPCClient
+            early_ipc = SimulationIPCClient(simulation_dir)
+            early_ipc._update_env_status("alive")
+            heartbeat_task = asyncio.create_task(_env_status_heartbeat_loop(simulation_dir))
+            log_manager.info("已标记 env_status=alive,启动后台心跳(30s/次)")
+        except Exception as e:
+            log_manager.info(f"早期 alive 标记失败(继续): {e}")
+
     if args.twitter_only:
         twitter_result = await run_twitter_simulation(config, simulation_dir, twitter_logger, log_manager, args.max_rounds, args.start_round)
     elif args.reddit_only:
@@ -1671,7 +1712,15 @@ async def main():
         
         log_manager.info("\n关闭环境...")
         ipc_handler.update_status("stopped")
-    
+
+    # 取消 env_status 心跳任务(rounds 期间后台跑的),避免它继续覆盖 stopped 标记
+    if heartbeat_task is not None:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
+
     # 关闭环境
     if twitter_result and twitter_result.env:
         await twitter_result.env.close()
