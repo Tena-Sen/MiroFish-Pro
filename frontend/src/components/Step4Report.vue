@@ -78,7 +78,7 @@
 
       <!-- RIGHT PANEL: Workflow Timeline -->
       <div class="right-panel" ref="rightPanel">
-        <div class="panel-header" :class="`panel-header--${activeStep.status}`" v-if="!isComplete">
+        <div class="panel-header" :class="`panel-header--${hasError ? 'error' : activeStep.status}`" v-if="!isComplete || hasError">
           <span class="header-dot" v-if="activeStep.status === 'active'"></span>
           <span class="header-index mono">{{ activeStep.noLabel }}</span>
           <span class="header-title">{{ activeStep.title }}</span>
@@ -379,19 +379,101 @@
             <div class="empty-pulse"></div>
             <span>Waiting for agent activity...</span>
           </div>
+
+          <!-- Error State —— 报告生成失败时显示恢复操作 -->
+          <div v-if="hasError && isComplete" class="report-error-state">
+            <div class="report-error-icon">
+              <svg viewBox="0 0 24 24" width="40" height="40" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="10"></circle>
+                <line x1="12" y1="8" x2="12" y2="12"></line>
+                <line x1="12" y1="16" x2="12.01" y2="16"></line>
+              </svg>
+            </div>
+            <h3 class="report-error-title">{{ $t('step4.reportFailedTitle') }}</h3>
+            <p class="report-error-hint">{{ $t('step4.reportFailedHint') }}</p>
+            <div v-if="errorMessage" class="report-error-detail">
+              {{ errorMessage }}
+            </div>
+            <div class="report-error-actions">
+              <button
+                class="report-error-btn primary"
+                :disabled="isRetrying"
+                @click="retryRegenerate"
+              >
+                <span v-if="isRetrying" class="loading-spinner-small"></span>
+                <span>{{ isRetrying ? $t('step4.retrying') : $t('step4.retryGenerate') }}</span>
+              </button>
+              <button
+                class="report-error-btn secondary"
+                @click="goBackToStep3"
+              >
+                {{ $t('step4.backToStep3') }}
+              </button>
+            </div>
+          </div>
         </div>
       </div>
     </div>
 
-    <!-- Bottom Console Logs -->
+    <!-- Bottom Console Logs (合并后端 console polling + 前端业务事件) -->
     <div class="console-logs">
       <div class="log-header">
-        <span class="log-title">CONSOLE OUTPUT</span>
+        <span class="log-title">CONSOLE &amp; EVENTS</span>
         <span class="log-id">{{ reportId || 'NO_REPORT' }}</span>
       </div>
+      <div class="log-toolbar">
+        <input
+          v-model="logSearch"
+          class="log-search"
+          :placeholder="$t('step4.logSearchPlaceholder')"
+        />
+        <div class="log-filter-group">
+          <button
+            class="log-filter-btn"
+            :class="{ active: logFilter === 'all' }"
+            @click="logFilter = 'all'"
+          >{{ $t('step4.logFilterAll') }}</button>
+          <button
+            class="log-filter-btn"
+            :class="{ active: logFilter === 'backend' }"
+            @click="logFilter = 'backend'"
+          >{{ $t('step4.logFilterBackend') }}</button>
+          <button
+            class="log-filter-btn"
+            :class="{ active: logFilter === 'frontend' }"
+            @click="logFilter = 'frontend'"
+          >{{ $t('step4.logFilterFrontend') }}</button>
+          <button
+            class="log-filter-btn error"
+            :class="{ active: logFilter === 'error' }"
+            @click="logFilter = 'error'"
+          >{{ $t('step4.logFilterError') }}</button>
+        </div>
+        <div class="log-stats">
+          <span class="log-stat">
+            <span class="log-stat-dot backend"></span>{{ consoleLogs.length }}
+          </span>
+          <span class="log-stat">
+            <span class="log-stat-dot frontend"></span>{{ eventLogs.length }}
+          </span>
+        </div>
+        <button class="log-clear-btn" @click="clearLogs">
+          {{ $t('step4.logClear') }}
+        </button>
+      </div>
       <div class="log-content" ref="logContent">
-        <div class="log-line" v-for="(log, idx) in consoleLogs" :key="idx">
-          <span class="log-msg" :class="getLogLevelClass(log)">{{ log }}</span>
+        <div
+          v-for="(log, idx) in unifiedLogs"
+          :key="idx"
+          class="log-line"
+          :class="['source-' + (log.source || 'backend'), 'level-' + (log.level || 'info')]"
+        >
+          <span class="log-source-tag">{{ log.source === 'frontend' ? 'F' : 'B' }}</span>
+          <span class="log-time">{{ formatLogTime(log.time) }}</span>
+          <span class="log-msg" :class="getLogLevelClass(log)">{{ log.msg }}</span>
+        </div>
+        <div v-if="unifiedLogs.length === 0" class="log-empty">
+          {{ logSearch || logFilter !== 'all' ? $t('step4.logNoMatch') : $t('step4.logEmpty') }}
         </div>
       </div>
     </div>
@@ -402,7 +484,7 @@
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, h, reactive } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { getAgentLog, getConsoleLog } from '../api/report'
+import { getAgentLog, getConsoleLog, generateReport } from '../api/report'
 
 const router = useRouter()
 const { t } = useI18n()
@@ -426,18 +508,64 @@ const goBack = () => {
   emit('go-back')
 }
 
+// 报告生成失败后的两个恢复动作:
+// 1. 重新生成报告(强制重生成,跳过已有章节的优化)
+// 2. 回到 Step 3 检查模拟数据
+const retryRegenerate = async () => {
+  if (isRetrying.value || !props.simulationId) return
+  isRetrying.value = true
+  try {
+    addLog('正在重新生成报告 (force_regenerate=true)...')
+    const res = await generateReport({
+      simulation_id: props.simulationId,
+      force_regenerate: true   // 用户主动 retry,强制重生成
+    })
+    if (res.success && res.data) {
+      const newReportId = res.data.report_id
+      addLog(`重新生成成功,跳转到新报告: ${newReportId}`)
+      // 跳到新的 Report 路由(reportId 变了)
+      router.push({ name: 'Report', params: { reportId: newReportId } })
+    } else {
+      addLog(`重试失败: ${res.error || '未知错误'}`)
+    }
+  } catch (err) {
+    addLog(`重试异常: ${err.message || err}`)
+  } finally {
+    isRetrying.value = false
+  }
+}
+
+const goBackToStep3 = () => {
+  if (props.simulationId) {
+    router.push({ name: 'SimulationRun', params: { simulationId: props.simulationId } })
+  } else {
+    addLog('无法回到 Step 3: 缺少 simulationId')
+  }
+}
+
 // State
 const agentLogs = ref([])
 const consoleLogs = ref([])
+const eventLogs = ref([])              // 前端业务事件(addLog)——以前丢黑洞,现在本地存一份
 const agentLogLine = ref(0)
 const consoleLogLine = ref(0)
 const reportOutline = ref(null)
 const currentSectionIndex = ref(null)
+// 日志面板交互状态
+const logFilter = ref('all')           // 'all' | 'backend' | 'frontend' | 'error'
+const logSearch = ref('')
+// 前端事件类别常量
+const LOG_LEVEL_INFO = 'info'
+const LOG_LEVEL_WARN = 'warn'
+const LOG_LEVEL_ERROR = 'error'
 const generatedSections = ref({})
 const expandedContent = ref(new Set())
 const expandedLogs = ref(new Set())
 const collapsedSections = ref(new Set())
 const isComplete = ref(false)
+const hasError = ref(false)              // 报告生成是否出错
+const isRetrying = ref(false)           // 重新生成中
+const errorMessage = ref('')            // 错误详情(给用户看)
 const startTime = ref(null)
 const leftPanel = ref(null)
 const rightPanel = ref(null)
@@ -1840,9 +1968,26 @@ const workflowSteps = computed(() => {
   return steps
 })
 
-// Methods
-const addLog = (msg) => {
+// 前端业务事件日志 —— 同时上抛给父级 + 本地存一份(以前只上抛,父级 systemLogs 没人渲染,等丢黑洞)
+// level 推断:含 ERROR/失败/error 关键字 → error, 含 WARN/warn → warn,其他 → info
+const detectLevel = (msg) => {
+  if (!msg) return LOG_LEVEL_INFO
+  const s = String(msg).toLowerCase()
+  if (s.includes('error') || s.includes('失败') || s.includes('fatal')) return LOG_LEVEL_ERROR
+  if (s.includes('warn') || s.includes('警告')) return LOG_LEVEL_WARN
+  return LOG_LEVEL_INFO
+}
+
+const addLog = (msg, level) => {
+  // 1. 上抛给父级(兼容现有父组件)
   emit('add-log', msg)
+  // 2. 本地存一份,渲染在 console-logs 面板
+  eventLogs.value.push({
+    time: new Date().toISOString(),
+    source: 'frontend',
+    level: level || detectLevel(msg),
+    msg
+  })
 }
 
 const isSectionCompleted = (sectionIndex) => {
@@ -1852,12 +1997,24 @@ const isSectionCompleted = (sectionIndex) => {
 const formatTime = (timestamp) => {
   if (!timestamp) return ''
   try {
-    return new Date(timestamp).toLocaleTimeString('en-US', { 
-      hour12: false, 
-      hour: '2-digit', 
-      minute: '2-digit', 
-      second: '2-digit' 
+    return new Date(timestamp).toLocaleTimeString('en-US', {
+      hour12: false,
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
     })
+  } catch {
+    return ''
+  }
+}
+
+// log 用的紧凑时间(HH:MM:SS.mmm) —— 用于日志面板每行时间戳
+const formatLogTime = (timestamp) => {
+  if (!timestamp) return ''
+  try {
+    const d = new Date(timestamp)
+    const pad = (n, w = 2) => String(n).padStart(w, '0')
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`
   } catch {
     return ''
   }
@@ -2024,10 +2181,35 @@ const getActionLabel = (action) => {
 }
 
 const getLogLevelClass = (log) => {
-  if (log.includes('ERROR') || log.includes('错误')) return 'error'
-  if (log.includes('WARNING') || log.includes('警告')) return 'warning'
-  // INFO 使用默认颜色，不标记为 success
+  // log 可能是 string 或 object —— 兼容新老格式
+  const text = typeof log === 'string' ? log : (log?.msg || '')
+  if (text.includes('ERROR') || text.includes('错误')) return 'error'
+  if (text.includes('WARNING') || text.includes('警告')) return 'warning'
   return ''
+}
+
+// 合并 backend + frontend 日志,并按 filter/search 过滤
+const unifiedLogs = computed(() => {
+  const merged = [...consoleLogs.value, ...eventLogs.value]
+  let filtered = merged
+  if (logFilter.value === 'backend') {
+    filtered = filtered.filter(l => l.source === 'backend')
+  } else if (logFilter.value === 'frontend') {
+    filtered = filtered.filter(l => l.source === 'frontend')
+  } else if (logFilter.value === 'error') {
+    filtered = filtered.filter(l => l.level === LOG_LEVEL_ERROR || getLogLevelClass(l) === 'error')
+  }
+  if (logSearch.value.trim()) {
+    const q = logSearch.value.toLowerCase()
+    filtered = filtered.filter(l => String(l.msg || '').toLowerCase().includes(q))
+  }
+  return filtered
+})
+
+// 清空所有可见日志(只是前端清,不影响后端真实日志)
+const clearLogs = () => {
+  consoleLogs.value = []
+  eventLogs.value = []
 }
 
 // Polling
@@ -2085,6 +2267,9 @@ const fetchAgentLog = async () => {
           if (log.action === 'error') {
             isComplete.value = true
             currentSectionIndex.value = null  // 确保清除 loading 状态
+            hasError.value = true
+            // 提取错误信息(用于错误 UI 展示)
+            errorMessage.value = log.error_message || log.details?.message || log.message || ''
             emit('update-status', 'error')
             stopPolling()
           }
@@ -2177,7 +2362,15 @@ const fetchConsoleLog = async () => {
       const newLogs = res.data.logs || []
 
       if (newLogs.length > 0) {
-        consoleLogs.value.push(...newLogs)
+        // 推入包装对象(source/level/time 元数据),原始 line 放 msg 字段
+        for (const line of newLogs) {
+          consoleLogs.value.push({
+            time: new Date().toISOString(),
+            source: 'backend',
+            level: detectLevel(line),
+            msg: line
+          })
+        }
         consoleLogLine.value = res.data.from_line + newLogs.length
 
         nextTick(() => {
@@ -2358,7 +2551,22 @@ watch(() => props.reportId, (newId) => {
 
 .panel-header--todo .header-index,
 .panel-header--todo .header-title {
-  color: #9CA3AF;
+  color: #BDBDBD;
+}
+
+/* 错误状态 header —— 红色提醒 */
+.panel-header--error {
+  background: #FFEBEE;
+  border-bottom-color: #EF9A9A;
+}
+
+.panel-header--error .header-index,
+.panel-header--error .header-title {
+  color: #C62828;
+}
+
+.panel-header--error .header-dot {
+  background: #D32F2F;
 }
 
 /* Left Panel - Report Style */
@@ -3515,6 +3723,117 @@ watch(() => props.reportId, (newId) => {
   padding: 60px 20px;
   color: #9CA3AF;
   font-size: 13px;
+}
+
+/* 报告生成失败的错误状态 —— 用户能直接重试或回到 Step 3 */
+.report-error-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 24px;
+  margin: 16px;
+  background: linear-gradient(135deg, #FFEBEE 0%, #FFCDD2 100%);
+  border: 1px solid #EF9A9A;
+  border-radius: 12px;
+  color: #C62828;
+  text-align: center;
+}
+
+.report-error-icon {
+  color: #D32F2F;
+  margin-bottom: 12px;
+}
+
+.report-error-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: #B71C1C;
+  margin: 0 0 8px 0;
+}
+
+.report-error-hint {
+  font-size: 13px;
+  color: #C62828;
+  margin: 0 0 12px 0;
+  line-height: 1.5;
+  max-width: 380px;
+}
+
+.report-error-detail {
+  font-size: 11px;
+  color: #B71C1C;
+  background: rgba(255, 255, 255, 0.6);
+  padding: 6px 12px;
+  border-radius: 4px;
+  font-family: 'JetBrains Mono', monospace;
+  max-width: 480px;
+  word-break: break-word;
+  margin-bottom: 16px;
+}
+
+.report-error-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.report-error-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 16px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+  border: 1px solid transparent;
+  min-width: 130px;
+}
+
+.report-error-btn.primary {
+  background: #D32F2F;
+  color: #FFFFFF;
+  border-color: #D32F2F;
+}
+
+.report-error-btn.primary:hover:not(:disabled) {
+  background: #C62828;
+  border-color: #C62828;
+}
+
+.report-error-btn.primary:disabled {
+  background: #EF9A9A;
+  border-color: #EF9A9A;
+  cursor: not-allowed;
+}
+
+.report-error-btn.secondary {
+  background: #FFFFFF;
+  color: #C62828;
+  border-color: #EF9A9A;
+}
+
+.report-error-btn.secondary:hover {
+  background: #FFF8F8;
+  border-color: #D32F2F;
+}
+
+/* 复用的小转圈 (与 Step3 一致) */
+.loading-spinner-small {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  border-top-color: #FFFFFF;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }
 
 .empty-pulse {
@@ -5176,11 +5495,11 @@ watch(() => props.reportId, (newId) => {
   border-radius: 4px;
 }
 
-/* Console Logs - 与 Step3Simulation.vue 保持一致 */
+/* Console Logs - 与 Step3Simulation.vue 保持一致 + 加上 toolbar / filter / source / time */
 .console-logs {
-  background: #000;
+  background: #0F0F0F;
   color: #DDD;
-  padding: 16px;
+  padding: 12px 16px 16px;
   font-family: 'JetBrains Mono', monospace;
   border-top: 1px solid #222;
   flex-shrink: 0;
@@ -5189,43 +5508,208 @@ watch(() => props.reportId, (newId) => {
 .log-header {
   display: flex;
   justify-content: space-between;
+  align-items: center;
   border-bottom: 1px solid #333;
-  padding-bottom: 8px;
+  padding-bottom: 6px;
   margin-bottom: 8px;
   font-size: 10px;
-  color: #666;
+  color: #888;
 }
 
 .log-title {
   text-transform: uppercase;
   letter-spacing: 0.1em;
+  font-weight: 600;
+}
+
+.log-id {
+  color: #555;
+  font-size: 10px;
+}
+
+/* Toolbar:搜索 + 过滤 + 计数 + 清空 */
+.log-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #1F1F1F;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.log-search {
+  flex: 0 1 200px;
+  min-width: 120px;
+  padding: 4px 8px;
+  background: #1A1A1A;
+  border: 1px solid #333;
+  border-radius: 3px;
+  color: #EEE;
+  font-family: inherit;
+  font-size: 11px;
+}
+
+.log-search:focus {
+  outline: none;
+  border-color: #4CAF50;
+}
+
+.log-filter-group {
+  display: flex;
+  gap: 2px;
+}
+
+.log-filter-btn {
+  padding: 4px 8px;
+  background: #1A1A1A;
+  border: 1px solid #333;
+  color: #AAA;
+  font-size: 10px;
+  cursor: pointer;
+  border-radius: 3px;
+  transition: all 0.15s;
+  font-family: inherit;
+}
+
+.log-filter-btn:hover {
+  background: #252525;
+  color: #FFF;
+}
+
+.log-filter-btn.active {
+  background: #2E5C2E;
+  border-color: #4CAF50;
+  color: #FFFFFF;
+}
+
+.log-filter-btn.error.active {
+  background: #5C2E2E;
+  border-color: #EF5350;
+}
+
+.log-stats {
+  display: flex;
+  gap: 10px;
+  font-size: 10px;
+  color: #888;
+}
+
+.log-stat {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.log-stat-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.log-stat-dot.backend { background: #4CAF50; }
+.log-stat-dot.frontend { background: #2196F3; }
+
+.log-clear-btn {
+  margin-left: auto;
+  padding: 4px 10px;
+  background: #1A1A1A;
+  border: 1px solid #444;
+  color: #CCC;
+  font-size: 10px;
+  cursor: pointer;
+  border-radius: 3px;
+  font-family: inherit;
+}
+
+.log-clear-btn:hover {
+  background: #2A2A2A;
+  border-color: #666;
+  color: #FFF;
 }
 
 .log-content {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  height: 100px;
+  gap: 2px;
+  height: 140px;
   overflow-y: auto;
-  padding-right: 4px;
+  padding-right: 6px;
+  font-family: inherit;
 }
 
-.log-content::-webkit-scrollbar { width: 4px; }
+.log-content::-webkit-scrollbar { width: 5px; }
 .log-content::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
 
 .log-line {
   font-size: 11px;
   line-height: 1.5;
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+  padding: 2px 0;
+  border-left: 2px solid transparent;
+  padding-left: 4px;
+}
+
+.log-line.source-frontend {
+  border-left-color: #2196F3;
+  background: rgba(33, 150, 243, 0.04);
+}
+
+.log-line.source-backend {
+  border-left-color: #4CAF50;
+}
+
+.log-line.level-error {
+  background: rgba(239, 83, 80, 0.08);
+}
+
+.log-source-tag {
+  flex-shrink: 0;
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  line-height: 16px;
+  text-align: center;
+  border-radius: 2px;
+  font-size: 9px;
+  font-weight: 700;
+  color: #FFF;
+}
+
+.log-source-tag + .log-time {
+  margin-left: 0;
+}
+
+.log-line.source-frontend .log-source-tag { background: #2196F3; }
+.log-line.source-backend .log-source-tag { background: #4CAF50; }
+
+.log-time {
+  flex-shrink: 0;
+  color: #666;
+  font-size: 10px;
+  font-family: inherit;
 }
 
 .log-msg {
+  flex: 1;
   color: #BBB;
   word-break: break-all;
+  min-width: 0;
 }
 
-.log-msg.error { color: #EF5350; }
+.log-msg.error { color: #EF5350; font-weight: 500; }
 .log-msg.warning { color: #FFA726; }
 .log-msg.success { color: #66BB6A; }
+
+.log-empty {
+  padding: 20px;
+  text-align: center;
+  color: #555;
+  font-size: 11px;
+}
 </style>
 
 <style>

@@ -234,6 +234,19 @@
   "step4": {
     "generatingSection": "正在生成{title}...",
     "goToInteraction": "进入深度互动",
+    "reportFailedTitle": "报告生成失败",
+    "reportFailedHint": "报告生成过程中遇到错误。你可以重新尝试,或回到 Step 3 检查模拟数据。",
+    "retryGenerate": "重新生成报告",
+    "retrying": "正在重新生成…",
+    "backToStep3": "回到 Step 3",
+    "logFilterAll": "全部",
+    "logFilterBackend": "后端",
+    "logFilterFrontend": "前端",
+    "logFilterError": "错误",
+    "logClear": "清空",
+    "logSearchPlaceholder": "搜索日志…",
+    "logEmpty": "暂无日志",
+    "logNoMatch": "没有匹配的日志",
     "waitingForReportAgent": "Waiting for Report Agent...",
     "collapse": "收起 ▲",
     "expandAll": "展开全部 {count} 条 ▼",
@@ -332,6 +345,13 @@
     "snapshotPickerTitle": "选择要恢复的世界快照",
     "snapshotPickerHint": "检测到多个完整轮次快照（按轮次从高到低），点击要恢复的那个",
     "snapshotPickerFresh": "全新启动",
+    "envForceFreshBtn": "从头开始",
+    "envForceFreshHint": "跳过 R0/R1/R2 准备阶段,从 R3 开始全新启动(已有数据会被清空)",
+    "envForceFreshTriggered": "从头启动已触发,正在清空并从 R3 重新拉起模拟子进程…",
+    "envForceFreshNavigating": "模拟已上线,跳转 Step 3 监控新进度…",
+    "envStageListing": "加载快照列表中…",
+    "envStagePicking": "请选择要恢复的快照（下方）",
+    "envStageWaitingAlive": "等待模拟环境上线…",
     "envUnknown": "环境状态未知"
   },
   "graph": {
@@ -371,6 +391,8 @@
     "deleteConfirmTitle": "确认删除",
     "deleteConfirmMessage": "确定要删除这个推演吗？",
     "deleteWarning": "此操作将永久删除所有相关数据，无法恢复！",
+    "stopAndDelete": "停止并删除",
+    "stopAndDeleteHint": "模拟正在运行中，先停止再删除",
     "deleteSuccess": "推演已删除"
   },
   "api": {

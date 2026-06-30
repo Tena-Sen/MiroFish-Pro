@@ -234,6 +234,19 @@
   "step4": {
     "generatingSection": "Generating {title}...",
     "goToInteraction": "Enter Deep Interaction",
+    "reportFailedTitle": "Report Generation Failed",
+    "reportFailedHint": "An error occurred during report generation. You can retry, or go back to Step 3 to check the simulation data.",
+    "retryGenerate": "Regenerate Report",
+    "retrying": "Regenerating…",
+    "backToStep3": "Back to Step 3",
+    "logFilterAll": "All",
+    "logFilterBackend": "Backend",
+    "logFilterFrontend": "Frontend",
+    "logFilterError": "Errors",
+    "logClear": "Clear",
+    "logSearchPlaceholder": "Search logs…",
+    "logEmpty": "No logs yet",
+    "logNoMatch": "No matching logs",
     "waitingForReportAgent": "Waiting for Report Agent...",
     "collapse": "Collapse ▲",
     "expandAll": "Show all {count} ▼",
@@ -332,6 +345,13 @@
     "snapshotPickerTitle": "Choose a world snapshot to restore",
     "snapshotPickerHint": "Multiple complete-round snapshots detected (sorted by round desc). Click one to restore.",
     "snapshotPickerFresh": "Fresh Start",
+    "envForceFreshBtn": "Start from Scratch",
+    "envForceFreshHint": "Skip R0/R1/R2 warmup, fresh start from R3 (existing data will be cleared)",
+    "envForceFreshTriggered": "Force-fresh start triggered, cleaning and re-launching simulation subprocess from R3…",
+    "envForceFreshNavigating": "Simulation online, navigating to Step 3 to monitor new run…",
+    "envStageListing": "Loading snapshots…",
+    "envStagePicking": "Choose a snapshot to restore (below)",
+    "envStageWaitingAlive": "Waiting for environment…",
     "envUnknown": "Environment status unknown"
   },
   "graph": {
@@ -371,6 +391,8 @@
     "deleteConfirmTitle": "Confirm Deletion",
     "deleteConfirmMessage": "Are you sure you want to delete this simulation?",
     "deleteWarning": "This will permanently delete all related data and cannot be undone!",
+    "stopAndDelete": "Stop & Delete",
+    "stopAndDeleteHint": "Simulation is running. Stop it first, then delete.",
     "deleteSuccess": "Simulation deleted"
   },
   "api": {
