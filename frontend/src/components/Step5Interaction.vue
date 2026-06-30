@@ -155,6 +155,64 @@
           </div>
         </div>
 
+        <!-- Environment Status Indicator — 必修 11：提到顶层，对话/采访两个 tab 都可见 -->
+        <!-- 之前放在 chat + report_agent 嵌套里，survey 模式完全看不到 env 状态 -->
+        <!-- 用户采访失败 504 时不知道去哪重启 → 把 env 状态提到 tab 切换区下方 -->
+        <div v-if="props.simulationId" class="env-status-bar" :class="envStatus || 'unknown'">
+          <span v-if="envStatusLoading" class="env-status-dot env-loading">⋯</span>
+          <span v-else-if="envStatus === 'alive'" class="env-status-dot env-alive">●</span>
+          <span v-else-if="envStatus === 'stopped'" class="env-status-dot env-stopped">●</span>
+          <span v-else class="env-status-dot env-unknown">●</span>
+          <span class="env-status-text">
+            <template v-if="envStatusLoading">{{ $t('step5.checkingEnv') }}</template>
+            <template v-else-if="envStatus === 'alive'">{{ $t('step5.envAlive') }}</template>
+            <template v-else-if="envStatus === 'stopped'">{{ $t('step5.envStopped') }}</template>
+            <template v-else>{{ $t('step5.envUnknown') }}</template>
+          </span>
+          <!-- 一键恢复入口（智能判断：1+ 快照展示选择器，否则 force 重启） -->
+          <button
+            v-if="envStatus === 'stopped' && !envStatusLoading && !showSnapshotPicker"
+            class="env-status-action"
+            :disabled="isRestarting"
+            @click="handleEnvStoppedAction"
+            :title="$t('step5.envStoppedHint')"
+          >
+            <span v-if="isRestarting">{{ $t('step5.envRestarting') }}</span>
+            <span v-else-if="restartMode === 'restore'">{{ $t('step5.restoring') }}</span>
+            <span v-else-if="restartMode === 'fresh'">{{ $t('step5.freshStarting') }}</span>
+            <span v-else>{{ $t('step5.envStoppedAction') }}</span>
+          </button>
+          <!-- 快照选择器（≥1 个 final_/fail_ 快照时展开） -->
+          <div v-if="showSnapshotPicker && availableSnapshots.length > 0" class="snapshot-picker">
+            <div class="snapshot-picker-title">{{ $t('step5.snapshotPickerTitle') }}</div>
+            <div class="snapshot-picker-hint">{{ $t('step5.snapshotPickerHint') }}</div>
+            <div class="snapshot-picker-list">
+              <div
+                v-for="snap in availableSnapshots"
+                :key="snap.snapshot_name"
+                class="snapshot-picker-item"
+                @click="chooseSnapshot(snap)"
+              >
+                <div class="snapshot-picker-item-name">{{ snap.snapshot_name }}</div>
+                <div class="snapshot-picker-item-meta">
+                  <span v-if="(snap.current_round ?? snap.run_state?.current_round) !== undefined">
+                    R{{ snap.current_round ?? snap.run_state?.current_round }}
+                  </span>
+                  <span v-if="snap.created_at">{{ snap.created_at.split('T')[0] }} {{ snap.created_at.split('T')[1]?.substring(0, 5) }}</span>
+                </div>
+              </div>
+            </div>
+            <div class="snapshot-picker-actions">
+              <button class="snapshot-picker-btn fresh" @click="chooseFreshStart">
+                {{ $t('step5.snapshotPickerFresh') }}
+              </button>
+              <button class="snapshot-picker-btn cancel" @click="cancelPickSnapshot">
+                {{ $t('common.cancel') }}
+              </button>
+            </div>
+          </div>
+        </div>
+
         <!-- Chat Mode -->
         <div v-if="activeTab === 'chat'" class="chat-container">
 
@@ -173,63 +231,7 @@
               </button>
             </div>
 
-            <!-- Environment Status Indicator -->
-            <div v-if="props.simulationId" class="env-status-bar" :class="envStatus || 'unknown'">
-              <span v-if="envStatusLoading" class="env-status-dot env-loading">⋯</span>
-              <span v-else-if="envStatus === 'alive'" class="env-status-dot env-alive">●</span>
-              <span v-else-if="envStatus === 'stopped'" class="env-status-dot env-stopped">●</span>
-              <span v-else class="env-status-dot env-unknown">●</span>
-              <span class="env-status-text">
-                <template v-if="envStatusLoading">{{ $t('step5.checkingEnv') }}</template>
-                <template v-else-if="envStatus === 'alive'">{{ $t('step5.envAlive') }}</template>
-                <template v-else-if="envStatus === 'stopped'">{{ $t('step5.envStopped') }}</template>
-                <template v-else>{{ $t('step5.envUnknown') }}</template>
-              </span>
-              <!-- 优化 S5：env 关闭时给出明确指引 + 一键恢复入口 -->
-              <!-- 智能判断：优先恢复快照（final_/fail_）回到之前世界状态 -->
-              <button
-                v-if="envStatus === 'stopped' && !envStatusLoading && !showSnapshotPicker"
-                class="env-status-action"
-                :disabled="isRestarting"
-                @click="handleEnvStoppedAction"
-                :title="$t('step5.envStoppedHint')"
-              >
-                <span v-if="isRestarting">{{ $t('step5.envRestarting') }}</span>
-                <span v-else-if="restartMode === 'restore'">{{ $t('step5.restoring') }}</span>
-                <span v-else-if="restartMode === 'fresh'">{{ $t('step5.freshStarting') }}</span>
-                <span v-else>{{ $t('step5.envStoppedAction') }}</span>
-              </button>
-
-              <!-- 快照选择器：1 个或多个 final_/fail_ 快照时都展开 -->
-              <div v-if="showSnapshotPicker && availableSnapshots.length > 0" class="snapshot-picker">
-                <div class="snapshot-picker-title">{{ $t('step5.snapshotPickerTitle') }}</div>
-                <div class="snapshot-picker-hint">{{ $t('step5.snapshotPickerHint') }}</div>
-                <div class="snapshot-picker-list">
-                  <div
-                    v-for="snap in availableSnapshots"
-                    :key="snap.snapshot_name"
-                    class="snapshot-picker-item"
-                    @click="chooseSnapshot(snap)"
-                  >
-                    <div class="snapshot-picker-item-name">{{ snap.snapshot_name }}</div>
-                    <div class="snapshot-picker-item-meta">
-                      <span v-if="(snap.current_round ?? snap.run_state?.current_round) !== undefined">
-                        R{{ snap.current_round ?? snap.run_state?.current_round }}
-                      </span>
-                      <span v-if="snap.created_at">{{ snap.created_at.split('T')[0] }} {{ snap.created_at.split('T')[1]?.substring(0, 5) }}</span>
-                    </div>
-                  </div>
-                </div>
-                <div class="snapshot-picker-actions">
-                  <button class="snapshot-picker-btn fresh" @click="chooseFreshStart">
-                    {{ $t('step5.snapshotPickerFresh') }}
-                  </button>
-                  <button class="snapshot-picker-btn cancel" @click="cancelPickSnapshot">
-                    {{ $t('common.cancel') }}
-                  </button>
-                </div>
-              </div>
-            </div>
+            <!-- Environment Status Indicator — 必修 11：已移到 tab 切换区下方，对两个 tab 都可见 -->
             <div v-if="showToolsDetail" class="tools-card-body">
               <div class="tools-grid">
                 <div class="tool-item tool-purple">
