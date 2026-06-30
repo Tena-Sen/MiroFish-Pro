@@ -340,7 +340,10 @@ class SimulationIPCClient:
                     last_dt = datetime.fromisoformat(ts_str)
                     age = (datetime.now() - last_dt).total_seconds()
                     if age > self.ENV_ALIVE_MAX_AGE_SECONDS:
-                        logger.warning(
+                        # 必修 10：高频轮询场景（前端的 waitForEnvAlive 每 1s 调一次），
+                        # 30s polling 就会产生 30 条 WARNING，污染日志
+                        # 改为 DEBUG：仍有完整 stack trace 可调试，但默认隐藏
+                        logger.debug(
                             f"env_status.json 心跳过期 ({age:.0f}s > {self.ENV_ALIVE_MAX_AGE_SECONDS}s)，"
                             f"判定子进程 dead，建议走 offline 路径"
                         )
