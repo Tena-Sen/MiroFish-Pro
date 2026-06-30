@@ -165,13 +165,15 @@
           <span v-else class="env-status-dot env-unknown">●</span>
           <span class="env-status-text">
             <template v-if="envStatusLoading">{{ $t('step5.checkingEnv') }}</template>
+            <template v-else-if="isRestarting">{{ $t(stageInfo.key, stageInfo.params) }}</template>
             <template v-else-if="envStatus === 'alive'">{{ $t('step5.envAlive') }}</template>
             <template v-else-if="envStatus === 'stopped'">{{ $t('step5.envStopped') }}</template>
             <template v-else>{{ $t('step5.envUnknown') }}</template>
           </span>
           <!-- 一键恢复入口（智能判断：1+ 快照展示选择器，否则 force 重启） -->
+          <!-- 修复：v-if 改 v-show，避免 picker 展示或重启进行中按钮整段消失 -->
           <button
-            v-if="envStatus === 'stopped' && !envStatusLoading && !showSnapshotPicker"
+            v-show="envStatus === 'stopped' && !envStatusLoading && !showSnapshotPicker && !isRestarting"
             class="env-status-action"
             :disabled="isRestarting"
             @click="handleEnvStoppedAction"
@@ -182,7 +184,24 @@
             <span v-else-if="restartMode === 'fresh'">{{ $t('step5.freshStarting') }}</span>
             <span v-else>{{ $t('step5.envStoppedAction') }}</span>
           </button>
-          <!-- 快照选择器（≥1 个 final_/fail_ 快照时展开） -->
+          <!-- 强制从头启动按钮 —— 永跳过 picker,清空并从 R0 重新开始 -->
+          <!-- 视觉上稍弱一点,避免和主入口抢镜;鼠标 hover 显示提示"已有数据会被清空" -->
+          <button
+            v-show="envStatus === 'stopped' && !envStatusLoading && !isRestarting"
+            class="env-status-action env-status-action-force"
+            :disabled="isRestarting"
+            @click="handleForceFreshStart"
+            :title="$t('step5.envForceFreshHint')"
+          >
+            {{ $t('step5.envForceFreshBtn') }}
+          </button>
+          <!-- 恢复期进度由独立的大 banner 接管 (.restart-progress-area),这里不再放小转圈避免双转圈 -->
+        </div>
+
+        <!-- 恢复期进度区：picker 与大型 progress banner 互斥 -->
+        <!-- 设计意图:让用户在 picker 中点击后立刻看到大型 banner,绝不可能错过进度反馈 -->
+        <div v-if="props.simulationId && isRestarting" class="restart-progress-area">
+          <!-- picking 阶段显示 picker -->
           <div v-if="showSnapshotPicker && availableSnapshots.length > 0" class="snapshot-picker">
             <div class="snapshot-picker-title">{{ $t('step5.snapshotPickerTitle') }}</div>
             <div class="snapshot-picker-hint">{{ $t('step5.snapshotPickerHint') }}</div>
@@ -203,12 +222,39 @@
               </div>
             </div>
             <div class="snapshot-picker-actions">
-              <button class="snapshot-picker-btn fresh" @click="chooseFreshStart">
+              <button
+                class="snapshot-picker-btn fresh"
+                @click="chooseFreshStart"
+              >
                 {{ $t('step5.snapshotPickerFresh') }}
               </button>
-              <button class="snapshot-picker-btn cancel" @click="cancelPickSnapshot">
+              <button
+                class="snapshot-picker-btn cancel"
+                @click="cancelPickSnapshot"
+              >
                 {{ $t('common.cancel') }}
               </button>
+            </div>
+          </div>
+
+          <!-- 其他阶段显示大型进度 banner,用户绝对不可能错过 -->
+          <div
+            v-else
+            class="restart-progress-banner"
+            :class="'stage-' + recoveryStage"
+          >
+            <div class="restart-progress-spinner" aria-hidden="true"></div>
+            <div class="restart-progress-content">
+              <div class="restart-progress-stage">{{ $t(stageInfo.key, stageInfo.params) }}</div>
+              <div class="restart-progress-hint">
+                {{
+                  recoveryStage === 'listing' ? '正在加载快照列表…' :
+                  recoveryStage === 'restoring' ? '正在恢复世界状态(恢复后启动会接着跑)…' :
+                  recoveryStage === 'starting' ? '正在拉起模拟子进程(通常 5–30 秒,请勿关闭页面)…' :
+                  recoveryStage === 'waiting_alive' ? '等待环境上线,请勿重复点击…' :
+                  '正在准备,请稍候…'
+                }}
+              </div>
             </div>
           </div>
         </div>
@@ -513,15 +559,81 @@ const refreshEnvStatus = async () => {
 //   2. 只有 1 个 → 自动用它恢复
 //   3. 有 ≥2 个 → 让用户选（按 current_round 倒序）
 //   4. 没有快照 → fallback 到 force=true 全新启动
+// 修复 UX：选完快照后立即关闭 picker，防止用户以为无反应而反复点击
+// 同时把整条链路拆成可观察的阶段（listing / picking / restoring / starting / waiting_alive），
+// 在 env-status-bar 显示 spinner + 阶段文案，让前端始终有可见反馈
 const isRestarting = ref(false)
 const restartMode = ref(null) // 'restore' | 'fresh' | null
 const showSnapshotPicker = ref(false)  // 多快照选择器展开状态
 const availableSnapshots = ref([])  // 可恢复的快照列表
-const pendingSnapshotResolve = ref(null)  // Promise resolver for picker
+// 恢复阶段：'idle' | 'listing' | 'picking' | 'restoring' | 'starting' | 'waiting_alive'
+// 用于 env-status-bar 显示阶段文案 + 进度 banner
+const recoveryStage = ref('idle')
+
+// 状态机式 picker：pickedSnapshot 由用户点击设置，由 watch 触发下游异步流程
+// 取代之前 Promise-based picker —— 避免 promise race / 用户看不见的状态变化
+const pickedSnapshot = ref(null)        // 当前正在恢复的快照（或 '__FRESH__' 或 null）
+const pendingSnapshotsForPicker = ref([])  // 暂存 listSnapshots 返回值，给 watch 选
+// 当前正在恢复的快照名（给文案模板 {name} 用的）
+const restoringSnapshotName = ref('')
+
+// stageInfo:把 recoveryStage 映射到 i18n key + params,模板用 stageInfo.key, stageInfo.params 渲染
+// 修复 "() 空括号" bug:restoring 阶段带 name 参数,其他阶段不带 params
+const stageInfo = computed(() => {
+  switch (recoveryStage.value) {
+    case 'listing':       return { key: 'step5.envStageListing', params: {} }
+    case 'picking':       return { key: 'step5.envStagePicking', params: {} }
+    case 'restoring':     return { key: 'step5.envRestoreTriggered', params: { name: restoringSnapshotName.value } }
+    case 'starting':      return { key: 'step5.envRestartTriggered', params: {} }
+    case 'waiting_alive': return { key: 'step5.envStageWaitingAlive', params: {} }
+    default:              return { key: 'step5.envRestarting', params: {} }
+  }
+})
+
+// step5 的辅助:从 snapshot 对象里提取当前轮次
+const getSnapshotRound = (snap) => {
+  if (!snap) return 0
+  return snap.current_round ?? snap.run_state?.current_round ?? 0
+}
+
+// 强制从头启动 —— 跳过快照 picker,直接 force=true 全新启动
+// 跟 "一键重启" 不同:这个按钮永不弹 picker,适合用户明确想清空重来的场景
+const handleForceFreshStart = async () => {
+  if (!props.simulationId || isRestarting.value) return
+  isRestarting.value = true
+  pickedSnapshot.value = null
+  recoveryStage.value = 'starting'
+  addLog(t('step5.envForceFreshTriggered'))
+  try {
+    // 从头开始 = force 清空 + 从 R3 开始(跳过 R0/R1/R2)
+    // 后端跑模拟循环时不会立刻写 env_status.json=alive(要等 144 轮跑完),
+    // 所以不等 polling,API 200 就立刻跳 Step 3 监控
+    const res = await startSimulation({
+      simulation_id: props.simulationId,
+      platform: 'parallel',
+      force: true,
+      start_round: 3,  // 跳过 R0/R1/R2
+      enable_graph_memory_update: true
+    })
+    if (res.success) {
+      addLog(t('step5.envForceFreshNavigating'))
+      resetRestartState()  // 复位 isRestarting,免得组件卸载后状态残留
+      goBack('env_stopped')  // 立刻跳 Step 3
+    } else {
+      addLog(t('step5.envRestartFailed', { error: res.error || '' }))
+      resetRestartState()
+    }
+  } catch (err) {
+    addLog(t('step5.envRestartException', { error: err.message }))
+    resetRestartState()
+  }
+}
 
 const handleEnvStoppedAction = async () => {
   if (!props.simulationId || isRestarting.value) return
   isRestarting.value = true
+  recoveryStage.value = 'listing'
+  pickedSnapshot.value = null
   addLog(t('step5.envStoppedActionHint'))
   try {
     // Step 1：检测所有 final_/fail_ 快照
@@ -542,39 +654,91 @@ const handleEnvStoppedAction = async () => {
       })
 
     availableSnapshots.value = meaningful
+    pendingSnapshotsForPicker.value = meaningful
 
     // Step 2：决定恢复路径
-    let targetSnapshot = null
     if (meaningful.length === 0) {
-      // 0 个快照 → force 全新启动
+      // 0 个快照 → force 全新启动（不进入 picker）
+      recoveryStage.value = 'starting'
+      // 直接走 freshStart 流程
       await doFreshStart()
       return
-    } else if (meaningful.length >= 1) {
-      // 1 个或多个快照 → 让用户看到可用快照并选择
-      // （即使是 1 个也展示，让用户知道系统发现了什么 + 提供"全新启动"备选）
-      const choice = await pickSnapshotInteractively(meaningful)
-      if (choice === '__FRESH__') {
-        await doFreshStart()
-        return
-      } else if (!choice) {
-        // 取消
-        addLog(t('step5.envRestoreCancelled'))
-        return
-      }
-      targetSnapshot = choice
-      addLog(t('step5.envRestoreChosen', { name: targetSnapshot.snapshot_name }))
     }
 
-    // Step 3：恢复选中的快照
+    // 1 个或多个快照 → 等待用户 picker 交互
+    // watcher(pickedSnapshot) 会接管后续：选了快照 → restore + start；选了 __FRESH__ → freshStart
+    recoveryStage.value = 'picking'
+    showSnapshotPicker.value = true
+    // 此处不阻塞。后台 watch 监控 pickedSnapshot 变化触发异步恢复
+  } catch (err) {
+    addLog(t('step5.envRestartException', { error: err.message }))
+    // 异常分支兜底复位
+    isRestarting.value = false
+    restartMode.value = null
+    recoveryStage.value = 'idle'
+    showSnapshotPicker.value = false
+    availableSnapshots.value = []
+  }
+}
+
+// 用户在 picker 里点某个快照
+const chooseSnapshot = (snapshot) => {
+  // 立刻关闭 picker + 选中快照；异步流程由 watcher 启动
+  showSnapshotPicker.value = false
+  pickedSnapshot.value = snapshot
+}
+
+// 用户在 picker 里点"全新启动"
+const chooseFreshStart = () => {
+  showSnapshotPicker.value = false
+  pickedSnapshot.value = '__FRESH__'
+}
+
+// 用户取消 picker
+const cancelPickSnapshot = () => {
+  showSnapshotPicker.value = false
+  availableSnapshots.value = []
+  // 重置整个恢复链
+  pickedSnapshot.value = null
+  isRestarting.value = false
+  restartMode.value = null
+  recoveryStage.value = 'idle'
+  addLog(t('step5.envRestoreCancelled'))
+}
+
+// watcher：用户选了快照后启动异步恢复流程
+// 这是状态机的核心 —— watcher 解耦 picker UI 和恢复逻辑，无 Promise race
+watch(pickedSnapshot, async (newPick) => {
+  if (newPick === null) return
+  const pick = newPick
+  // 用完立刻清掉，避免重复触发
+  pickedSnapshot.value = null
+
+  try {
+    if (pick === '__FRESH__') {
+      recoveryStage.value = 'starting'
+      await doFreshStart()
+      return
+    }
+
+    // 选了一个具体快照
+    const targetSnapshot = pick
+    addLog(t('step5.envRestoreChosen', { name: targetSnapshot.snapshot_name }))
+    // Step 3:恢复选中的快照
+    restoringSnapshotName.value = targetSnapshot.snapshot_name  // 给文案 {name} 用
+    recoveryStage.value = 'restoring'
     restartMode.value = 'restore'
     const restoreRes = await restoreSnapshot(props.simulationId, {
       snapshot_name: targetSnapshot.snapshot_name
     })
     if (!restoreRes.success) {
       addLog(t('step5.envRestoreFailed', { error: restoreRes.error || '' }))
+      resetRestartState()
       return
     }
-    // Step 4：启动模拟（continue 模式：start_round=current_round）
+
+    // Step 4:启动模拟 (continue 模式 start_round=current_round)
+    recoveryStage.value = 'starting'
     addLog(t('step5.envRestartTriggered'))
     const startRes = await startSimulation({
       simulation_id: props.simulationId,
@@ -583,81 +747,71 @@ const handleEnvStoppedAction = async () => {
       enable_graph_memory_update: true
     })
     if (startRes.success) {
+      recoveryStage.value = 'waiting_alive'
       await waitForEnvAlive()
     } else {
       addLog(t('step5.envRestartFailed', { error: startRes.error || '' }))
+      resetRestartState()
     }
   } catch (err) {
     addLog(t('step5.envRestartException', { error: err.message }))
-  } finally {
-    isRestarting.value = false
-    restartMode.value = null
-    showSnapshotPicker.value = false
+    resetRestartState()
   }
+})
+
+// 复位整个恢复状态 (成功/失败后都用)
+const resetRestartState = () => {
+  isRestarting.value = false
+  restartMode.value = null
+  recoveryStage.value = 'idle'
+  restoringSnapshotName.value = ''
+  showSnapshotPicker.value = false
+  availableSnapshots.value = []
+  pendingSnapshotsForPicker.value = []
+  pickedSnapshot.value = null
 }
 
-// 多个快照时弹出选择器，让用户选
-const pickSnapshotInteractively = (snapshots) => {
-  showSnapshotPicker.value = true
-  return new Promise((resolve) => {
-    pendingSnapshotResolve.value = resolve
-  })
-}
-
-// 用户点击某个快照
-const chooseSnapshot = (snapshot) => {
-  if (pendingSnapshotResolve.value) {
-    pendingSnapshotResolve.value(snapshot)
-    pendingSnapshotResolve.value = null
-  }
-}
-
-// 用户点击"全新启动"（不用快照）
-const chooseFreshStart = () => {
-  if (pendingSnapshotResolve.value) {
-    pendingSnapshotResolve.value('__FRESH__')
-    pendingSnapshotResolve.value = null
-  }
-}
-
-// 用户取消
-const cancelPickSnapshot = () => {
-  if (pendingSnapshotResolve.value) {
-    pendingSnapshotResolve.value(null)
-    pendingSnapshotResolve.value = null
-  }
-}
-
-// force 全新启动（无快照恢复时使用）
-const doFreshStart = async () => {
+// force 全新启动（force=true 重置 + 可选 start_round 跳过开头几轮）
+// opts.startRound:默认 0(从 R0 开始); 设 3 时跳过 R0/R1/R2(用于"从头开始"按钮)
+// 返回:true = env 已 alive(成功),false = 后端/超时失败
+const doFreshStart = async (opts = {}) => {
+  const startRound = opts.startRound ?? 0
   restartMode.value = 'fresh'
+  recoveryStage.value = 'starting'
   addLog(t('step5.envFreshTriggered'))
   const res = await startSimulation({
     simulation_id: props.simulationId,
     platform: 'parallel',
     force: true,
+    start_round: startRound,  // 0 = 正常从头;3 = 跳过 R0/R1/R2
     enable_graph_memory_update: true
   })
   if (res.success) {
+    recoveryStage.value = 'waiting_alive'
     addLog(t('step5.envRestartTriggered'))
-    await waitForEnvAlive()
+    return await waitForEnvAlive()  // ← 把 waitForEnvAlive 的结果返回
   } else {
     addLog(t('step5.envRestartFailed', { error: res.error || '' }))
+    resetRestartState()
+    return false
   }
 }
 
-// 等待 env 状态变 alive
+// 等待 env 状态变 alive —— 进入循环时打标为 waiting_alive
 const waitForEnvAlive = async (maxWaitSec = 30) => {
+  recoveryStage.value = 'waiting_alive'
   const startTime = Date.now()
   while (Date.now() - startTime < maxWaitSec * 1000) {
     await new Promise(r => setTimeout(r, 1000))
     await refreshEnvStatus()
     if (envStatus.value === 'alive') {
       addLog(t('step5.envRestartSuccess'))
+      resetRestartState()
       return true
     }
   }
   addLog(t('step5.envRestartTimeout'))
+  resetRestartState()
   return false
 }
 
@@ -678,8 +832,10 @@ const props = defineProps({
 const emit = defineEmits(['add-log', 'update-status', 'go-back'])
 
 // 返回到上一个步骤
-const goBack = () => {
-  emit('go-back')
+// reason: 'env_stopped' → 跳 Step 3 监控(InteractionView 的 handleGoBack 路由)
+//         null/undefined → 跳 Step 4
+const goBack = (reason = null) => {
+  emit('go-back', reason)
 }
 
 // State
@@ -2957,6 +3113,20 @@ onUnmounted(() => {
   border-color: #FB8C00;
 }
 
+/* 次级按钮 —— 强制从头开始,样式比主入口稍弱以免抢镜 */
+.env-status-action-force {
+  background: #FFF;
+  color: #757575;
+  border-color: #DDDDDD;
+  margin-left: 6px;   /* 紧贴主按钮右侧 */
+}
+
+.env-status-action-force:hover {
+  background: #FAFAFA;
+  border-color: #BDBDBD;
+  color: #424242;
+}
+
 /* 多快照选择器（≥2 个 final_/fail_ 快照时） */
 .snapshot-picker {
   margin: 0 16px 12px;
@@ -3066,6 +3236,89 @@ onUnmounted(() => {
 .env-status-dot {
   font-size: 14px;
   line-height: 1;
+}
+
+/*（已删除 env-recovery-progress / -spinner / -stage —— 大 banner 已取代小转圈，避免双指示） */
+
+@keyframes env-spin {
+  to { transform: rotate(360deg); }
+}
+
+/*（已删除 picker 的 is-disabled 样式 —— picker 必须保持可点击，由 closeSnapshotPicker 自动防重）*/
+
+/* 恢复期进度区:替换 picker 的大型 banner,用户绝对不可能错过反馈 */
+.restart-progress-area {
+  margin: 0 16px 12px;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.restart-progress-banner {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 16px 18px;
+  background: linear-gradient(135deg, #FFF3E0 0%, #FFE0B2 100%);
+  border: 1px solid #FFB74D;
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(255, 152, 0, 0.15);
+}
+
+.restart-progress-banner.stage-restoring,
+.restart-progress-banner.stage-starting,
+.restart-progress-banner.stage-waiting_alive {
+  background: linear-gradient(135deg, #E3F2FD 0%, #BBDEFB 100%);
+  border-color: #64B5F6;
+  box-shadow: 0 2px 8px rgba(33, 150, 243, 0.15);
+}
+
+.restart-progress-spinner {
+  display: inline-block;
+  width: 28px;
+  height: 28px;
+  min-width: 28px;
+  border: 3px solid rgba(230, 81, 0, 0.2);
+  border-top-color: #E65100;
+  border-radius: 50%;
+  animation: env-spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+
+.restart-progress-banner.stage-restoring .restart-progress-spinner,
+.restart-progress-banner.stage-starting .restart-progress-spinner,
+.restart-progress-banner.stage-waiting_alive .restart-progress-spinner {
+  border-color: rgba(33, 150, 243, 0.2);
+  border-top-color: #1976D2;
+}
+
+.restart-progress-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.restart-progress-stage {
+  font-size: 13px;
+  font-weight: 700;
+  color: #E65100;
+  margin-bottom: 2px;
+}
+
+.restart-progress-banner.stage-restoring .restart-progress-stage,
+.restart-progress-banner.stage-starting .restart-progress-stage,
+.restart-progress-banner.stage-waiting_alive .restart-progress-stage {
+  color: #0D47A1;
+}
+
+.restart-progress-hint {
+  font-size: 11px;
+  color: #BF360C;
+  line-height: 1.4;
+}
+
+.restart-progress-banner.stage-restoring .restart-progress-hint,
+.restart-progress-banner.stage-starting .restart-progress-hint,
+.restart-progress-banner.stage-waiting_alive .restart-progress-hint {
+  color: #1565C0;
 }
 
 .env-alive { color: #4CAF50; }
