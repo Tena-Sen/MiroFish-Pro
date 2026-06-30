@@ -681,8 +681,14 @@ const showProfilesDetail = ref(true)
 
 // 日志去重：记录上一次输出的关键信息
 let lastLoggedMessage = ''
+let pollCount = 0              // 心跳计数器:每 5 次 poll(~15 秒)强制输出一条进度日志
+let lastLoggedProgress = -1     // 上次日志里的 progress 百分比,变化时强制 addLog
 let lastLoggedProfileCount = 0
+let profilesPollCount = 0      // profile 端心跳计数器
+let lastLoggedProfileStamp = 0  // 上次 profile 心跳的时间戳(秒) — 防止同一秒重复
 let lastLoggedConfigStage = ''
+// profile 生成开始时间(秒, 用于心跳显示"已等待 Xm")
+let profileGenStartTime = 0
 
 // 优化 B9：profile 增量拉取缓存
 let lastProfilesMtime = null
@@ -865,34 +871,45 @@ const stopProfilesPolling = () => {
 
 const pollPrepareStatus = async () => {
   if (!taskId.value && !props.simulationId) return
-  
+
+  pollCount++
+
   try {
     const res = await getPrepareStatus({
       task_id: taskId.value,
       simulation_id: props.simulationId
     })
-    
+
     if (res.success && res.data) {
       const data = res.data
-      
+
       // 更新进度
       prepareProgress.value = data.progress || 0
       progressMessage.value = data.message || ''
-      
+
       // 解析阶段信息并输出详细日志
       if (data.progress_detail) {
         currentStage.value = data.progress_detail.current_stage_name || ''
-        
-        // 输出详细进度日志（避免重复）
+
+        // 输出详细进度日志(严格去重:只有真正变化才 log)
         const detail = data.progress_detail
         const logKey = `${detail.current_stage}-${detail.current_item}-${detail.total_items}`
-        if (logKey !== lastLoggedMessage && detail.item_description) {
+        const progressInt = Math.round(data.progress || 0)
+
+        const progressChanged = progressInt !== lastLoggedProgress
+        const stageItemChanged = logKey !== lastLoggedMessage
+
+        // 只在 (stage-item 变 OR progress 变 ≥1%) 时 addLog,不再每 5s 强制心跳
+        // (进度条 prepareProgress 已经在 UI 上,每 3s 自动更新,不靠 log 当心跳)
+        if ((stageItemChanged || progressChanged) && detail.item_description) {
           lastLoggedMessage = logKey
+          lastLoggedProgress = progressInt
           const stageInfo = `[${detail.stage_index}/${detail.total_stages}]`
+          const progressTag = `(${progressInt}%)`
           if (detail.total_items > 0) {
-            addLog(`${stageInfo} ${detail.current_stage_name}: ${detail.current_item}/${detail.total_items} - ${detail.item_description}`)
+            addLog(`${stageInfo} ${detail.current_stage_name} ${progressTag}: ${detail.current_item}/${detail.total_items} - ${detail.item_description}`)
           } else {
-            addLog(`${stageInfo} ${detail.current_stage_name}: ${detail.item_description}`)
+            addLog(`${stageInfo} ${detail.current_stage_name} ${progressTag}: ${detail.item_description}`)
           }
         }
       } else if (data.message) {
@@ -901,13 +918,17 @@ const pollPrepareStatus = async () => {
         if (match) {
           currentStage.value = match[3].trim()
         }
-        // 输出消息日志（避免重复）
-        if (data.message !== lastLoggedMessage) {
+        // 严格去重:相同 message+progress 不再 log
+        const progressInt = Math.round(data.progress || 0)
+        const progressChanged = progressInt !== lastLoggedProgress
+        if (data.message !== lastLoggedMessage || progressChanged) {
           lastLoggedMessage = data.message
-          addLog(data.message)
+          lastLoggedProgress = progressInt
+          const suffix = progressChanged ? ` (${progressInt}%)` : ''
+          addLog(`${data.message}${suffix}`)
         }
       }
-      
+
       // 检查是否完成
       if (data.status === 'completed' || data.status === 'ready' || data.already_prepared) {
         addLog(t('log.prepareComplete'))
@@ -975,18 +996,31 @@ const fetchProfilesFull = async () => {
 
       // 输出 Profile 生成进度日志（仅当数量变化时）
       const currentCount = profiles.value.length
+      const total = expectedTotal.value || '?'
+
       if (currentCount > 0 && currentCount !== lastLoggedProfileCount) {
         lastLoggedProfileCount = currentCount
-        const total = expectedTotal.value || '?'
         const latestProfile = profiles.value[currentCount - 1]
         const profileName = latestProfile?.name || latestProfile?.username || `Agent_${currentCount}`
-        if (currentCount === 1) {
+        if (lastLoggedProfileCount === 0 || lastLoggedProfileCount === undefined) {
           addLog(t('log.startGeneratingAgentProfiles'))
         }
         addLog(t('log.agentProfile', { current: currentCount, total: total, name: profileName, profession: latestProfile?.profession || t('step2.unknownProfession') }))
 
         if (expectedTotal.value && currentCount >= expectedTotal.value) {
           addLog(t('log.allProfilesComplete', { count: currentCount }))
+        }
+      } else if (currentCount === 0 && total !== '?' && expectedTotal.value) {
+        // 当前 0 个 profile 但后端说有 total 个 — 说明后端在内存里生成,文件未落盘
+        // 只发一次"仍在等待文件落盘"提示,避免噪音
+        if (lastLoggedProfileStamp === 0) {
+          addLog(`Profile 生成中,等待后端写入文件... (后端按批次落盘,落盘后才能看到 ${total} 个)`)
+          lastLoggedProfileStamp = Date.now()
+        } else if (Date.now() - lastLoggedProfileStamp > 60000) {
+          // 每 60s 提醒一次"仍在等",且时间戳变化保证不重复
+          const elapsedSec = Math.round((Date.now() - lastLoggedProfileStamp) / 1000)
+          addLog(`Profile 仍在等待文件落盘... (已等待 ${elapsedSec}s,后端按批次写入)`)
+          lastLoggedProfileStamp = Date.now()
         }
       }
     }
