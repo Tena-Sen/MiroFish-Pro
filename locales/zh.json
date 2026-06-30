@@ -326,6 +326,8 @@
     "envAlive": "环境运行中",
     "envStopped": "环境已关闭",
     "envStoppedHint": "模拟进程已结束或崩溃，返回 Step3 重新启动模拟后可继续采访",
+    "envStoppedInlineHint": "模拟世界已停止,采访功能不可用。点击右侧按钮启动模拟即可继续。",
+    "chatInputPlaceholderStopped": "请先启动模拟世界再发送采访…",
     "envStoppedAction": "一键重启",
     "envStoppedActionHint": "正在重启模拟环境...",
     "envRestarting": "重启中...",

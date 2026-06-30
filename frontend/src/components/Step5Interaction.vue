@@ -404,25 +404,41 @@
 
           <!-- Chat Input -->
           <div class="chat-input-area">
-            <textarea 
-              v-model="chatInput"
-              class="chat-input"
-              :placeholder="$t('step5.chatInputPlaceholder')"
-              @keydown.enter.exact.prevent="sendMessage"
-              :disabled="isSending || (!selectedAgent && chatTarget === 'agent')"
-              rows="1"
-              ref="chatInputRef"
-            ></textarea>
-            <button 
-              class="send-btn"
-              @click="sendMessage"
-              :disabled="!chatInput.trim() || isSending || (!selectedAgent && chatTarget === 'agent')"
-            >
-              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
-                <line x1="22" y1="2" x2="11" y2="13"></line>
-                <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
-              </svg>
-            </button>
+            <!-- 模拟世界停止时,在输入框上方显眼的内嵌横幅 -->
+            <div v-if="envStatus === 'stopped' && !envStatusLoading" class="chat-stopped-banner">
+              <span class="chat-stopped-icon">⚠</span>
+              <span class="chat-stopped-text">{{ $t('step5.envStoppedInlineHint') }}</span>
+              <button
+                type="button"
+                class="chat-stopped-btn"
+                :disabled="isRestarting"
+                @click="handleEnvStoppedAction"
+              >
+                <span v-if="isRestarting" class="loading-spinner-small"></span>
+                {{ isRestarting ? $t('step5.envRestarting') : $t('step5.envStoppedAction') }}
+              </button>
+            </div>
+            <div class="chat-input-row">
+              <textarea
+                v-model="chatInput"
+                class="chat-input"
+                :placeholder="envStatus === 'stopped' ? $t('step5.chatInputPlaceholderStopped') : $t('step5.chatInputPlaceholder')"
+                @keydown.enter.exact.prevent="sendMessage"
+                :disabled="isSending || (!selectedAgent && chatTarget === 'agent') || envStatus === 'stopped'"
+                rows="1"
+                ref="chatInputRef"
+              ></textarea>
+              <button
+                class="send-btn"
+                @click="sendMessage"
+                :disabled="!chatInput.trim() || isSending || (!selectedAgent && chatTarget === 'agent') || envStatus === 'stopped'"
+              >
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                  <line x1="22" y1="2" x2="11" y2="13"></line>
+                  <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                </svg>
+              </button>
+            </div>
           </div>
         </div>
 
@@ -478,9 +494,24 @@
               ></textarea>
             </div>
 
-            <button 
+            <!-- 模拟停止时 survey 顶部也加 banner -->
+            <div v-if="envStatus === 'stopped' && !envStatusLoading" class="chat-stopped-banner">
+              <span class="chat-stopped-icon">⚠</span>
+              <span class="chat-stopped-text">{{ $t('step5.envStoppedInlineHint') }}</span>
+              <button
+                type="button"
+                class="chat-stopped-btn"
+                :disabled="isRestarting"
+                @click="handleEnvStoppedAction"
+              >
+                <span v-if="isRestarting" class="loading-spinner-small"></span>
+                {{ isRestarting ? $t('step5.envRestarting') : $t('step5.envStoppedAction') }}
+              </button>
+            </div>
+
+            <button
               class="survey-submit-btn"
-              :disabled="selectedAgents.size === 0 || !surveyQuestion.trim() || isSurveying"
+              :disabled="selectedAgents.size === 0 || !surveyQuestion.trim() || isSurveying || envStatus === 'stopped'"
               @click="submitSurvey"
             >
               <span v-if="isSurveying" class="loading-spinner"></span>
@@ -2601,8 +2632,67 @@ onUnmounted(() => {
   padding: 16px 24px;
   border-top: 1px solid #E5E7EB;
   display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.chat-input-row {
+  display: flex;
   gap: 12px;
   align-items: flex-end;
+}
+
+/* 模拟世界停止时的内嵌横幅 —— 用户在聊天输入处就能看到 */
+.chat-stopped-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: linear-gradient(135deg, #FFF3E0 0%, #FFE0B2 100%);
+  border: 1px solid #FFB74D;
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.chat-stopped-icon {
+  flex-shrink: 0;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.chat-stopped-text {
+  flex: 1;
+  color: #E65100;
+  font-weight: 500;
+  line-height: 1.4;
+}
+
+.chat-stopped-btn {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: #FF6F00;
+  color: #FFFFFF;
+  border: 1px solid #FF6F00;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+
+.chat-stopped-btn:hover:not(:disabled) {
+  background: #E65100;
+  border-color: #E65100;
+}
+
+.chat-stopped-btn:disabled {
+  background: #FFB74D;
+  border-color: #FFB74D;
+  cursor: not-allowed;
 }
 
 .chat-input {

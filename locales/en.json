@@ -326,6 +326,8 @@
     "envAlive": "Environment running",
     "envStopped": "Environment stopped",
     "envStoppedHint": "Simulation process has ended or crashed. Return to Step 3 to restart it.",
+    "envStoppedInlineHint": "Simulation world is stopped, interview unavailable. Click the button to restart and continue.",
+    "chatInputPlaceholderStopped": "Please restart the simulation world before sending…",
     "envStoppedAction": "Restart",
     "envStoppedActionHint": "Restarting simulation environment...",
     "envRestarting": "Restarting...",
