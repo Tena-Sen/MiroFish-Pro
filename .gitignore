@@ -45,6 +45,9 @@ htmlcov/
 .cursor/
 .claude/
 
+# Qwen auto-skill 调试产物
+.qwen/
+
 # 文档与测试程序
 mydoc/
 mytest/

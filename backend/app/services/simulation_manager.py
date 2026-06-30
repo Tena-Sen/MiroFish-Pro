@@ -336,15 +336,46 @@ class SimulationManager:
                 realtime_output_path = os.path.join(sim_dir, "twitter_profiles.csv")
                 realtime_platform = "twitter"
             
-            profiles = generator.generate_profiles_from_entities(
-                entities=filtered.entities,
-                use_llm=use_llm_for_profiles,
-                progress_callback=profile_progress,
-                graph_id=state.graph_id,  # 传入graph_id用于Zep检索
-                parallel_count=parallel_profile_count or Config.OASIS_DEFAULT_PARALLEL_PROFILE_COUNT,  # 使用配置值或默认值
-                realtime_output_path=realtime_output_path,  # 实时保存路径
-                output_platform=realtime_platform  # 输出格式
-            )
+            # Phase 2: 默认走 asyncio 异步路径（更高并发，不阻塞主线程）
+            if Config.OASIS_USE_ASYNC_PROFILE_GEN:
+                try:
+                    import asyncio
+                    async_concurrency = (
+                        parallel_profile_count
+                        or Config.OASIS_ASYNC_PROFILE_CONCURRENCY
+                    )
+                    profiles = asyncio.run(
+                        generator.generate_profiles_from_entities_async(
+                            entities=filtered.entities,
+                            use_llm=use_llm_for_profiles,
+                            progress_callback=profile_progress,
+                            graph_id=state.graph_id,
+                            parallel_count=async_concurrency,
+                            realtime_output_path=realtime_output_path,
+                            output_platform=realtime_platform,
+                        )
+                    )
+                except Exception as e:
+                    logger.warning(f"异步 profile 生成失败，回退到 ThreadPool: {e}")
+                    profiles = generator.generate_profiles_from_entities(
+                        entities=filtered.entities,
+                        use_llm=use_llm_for_profiles,
+                        progress_callback=profile_progress,
+                        graph_id=state.graph_id,
+                        parallel_count=parallel_profile_count or Config.OASIS_DEFAULT_PARALLEL_PROFILE_COUNT,
+                        realtime_output_path=realtime_output_path,
+                        output_platform=realtime_platform,
+                    )
+            else:
+                profiles = generator.generate_profiles_from_entities(
+                    entities=filtered.entities,
+                    use_llm=use_llm_for_profiles,
+                    progress_callback=profile_progress,
+                    graph_id=state.graph_id,  # 传入graph_id用于Zep检索
+                    parallel_count=parallel_profile_count or Config.OASIS_DEFAULT_PARALLEL_PROFILE_COUNT,  # 使用配置值或默认值
+                    realtime_output_path=realtime_output_path,  # 实时保存路径
+                    output_platform=realtime_platform  # 输出格式
+                )
             
             state.profiles_count = len(profiles)
             
@@ -421,8 +452,10 @@ class SimulationManager:
             
             # 保存配置文件
             config_path = os.path.join(sim_dir, "simulation_config.json")
-            with open(config_path, 'w', encoding='utf-8') as f:
-                f.write(sim_params.to_json())
+            # 优化 B10：改用原子写入，避免前端 /config/realtime 2s 轮询读到半截 JSON
+            # 业务语义不变：最终文件内容与原版完全一致
+            from ..utils.atomic_io import atomic_write_json
+            atomic_write_json(config_path, sim_params.to_dict(), ensure_ascii=False)
             
             state.config_generated = True
             state.config_reasoning = sim_params.generation_reasoning

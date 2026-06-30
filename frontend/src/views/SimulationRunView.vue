@@ -243,8 +243,8 @@ let graphRefreshTimer = null
 const startGraphRefresh = () => {
   if (graphRefreshTimer) return
   addLog(t('log.graphRealtimeRefreshStart'))
-  // 立即刷新一次，然后每30秒刷新
-  graphRefreshTimer = setInterval(refreshGraph, 30000)
+  // 立即刷新一次，然后每 5 秒刷新（Phase 4a 配套：BATCH_SIZE=10 后图谱变化很快）
+  graphRefreshTimer = setInterval(refreshGraph, 5000)
 }
 
 const stopGraphRefresh = () => {

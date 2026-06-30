@@ -68,6 +68,16 @@ export const getSimulationConfigRealtime = (simulationId) => {
 }
 
 /**
+ * 获取 Profile 轻量元数据（仅 count + mtime）—— 用于高频轮询，避免每次 parse 全量 JSON
+ * @param {string} simulationId
+ * @param {string} platform - 'reddit' | 'twitter'
+ * @returns {Promise<{success, data: {count, total_expected, is_generating, file_modified_at, file_exists}}>}
+ */
+export const getProfilesMeta = (simulationId, platform = 'reddit') => {
+  return service.get(`/api/simulation/${simulationId}/profiles/meta`, { params: { platform } })
+}
+
+/**
  * 列出所有模拟
  * @param {string} projectId - 可选，按项目ID过滤
  */

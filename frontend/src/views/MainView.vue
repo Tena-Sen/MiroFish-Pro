@@ -144,8 +144,15 @@ const statusText = computed(() => {
 })
 
 // --- Helpers ---
+// T3：单调时间戳追踪，确保 addLog 顺序与显示顺序一致（避免跨秒边界的 ms 回绕）
+let lastLogMs = 0
 const addLog = (msg) => {
-  const time = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' }) + '.' + new Date().getMilliseconds().toString().padStart(3, '0')
+  const now = Date.now()
+  // 如果新调用时间早于或等于最后一条记录的时间，强制 +1ms 保证单调
+  const monotonicMs = Math.max(now, lastLogMs + 1)
+  lastLogMs = monotonicMs
+  const date = new Date(monotonicMs)
+  const time = date.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' }) + '.' + String(date.getMilliseconds()).padStart(3, '0')
   systemLogs.value.push({ time, msg })
   // Keep last 100 logs
   if (systemLogs.value.length > 100) {

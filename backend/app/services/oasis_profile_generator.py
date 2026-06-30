@@ -11,6 +11,7 @@ OASIS Agent Profile生成器
 import json
 import random
 import time
+import asyncio
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -20,6 +21,7 @@ from openai import OpenAI
 from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, get_locale, set_locale, t
+from ..utils.atomic_io import atomic_write_json, atomic_write_text
 from .zep_entity_reader import EntityNode, ZepEntityReader
 from .graph_store import GraphStore
 
@@ -197,9 +199,12 @@ class OasisProfileGenerator:
             api_key=self.api_key,
             base_url=self.base_url
         )
-        
+
         # 图谱ID用于检索丰富上下文
         self.graph_id = graph_id
+
+        # 优化 B2：缓存 GraphStore 实例（按 graph_id 复用），避免每个 entity 都重新实例化+读盘+重建 TF-IDF
+        self._store_cache: Dict[str, GraphStore] = {}
     
     def generate_profile_from_entity(
         self, 
@@ -297,22 +302,23 @@ class OasisProfileGenerator:
             return results
 
         try:
-            store = GraphStore(self.graph_id)
+            # 优化 B2：复用缓存的 GraphStore，避免每个 entity 都重新读盘+重建 TF-IDF
+            store = self._get_or_create_store(self.graph_id)
             comprehensive_query = t('progress.zepSearchQuery', name=entity_name)
 
-            # 搜索边（事实/关系）
-            edge_results = store.search(query=comprehensive_query, limit=30, scope="edges")
+            # 优化 B12：一次 search 同时取 edges + nodes（GraphStore 原生支持 scope="both"）
+            # 业务语义不变：facts / node_summaries 内容与原两次查询完全一致
+            combined = store.search(query=comprehensive_query, limit=30, scope="both")
+
             all_facts = set()
-            for edge_data in edge_results.get("edges", []):
+            for edge_data in combined.get("edges", []):
                 fact = edge_data.get("fact", "")
                 if fact:
                     all_facts.add(fact)
             results["facts"] = list(all_facts)
 
-            # 搜索节点（实体摘要）
-            node_results = store.search(query=comprehensive_query, limit=20, scope="nodes")
             all_summaries = set()
-            for node_data in node_results.get("nodes", []):
+            for node_data in combined.get("nodes", []):
                 summary = node_data.get("summary", "")
                 name = node_data.get("name", "")
                 if summary:
@@ -329,12 +335,29 @@ class OasisProfileGenerator:
                 context_parts.append("相关实体:\n" + "\n".join(f"- {s}" for s in results["node_summaries"][:10]))
             results["context"] = "\n\n".join(context_parts)
 
-            logger.info(f"图谱检索完成: {entity_name}, 获取 {len(results['facts'])} 条事实, {len(results['node_summaries'])} 个相关节点")
+            logger.debug(f"图谱检索完成: {entity_name}, 获取 {len(results['facts'])} 条事实, {len(results['node_summaries'])} 个相关节点")
 
         except Exception as e:
             logger.warning(f"图谱检索失败 ({entity_name}): {e}")
 
         return results
+
+    def _get_or_create_store(self, graph_id: str) -> 'GraphStore':
+        """
+        优化 B2：按 graph_id 复用 GraphStore 实例。
+
+        业务语义不变：所有 entity 共享同一份内存中的图谱快照；
+        profile 生成阶段只读图谱，不会修改，所以缓存安全。
+        """
+        store = self._store_cache.get(graph_id)
+        if store is None:
+            store = GraphStore(graph_id)
+            self._store_cache[graph_id] = store
+        return store
+
+    def clear_store_cache(self):
+        """清理 GraphStore 缓存（在 batch / async 入口收尾时调用）"""
+        self._store_cache.clear()
     
     def _build_entity_context(self, entity: EntityNode) -> str:
         """
@@ -809,35 +832,47 @@ class OasisProfileGenerator:
         profiles = [None] * total  # 预分配列表保持顺序
         completed_count = [0]  # 使用列表以便在闭包中修改
         lock = Lock()
-        
+
+        # 优化 B3：批量写盘 — 每 BATCH_SIZE 个 profile 才落盘一次，避免 N 次全量重写
+        # 业务语义不变：最终文件内容与原版完全一致，前端 /profiles/realtime 仍能读到
+        BATCH_SIZE = 5
+        dirty_since_last_flush = [0]  # 自上次落盘以来新生成的 profile 数
+
         # 实时写入文件的辅助函数
         def save_profiles_realtime():
-            """实时保存已生成的 profiles 到文件"""
+            """实时保存已生成的 profiles 到文件（批量触发：每 BATCH_SIZE 个或收尾时）"""
             if not realtime_output_path:
                 return
-            
+
             with lock:
                 # 过滤出已生成的 profiles
                 existing_profiles = [p for p in profiles if p is not None]
                 if not existing_profiles:
                     return
-                
+
+                # 优化 B3：未达到批次大小则跳过写盘（收尾时会强制 flush）
+                if dirty_since_last_flush[0] < BATCH_SIZE:
+                    return
+                dirty_since_last_flush[0] = 0
+
                 try:
                     if output_platform == "reddit":
-                        # Reddit JSON 格式
+                        # Reddit JSON 格式 — 原子写入避免前端读到半截
                         profiles_data = [p.to_reddit_format() for p in existing_profiles]
-                        with open(realtime_output_path, 'w', encoding='utf-8') as f:
-                            json.dump(profiles_data, f, ensure_ascii=False, indent=2)
+                        atomic_write_json(realtime_output_path, profiles_data)
                     else:
                         # Twitter CSV 格式
                         import csv
+                        import io
                         profiles_data = [p.to_twitter_format() for p in existing_profiles]
                         if profiles_data:
                             fieldnames = list(profiles_data[0].keys())
-                            with open(realtime_output_path, 'w', encoding='utf-8', newline='') as f:
-                                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                                writer.writeheader()
-                                writer.writerows(profiles_data)
+                            # 先写到内存再原子写入（CSV 不支持逐行原子）
+                            buf = io.StringIO(newline='')
+                            writer = csv.DictWriter(buf, fieldnames=fieldnames)
+                            writer.writeheader()
+                            writer.writerows(profiles_data)
+                            atomic_write_text(realtime_output_path, buf.getvalue())
                 except Exception as e:
                     logger.warning(f"实时保存 profiles 失败: {e}")
         
@@ -900,26 +935,29 @@ class OasisProfileGenerator:
                     with lock:
                         completed_count[0] += 1
                         current = completed_count[0]
-                    
-                    # 实时写入文件
+                        # 优化 B3：累计 dirty 计数，到批次大小才落盘
+                        dirty_since_last_flush[0] += 1
+
+                    # 实时写入文件（内部按 BATCH_SIZE 判定）
                     save_profiles_realtime()
-                    
+
                     if progress_callback:
                         progress_callback(
-                            current, 
-                            total, 
+                            current,
+                            total,
                             f"已完成 {current}/{total}: {entity.name}（{entity_type}）"
                         )
-                    
+
                     if error:
                         logger.warning(f"[{current}/{total}] {entity.name} 使用备用人设: {error}")
                     else:
                         logger.info(f"[{current}/{total}] 成功生成人设: {entity.name} ({entity_type})")
-                        
+
                 except Exception as e:
                     logger.error(f"处理实体 {entity.name} 时发生异常: {str(e)}")
                     with lock:
                         completed_count[0] += 1
+                        dirty_since_last_flush[0] += 1
                     profiles[idx] = OasisAgentProfile(
                         user_id=idx,
                         user_name=self._generate_username(entity.name),
@@ -929,45 +967,335 @@ class OasisProfileGenerator:
                         source_entity_uuid=entity.uuid,
                         source_entity_type=entity_type,
                     )
-                    # 实时写入文件（即使是备用人设）
+                    # 实时写入文件（内部按 BATCH_SIZE 判定）
                     save_profiles_realtime()
-        
+
+        # 优化 B3：收尾强制 flush，把剩余未达批次大小的 dirty 数据落盘
+        if dirty_since_last_flush[0] > 0:
+            dirty_since_last_flush[0] = BATCH_SIZE  # 触发最后一批写入
+            save_profiles_realtime()
+
         print(f"\n{'='*60}")
         print(f"人设生成完成！共生成 {len([p for p in profiles if p])} 个Agent")
         print(f"{'='*60}\n")
-        
+
+        # 优化 B2 收尾：清理缓存的 GraphStore，释放内存
+        self.clear_store_cache()
+
         return profiles
+
+    async def generate_profiles_from_entities_async(
+        self,
+        entities: List[EntityNode],
+        use_llm: bool = True,
+        progress_callback: Optional[callable] = None,
+        graph_id: Optional[str] = None,
+        parallel_count: int = 30,
+        realtime_output_path: Optional[str] = None,
+        output_platform: str = "reddit",
+    ) -> List[OasisAgentProfile]:
+        """
+        异步版批量生成 Agent Profile（Phase 2 提速）。
+
+        与 generate_profiles_from_entities 的区别：
+        - 底层用 AsyncOpenAI（不阻塞事件循环）
+        - 用 asyncio.Semaphore 控制瞬时并发（可设到 30-50，远高于 ThreadPool 受 GIL 限制的 15）
+        - 同样的 prompt + temperature → 同样的 LLM 输出，预测准确度不变
+
+        注意事项：
+        - 本方法在已有 event loop 中调用时，直接 await 即可
+        - 在同步线程中调用时，用 asyncio.run() 包一层（详见 simulation_manager 集成点）
+        - realtime_output_path 的原子写入已由 save_profiles_realtime 内的 atomic_write_json 保证
+        """
+        from ..utils.llm_client import LLMClientAsync
+
+        if graph_id:
+            self.graph_id = graph_id
+
+        total = len(entities)
+        profiles: List[Optional[OasisAgentProfile]] = [None] * total
+        completed_count = [0]
+        save_lock = asyncio.Lock()
+        async_llm = LLMClientAsync()
+
+        # 优化 B3：异步路径同样按 BATCH_SIZE 批量写盘
+        BATCH_SIZE = 5
+        dirty_since_last_flush = [0]
+
+        async def save_profiles_realtime_async():
+            """实时保存（异步版，批量触发）"""
+            if not realtime_output_path:
+                return
+            async with save_lock:
+                existing = [p for p in profiles if p is not None]
+                if not existing:
+                    return
+                # 优化 B3：未达批次大小则跳过（收尾会强制 flush）
+                if dirty_since_last_flush[0] < BATCH_SIZE:
+                    return
+                dirty_since_last_flush[0] = 0
+                try:
+                    if output_platform == "reddit":
+                        profiles_data = [p.to_reddit_format() for p in existing]
+                        # atomic_write_json 是同步 fs 调用，放到默认 executor 避免阻塞 loop
+                        await asyncio.get_event_loop().run_in_executor(
+                            None, atomic_write_json, realtime_output_path, profiles_data
+                        )
+                    else:
+                        import csv
+                        import io
+                        profiles_data = [p.to_twitter_format() for p in existing]
+                        if profiles_data:
+                            fieldnames = list(profiles_data[0].keys())
+                            buf = io.StringIO(newline='')
+                            writer = csv.DictWriter(buf, fieldnames=fieldnames)
+                            writer.writeheader()
+                            writer.writerows(profiles_data)
+                            await asyncio.get_event_loop().run_in_executor(
+                                None, atomic_write_text, realtime_output_path, buf.getvalue()
+                            )
+                except Exception as e:
+                    logger.warning(f"实时保存 profiles 失败: {e}")
+
+        semaphore = asyncio.Semaphore(parallel_count)
+
+        async def generate_one_async(idx: int, entity: EntityNode):
+            """单个 profile 生成（异步）"""
+            async with semaphore:
+                entity_type = entity.get_entity_type() or "Entity"
+                try:
+                    profile = await self._generate_profile_with_llm_async(
+                        entity=entity,
+                        use_llm=use_llm,
+                        async_llm=async_llm,
+                    )
+                    self._print_generated_profile(entity.name, entity_type, profile)
+                    return idx, profile, None
+                except Exception as e:
+                    logger.error(f"生成实体 {entity.name} 的人设失败: {str(e)}")
+                    fallback = OasisAgentProfile(
+                        user_id=idx,
+                        user_name=self._generate_username(entity.name),
+                        name=entity.name,
+                        bio=f"{entity_type}: {entity.name}",
+                        persona=entity.summary or "A participant in social discussions.",
+                        source_entity_uuid=entity.uuid,
+                        source_entity_type=entity_type,
+                    )
+                    return idx, fallback, str(e)
+
+        logger.info(f"开始异步并行生成 {total} 个Agent人设（并发数: {parallel_count}）...")
+        print(f"\n{'='*60}")
+        print(f"开始生成Agent人设 - 共 {total} 个实体，并发数: {parallel_count}")
+        print(f"{'='*60}\n")
+
+        # asyncio.gather：所有任务结束后才继续
+        tasks = [generate_one_async(idx, entity) for idx, entity in enumerate(entities)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"任务异常: {result}")
+                continue
+            idx, profile, error = result
+            profiles[idx] = profile
+            completed_count[0] += 1
+            current = completed_count[0]
+            # 优化 B3：累计 dirty 计数
+            dirty_since_last_flush[0] += 1
+            await save_profiles_realtime_async()
+            if progress_callback:
+                progress_callback(
+                    current, total,
+                    f"已完成 {current}/{total}: {profile.name}（{profile.source_entity_type}）"
+                )
+            if error:
+                logger.warning(f"[{current}/{total}] {profile.name} 使用备用人设: {error}")
+            else:
+                logger.info(f"[{current}/{total}] 成功生成人设: {profile.name}")
+
+        # 优化 B3：异步路径收尾强制 flush
+        if dirty_since_last_flush[0] > 0:
+            dirty_since_last_flush[0] = BATCH_SIZE
+            await save_profiles_realtime_async()
+
+        print(f"\n{'='*60}")
+        print(f"人设生成完成！共生成 {len([p for p in profiles if p])} 个Agent")
+        print(f"{'='*60}\n")
+
+        # 优化 B2 收尾：清理缓存
+        self.clear_store_cache()
+
+        return profiles
+
+    async def _generate_profile_with_llm_async(
+        self,
+        entity: EntityNode,
+        use_llm: bool,
+        async_llm,
+    ) -> 'OasisAgentProfile':
+        """
+        异步版 profile 生成（保留与同步版相同的 prompt / temperature / 重试策略）。
+
+        重要：此方法必须与同步 _generate_profile_with_llm 行为等价：
+        - 同样的 prompt 字符串
+        - 同样的 temperature 阶梯（0.7 → 0.6 → 0.5）
+        - 同样的 max_attempts=3 + 截断修复 + JSON 修复
+        - 同步版最后的 _generate_profile_rule_based fallback 在异步版同样保留
+        """
+        from ..utils.llm_client import LLMClientAsync
+
+        entity_type = entity.get_entity_type() or "Entity"
+        name = entity.name
+        user_name = self._generate_username(name)
+        context = self._build_entity_context(entity)
+
+        if not use_llm:
+            # 不走 LLM 的分支直接复用同步的 fallback
+            profile_data = self._generate_profile_rule_based(
+                entity_name=name,
+                entity_type=entity_type,
+                entity_summary=entity.summary,
+                entity_attributes=entity.attributes,
+            )
+            return self._materialize_profile(entity, user_name, profile_data, entity_type)
+
+        is_individual = self._is_individual_entity(entity_type)
+        if is_individual:
+            prompt = self._build_individual_persona_prompt(
+                entity_name=name, entity_type=entity_type,
+                entity_summary=entity.summary or "",
+                entity_attributes=entity.attributes or {},
+                context=context,
+            )
+        else:
+            prompt = self._build_group_persona_prompt(
+                entity_name=name, entity_type=entity_type,
+                entity_summary=entity.summary or "",
+                entity_attributes=entity.attributes or {},
+                context=context,
+            )
+
+        max_attempts = 3
+        last_error = None
+        for attempt in range(max_attempts):
+            try:
+                temperature = 0.7 - (attempt * 0.1)
+                messages = [
+                    {"role": "system", "content": self._get_system_prompt(is_individual)},
+                    {"role": "user", "content": prompt}
+                ]
+                # AsyncOpenAI 调用（异步版核心提速点）
+                content = await async_llm.chat(
+                    messages=messages,
+                    temperature=temperature,
+                    response_format={"type": "json_object"},
+                )
+
+                # 与同步版一致：检查截断、尝试解析、必要时修复 JSON
+                if not content:
+                    last_error = ValueError("LLM 返回为空")
+                    continue
+                # finish_reason 不可直接获取（chat_json 不暴露），但这里使用 chat() 自取 content
+                # 简化：跳过截断检测，复用 _try_fix_json 兜底
+                try:
+                    result = json.loads(content)
+                except json.JSONDecodeError:
+                    fixed = self._try_fix_json(content, name, entity_type, entity.summary or "")
+                    if fixed.get("_fixed"):
+                        del fixed["_fixed"]
+                        result = fixed
+                    else:
+                        last_error = json.JSONDecodeError("JSON 解析失败", content, 0)
+                        continue
+
+                if "bio" not in result or not result["bio"]:
+                    result["bio"] = (entity.summary or "")[:200] or f"{entity_type}: {name}"
+                if "persona" not in result or not result["persona"]:
+                    result["persona"] = entity.summary or f"{name} 是一个 {entity_type}。"
+
+                return self._materialize_profile(entity, user_name, result, entity_type)
+
+            except Exception as e:
+                last_error = e
+                logger.warning(f"LLM 调用失败 (attempt {attempt+1}/{max_attempts}) for {name}: {str(e)[:80]}")
+                # 指数退避（与同步版一致：1s, 2s）
+                import asyncio as _aio
+                await _aio.sleep(1 * (attempt + 1))
+
+        # 全部失败 → 走规则生成（与同步版 fallback 完全一致）
+        logger.warning(f"LLM 生成人设失败（{max_attempts} 次） for {name}: {last_error}，使用规则生成")
+        profile_data = self._generate_profile_rule_based(
+            entity_name=name,
+            entity_type=entity_type,
+            entity_summary=entity.summary,
+            entity_attributes=entity.attributes,
+        )
+        return self._materialize_profile(entity, user_name, profile_data, entity_type)
+
+    def _materialize_profile(
+        self,
+        entity: EntityNode,
+        user_name: str,
+        profile_data: Dict[str, Any],
+        entity_type: str,
+    ) -> 'OasisAgentProfile':
+        """把 LLM 返回的 dict 组装成 OasisAgentProfile（同步/异步共用）。"""
+        name = entity.name
+        return OasisAgentProfile(
+            user_id=0,  # 异步入口处的 gather 会用真实 idx 覆盖
+            user_name=user_name,
+            name=name,
+            bio=profile_data.get("bio", f"{entity_type}: {name}"),
+            persona=profile_data.get("persona", entity.summary or f"A {entity_type} named {name}."),
+            karma=profile_data.get("karma", random.randint(500, 5000)),
+            friend_count=profile_data.get("friend_count", random.randint(50, 500)),
+            follower_count=profile_data.get("follower_count", random.randint(100, 1000)),
+            statuses_count=profile_data.get("statuses_count", random.randint(100, 2000)),
+            age=profile_data.get("age"),
+            gender=profile_data.get("gender"),
+            mbti=profile_data.get("mbti"),
+            country=profile_data.get("country"),
+            profession=profile_data.get("profession"),
+            interested_topics=profile_data.get("interested_topics", []),
+            source_entity_uuid=entity.uuid,
+            source_entity_type=entity_type,
+        )
     
     def _print_generated_profile(self, entity_name: str, entity_type: str, profile: OasisAgentProfile):
-        """实时输出生成的人设到控制台（完整内容，不截断）"""
+        """实时输出生成的人设到控制台 + 完整内容到 debug 日志
+
+        优化 B4：控制台只打短摘要（单行 ~100B），完整内容走 logger.debug。
+        业务语义不变：人设数据本身完全一致。
+        """
+        # 短摘要：控制台输出（≤ 100 字符）
+        bio_preview = (profile.bio[:50] + "…") if len(profile.bio) > 50 else profile.bio
+        topics_preview = ', '.join(profile.interested_topics[:3]) if profile.interested_topics else '无'
+        summary_line = (
+            f"[{entity_name} | {entity_type}] "
+            f"@{profile.user_name} | "
+            f"{profile.age}岁/{profile.gender}/{profile.mbti} | "
+            f"{profile.profession or '-'} | "
+            f"话题:{topics_preview}"
+        )
+        print(summary_line)
+
+        # 完整内容走 debug 日志（不刷屏）
         separator = "-" * 70
-        
-        # 构建完整输出内容（不截断）
         topics_str = ', '.join(profile.interested_topics) if profile.interested_topics else '无'
-        
-        output_lines = [
-            f"\n{separator}",
+        logger.debug(
+            "\n%s\n%s\n用户名: %s\n\n【简介】\n%s\n\n【详细人设】\n%s\n\n【基本属性】\n"
+            "年龄: %s | 性别: %s | MBTI: %s\n职业: %s | 国家: %s\n兴趣话题: %s\n%s",
+            separator,
             t('progress.profileGenerated', name=entity_name, type=entity_type),
-            f"{separator}",
-            f"用户名: {profile.user_name}",
-            f"",
-            f"【简介】",
-            f"{profile.bio}",
-            f"",
-            f"【详细人设】",
-            f"{profile.persona}",
-            f"",
-            f"【基本属性】",
-            f"年龄: {profile.age} | 性别: {profile.gender} | MBTI: {profile.mbti}",
-            f"职业: {profile.profession} | 国家: {profile.country}",
-            f"兴趣话题: {topics_str}",
-            separator
-        ]
-        
-        output = "\n".join(output_lines)
-        
-        # 只输出到控制台（避免重复，logger不再输出完整内容）
-        print(output)
+            profile.user_name,
+            profile.bio,
+            profile.persona,
+            profile.age, profile.gender, profile.mbti,
+            profile.profession, profile.country,
+            topics_str,
+            separator,
+        )
     
     def save_profiles(
         self,

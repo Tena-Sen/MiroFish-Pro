@@ -554,12 +554,43 @@ def get_graph_data(graph_id: str):
     try:
         builder = GraphBuilderService()
         graph_data = builder.get_graph_data(graph_id)
-        
+
         return jsonify({
             "success": True,
             "data": graph_data
         })
-        
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@graph_bp.route('/data/<graph_id>/summary', methods=['GET'])
+def get_graph_data_summary(graph_id: str):
+    """
+    获取图谱轻量摘要（仅节点/边计数 + 本体类型计数）。
+
+    优化 B3：
+    - 原 /data/<id> 每次返回完整节点/边列表 + source/target name，O(N+E) 序列化
+    - 本端点只返回计数，O(1) 序列化
+    - 前端轮询改用本端点，节点/边数变化时才去拉全量
+    - 业务逻辑不变（节点/边数据本身完全一致）
+    """
+    try:
+        from ..services.graph_store import GraphStore
+        store = GraphStore(graph_id)
+        return jsonify({
+            "success": True,
+            "data": {
+                "graph_id": graph_id,
+                "node_count": len(store._nodes),
+                "edge_count": len(store._edges),
+            }
+        })
+
     except Exception as e:
         return jsonify({
             "success": False,

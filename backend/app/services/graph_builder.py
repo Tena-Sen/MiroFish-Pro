@@ -23,6 +23,14 @@ from ..utils.logger import get_logger
 logger = get_logger('mirofish.graph_builder')
 
 
+class _NullContext:
+    """空 context manager，用于 seen_lock 为 None 时兼容 `with lock or _NullContext()` 写法"""
+    def __enter__(self):
+        return self
+    def __exit__(self, *args):
+        return False
+
+
 @dataclass
 class GraphInfo:
     """图谱信息"""
@@ -134,10 +142,11 @@ class GraphBuilderService:
                 message=t('progress.textSplit', count=total_chunks)
             )
 
-            # 4. 分批添加数据 + 实体提取
+            # 4. 分批添加数据 + 实体提取（Phase 4a: chunk_parallel 提速）
             episode_uuids = self.add_text_batches(
                 graph_id, chunks, ontology, batch_size,
-                lambda msg, prog: self.task_manager.update_task(
+                chunk_parallel=Config.GRAPH_BUILDER_CHUNK_PARALLEL,
+                progress_callback=lambda msg, prog: self.task_manager.update_task(
                     task_id,
                     progress=20 + int(prog * 0.65),  # 20-85%
                     message=msg
@@ -207,9 +216,28 @@ class GraphBuilderService:
         chunks: List[str],
         ontology: Dict[str, Any],
         batch_size: int = 3,
-        progress_callback: Optional[Callable] = None
+        progress_callback: Optional[Callable] = None,
+        chunk_parallel: int = 3,
     ) -> List[str]:
-        """分批添加文本到图谱，并提取实体和关系"""
+        """
+        分批添加文本到图谱，并提取实体和关系。
+
+        Phase 4a 提速：
+        - 每个 batch 内的多个 chunk 并行调用 _extract_and_add_entities
+        - chunk_parallel 控制单 batch 内的并发线程数（默认 = batch_size）
+        - seen_entity_names 用 threading.Lock 保护，并发安全
+        - LLM 调用 prompt/temperature 完全不变 → 预测准确度不变
+
+        Args:
+            graph_id: 图谱ID
+            chunks: 文本块列表
+            ontology: 本体定义（entity_types / edge_types）
+            batch_size: 每个 batch 包含的 chunk 数
+            progress_callback: 进度回调
+            chunk_parallel: 单 batch 内 chunk 抽取的并行线程数（1=原行为）
+        """
+        import concurrent.futures
+
         store = GraphStore(graph_id)
         episode_uuids = []
         total_chunks = len(chunks)
@@ -218,8 +246,23 @@ class GraphBuilderService:
         entity_type_names = [et.get("name", "") for et in ontology.get("entity_types", []) if et.get("name")]
         edge_type_names = [et.get("name", "") for et in ontology.get("edge_types", []) if et.get("name")]
 
-        # 用于跨批次去重的实体名称集合
-        seen_entity_names = set()
+        # 用于跨批次去重的实体名称集合 + 锁
+        seen_entity_names: set = set()
+        seen_lock = threading.Lock()
+
+        # Capture locale (LLM 调用可能在多线程 worker 中)
+        current_locale = get_locale()
+
+        def extract_one_chunk(chunk: str) -> None:
+            """单 chunk 抽取（线程 worker）"""
+            set_locale(current_locale)
+            try:
+                self._extract_and_add_entities(
+                    store, chunk, entity_type_names, edge_type_names,
+                    seen_entity_names, seen_lock,
+                )
+            except Exception as e:
+                logger.warning(f"单 chunk 实体抽取失败（已跳过）: {str(e)[:200]}")
 
         for i in range(0, total_chunks, batch_size):
             batch_chunks = chunks[i:i + batch_size]
@@ -234,21 +277,36 @@ class GraphBuilderService:
                 )
 
             try:
-                # 存储原始文本
+                # 存储原始文本（保留串行：GraphStore 内部非线程安全）
                 batch_uuids = store.add_batch(batch_chunks)
                 episode_uuids.extend(batch_uuids)
 
-                # 从文本中提取实体和关系
-                for chunk in batch_chunks:
-                    self._extract_and_add_entities(
-                        store, chunk, entity_type_names, edge_type_names, seen_entity_names
-                    )
+                # 并行抽取实体和关系（Phase 4a 提速）
+                workers = max(1, min(chunk_parallel, len(batch_chunks)))
+                if workers == 1:
+                    # 单线程：保留原行为，零开销
+                    for chunk in batch_chunks:
+                        extract_one_chunk(chunk)
+                else:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                        futures = [executor.submit(extract_one_chunk, chunk) for chunk in batch_chunks]
+                        # 等待所有完成（即使个别失败也不影响其他）
+                        for f in concurrent.futures.as_completed(futures):
+                            exc = f.exception()
+                            if exc:
+                                logger.warning(f"Chunk 抽取异常（已跳过）: {exc}")
+
+                # 优化 B1+B5：本批内 episode + 抽取出的实体/关系统一落盘一次
+                # 业务语义不变：与原版"每 add_node 都 _save"产出的最终 JSON 完全一致
+                store.flush()
 
             except Exception as e:
                 if progress_callback:
                     progress_callback(t('progress.batchFailed', batch=batch_num, error=str(e)), 0)
                 raise
 
+        # 最终 flush（防御性：万一最后一批异常后仍有脏数据）
+        store.flush()
         return episode_uuids
 
     def _extract_and_add_entities(
@@ -257,11 +315,23 @@ class GraphBuilderService:
         text: str,
         entity_type_names: List[str],
         edge_type_names: List[str],
-        seen_entity_names: set
+        seen_entity_names: set,
+        seen_lock: Optional[threading.Lock] = None,
     ):
-        """从文本中提取实体和关系，并添加到图谱"""
+        """从文本中提取实体和关系，并添加到图谱
+
+        Phase 4a 并行化：
+        - seen_lock 提供时，所有 seen_entity_names / store 写入都串行化
+        - lock 为 None 时保持原单线程行为
+
+        优化 B2：
+        - 实体/关系处理各开一个临界区，临界区内一次构建 name→uuid 索引
+        - 消除原先每次去重都对 store.get_all_nodes() 做 O(N) 线性扫描
+        - 业务语义不变：仍是"去重 → 写入图谱"，仅查找方式由 O(N) 全表扫变成 O(1) 字典查
+        - LLM 调用（_extract_entities_with_lllm）依旧在锁外，不阻塞并发
+        """
         try:
-            # 使用 LLM 提取实体和关系
+            # 使用 LLM 提取实体和关系（在锁外执行，让并行 worker 不互相阻塞）
             extraction_result = self._extract_entities_with_llm(
                 text, entity_type_names, edge_type_names
             )
@@ -269,77 +339,75 @@ class GraphBuilderService:
             if not extraction_result:
                 return
 
-            # 添加实体节点
-            entity_uuid_map = {}  # name -> uuid
-            for entity in extraction_result.get("entities", []):
-                name = entity.get("name", "").strip()
-                entity_type = entity.get("type", "Entity").strip()
-                summary = entity.get("summary", "").strip()
+            entity_uuid_map: Dict[str, str] = {}  # 当前 chunk 内的 name → uuid
 
-                if not name:
-                    continue
+            # ============== 实体写入：单一临界区 ==============
+            with seen_lock if seen_lock else _NullContext():
+                # 进入临界区时一次性构建索引，避免每个实体都线性扫描全节点
+                name_to_uuid: Dict[str, str] = {
+                    n.name: n.uuid for n in store.get_all_nodes()
+                }
 
-                # 跨批次去重
-                if name in seen_entity_names:
-                    # 查找已有节点的 UUID
-                    for node in store.get_all_nodes():
-                        if node.name == name:
-                            entity_uuid_map[name] = node.uuid
-                            break
-                    continue
+                for entity in extraction_result.get("entities", []):
+                    name = entity.get("name", "").strip()
+                    entity_type = entity.get("type", "Entity").strip()
+                    summary = entity.get("summary", "").strip()
 
-                seen_entity_names.add(name)
+                    if not name:
+                        continue
 
-                # 确定标签
-                labels = [entity_type] if entity_type and entity_type != "Entity" else ["Entity"]
-                if entity_type not in ("Entity",) and entity_type not in labels:
-                    labels.append(entity_type)
+                    # 跨批次去重
+                    if name in seen_entity_names:
+                        # O(1) 字典查替代原先 O(N) 线性扫描
+                        existing_uuid = name_to_uuid.get(name)
+                        if existing_uuid:
+                            entity_uuid_map[name] = existing_uuid
+                        continue
 
-                node_uuid = store.add_node(
-                    name=name,
-                    labels=labels,
-                    summary=summary or f"{entity_type}: {name}",
-                    attributes={"source": "llm_extraction"}
-                )
-                entity_uuid_map[name] = node_uuid
+                    seen_entity_names.add(name)
 
-            # 添加关系边
-            for relation in extraction_result.get("relations", []):
-                source_name = relation.get("source", "").strip()
-                target_name = relation.get("target", "").strip()
-                relation_type = relation.get("type", "RELATED_TO").strip()
-                fact = relation.get("fact", "").strip()
+                    # 确定标签
+                    labels = [entity_type] if entity_type and entity_type != "Entity" else ["Entity"]
+                    if entity_type not in ("Entity",) and entity_type not in labels:
+                        labels.append(entity_type)
 
-                if not source_name or not target_name:
-                    continue
-
-                # 查找源和目标节点的 UUID
-                source_uuid = entity_uuid_map.get(source_name)
-                target_uuid = entity_uuid_map.get(target_name)
-
-                # 如果不在当前批次中，尝试从图谱中查找
-                if not source_uuid:
-                    for node in store.get_all_nodes():
-                        if node.name == source_name:
-                            source_uuid = node.uuid
-                            entity_uuid_map[source_name] = source_uuid
-                            break
-
-                if not target_uuid:
-                    for node in store.get_all_nodes():
-                        if node.name == target_name:
-                            target_uuid = node.uuid
-                            entity_uuid_map[target_name] = target_uuid
-                            break
-
-                if source_uuid and target_uuid:
-                    store.add_edge(
-                        name=relation_type,
-                        fact=fact or f"{source_name} {relation_type} {target_name}",
-                        source_node_uuid=source_uuid,
-                        target_node_uuid=target_uuid,
+                    node_uuid = store.add_node(
+                        name=name,
+                        labels=labels,
+                        summary=summary or f"{entity_type}: {name}",
                         attributes={"source": "llm_extraction"}
                     )
+                    entity_uuid_map[name] = node_uuid
+                    name_to_uuid[name] = node_uuid  # 同步更新本地索引，供后续实体/关系查
+
+            # ============== 关系写入：单一临界区 ==============
+            with seen_lock if seen_lock else _NullContext():
+                # 重新构建索引：临界区之间其他 worker 可能已添加新节点
+                name_to_uuid = {
+                    n.name: n.uuid for n in store.get_all_nodes()
+                }
+
+                for relation in extraction_result.get("relations", []):
+                    source_name = relation.get("source", "").strip()
+                    target_name = relation.get("target", "").strip()
+                    relation_type = relation.get("type", "RELATED_TO").strip()
+                    fact = relation.get("fact", "").strip()
+
+                    if not source_name or not target_name:
+                        continue
+
+                    # 优先用本 chunk 的映射；缺失则用全图索引
+                    source_uuid = entity_uuid_map.get(source_name) or name_to_uuid.get(source_name)
+                    target_uuid = entity_uuid_map.get(target_name) or name_to_uuid.get(target_name)
+
+                    if source_uuid and target_uuid:
+                        store.add_edge(
+                            name=relation_type,
+                            fact=fact or f"{source_name} {relation_type} {target_name}",
+                            source_node_uuid=source_uuid,
+                            target_node_uuid=target_uuid,
+                            attributes={"source": "llm_extraction"}
+                        )
 
         except Exception as e:
             logger.warning(f"实体提取失败（非致命）: {str(e)[:100]}")

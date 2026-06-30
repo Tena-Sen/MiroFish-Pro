@@ -150,6 +150,15 @@ class ZepEntityReader:
         # 构建节点映射
         node_map = {n.uuid: n for n in all_nodes}
 
+        # 优化 B1：构建 outgoing / incoming 索引，避免 N×E 双层循环
+        # 业务语义不变：related_edges / related_nodes 内容、顺序与原版完全一致
+        if enrich_with_edges:
+            outgoing_by_uuid: Dict[str, List[Any]] = {}
+            incoming_by_uuid: Dict[str, List[Any]] = {}
+            for edge in all_edges:
+                outgoing_by_uuid.setdefault(edge.source_node_uuid, []).append(edge)
+                incoming_by_uuid.setdefault(edge.target_node_uuid, []).append(edge)
+
         # 筛选
         filtered_entities = []
         entity_types_found = set()
@@ -178,35 +187,37 @@ class ZepEntityReader:
                 attributes=node.attributes,
             )
 
-            # 获取相关边和节点
+            # 获取相关边和节点（O(deg(node)) 而非 O(E)）
             if enrich_with_edges:
                 related_edges = []
                 related_node_uuids = set()
 
-                for edge in all_edges:
-                    if edge.source_node_uuid == node.uuid:
-                        related_edges.append({
-                            "direction": "outgoing",
-                            "edge_name": edge.name,
-                            "fact": edge.fact,
-                            "target_node_uuid": edge.target_node_uuid,
-                        })
-                        related_node_uuids.add(edge.target_node_uuid)
-                    elif edge.target_node_uuid == node.uuid:
-                        related_edges.append({
-                            "direction": "incoming",
-                            "edge_name": edge.name,
-                            "fact": edge.fact,
-                            "source_node_uuid": edge.source_node_uuid,
-                        })
-                        related_node_uuids.add(edge.source_node_uuid)
+                # 优化 B1：O(deg) 直接查 outgoing 索引
+                for edge in outgoing_by_uuid.get(node.uuid, []):
+                    related_edges.append({
+                        "direction": "outgoing",
+                        "edge_name": edge.name,
+                        "fact": edge.fact,
+                        "target_node_uuid": edge.target_node_uuid,
+                    })
+                    related_node_uuids.add(edge.target_node_uuid)
+
+                # 优化 B1：O(deg) 直接查 incoming 索引
+                for edge in incoming_by_uuid.get(node.uuid, []):
+                    related_edges.append({
+                        "direction": "incoming",
+                        "edge_name": edge.name,
+                        "fact": edge.fact,
+                        "source_node_uuid": edge.source_node_uuid,
+                    })
+                    related_node_uuids.add(edge.source_node_uuid)
 
                 entity.related_edges = related_edges
 
                 related_nodes = []
                 for related_uuid in related_node_uuids:
-                    if related_uuid in node_map:
-                        related_node = node_map[related_uuid]
+                    related_node = node_map.get(related_uuid)
+                    if related_node:
                         related_nodes.append({
                             "uuid": related_node.uuid,
                             "name": related_node.name,

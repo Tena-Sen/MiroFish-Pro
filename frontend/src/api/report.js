@@ -9,6 +9,15 @@ export const generateReport = (data) => {
 }
 
 /**
+ * 检查报告状态 + 断点续传信息（R5）
+ * @param {string} simulationId
+ * @returns {Promise<{success, data: {has_report, report_status, report_id, interview_unlocked, completed_sections, total_sections, resumable}}>}
+ */
+export const checkReportStatus = (simulationId) => {
+  return service.get(`/api/report/check/${simulationId}`)
+}
+
+/**
  * 获取报告生成状态
  * @param {string} reportId
  */

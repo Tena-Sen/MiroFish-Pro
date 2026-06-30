@@ -651,7 +651,8 @@ import {
   getPrepareStatus,
   getSimulationProfilesRealtime,
   getSimulationConfig,
-  getSimulationConfigRealtime
+  getSimulationConfigRealtime,
+  getProfilesMeta
 } from '../api/simulation'
 
 const { t } = useI18n()
@@ -682,6 +683,10 @@ const showProfilesDetail = ref(true)
 let lastLoggedMessage = ''
 let lastLoggedProfileCount = 0
 let lastLoggedConfigStage = ''
+
+// 优化 B9：profile 增量拉取缓存
+let lastProfilesMtime = null
+let lastProfilesSnapshot = null
 
 // 模拟轮数配置
 const useCustomRounds = ref(false) // 默认使用自动配置轮数
@@ -922,25 +927,52 @@ const pollPrepareStatus = async () => {
 
 const fetchProfilesRealtime = async () => {
   if (!props.simulationId) return
-  
+
+  try {
+    // 优化 B9：先用轻量 /profiles/meta 检查 mtime 与 count，未变则跳过全量拉取
+    const metaRes = await getProfilesMeta(props.simulationId, 'reddit')
+    if (!metaRes.success || !metaRes.data) {
+      // 兜底：拉一次全量
+      await fetchProfilesFull()
+      return
+    }
+
+    const mtime = metaRes.data.file_modified_at
+    const count = metaRes.data.count
+    if (mtime && mtime === lastProfilesMtime && lastProfilesSnapshot) {
+      // 文件未变，复用上一次的 profiles（避免无意义 parse + diff）
+      return
+    }
+
+    // 文件有变（或首次）→ 拉全量
+    await fetchProfilesFull()
+    lastProfilesMtime = mtime
+  } catch (err) {
+    console.warn('获取 Profiles meta 失败，回退全量:', err)
+    await fetchProfilesFull()
+  }
+}
+
+const fetchProfilesFull = async () => {
+  if (!props.simulationId) return
   try {
     const res = await getSimulationProfilesRealtime(props.simulationId, 'reddit')
-    
+
     if (res.success && res.data) {
-      const prevCount = profiles.value.length
       profiles.value = res.data.profiles || []
-      // 只有当 API 返回有效值时才更新，避免覆盖已有的有效值
+      lastProfilesSnapshot = profiles.value
+
       if (res.data.total_expected) {
         expectedTotal.value = res.data.total_expected
       }
-      
+
       // 提取实体类型
       const types = new Set()
       profiles.value.forEach(p => {
         if (p.entity_type) types.add(p.entity_type)
       })
       entityTypes.value = Array.from(types)
-      
+
       // 输出 Profile 生成进度日志（仅当数量变化时）
       const currentCount = profiles.value.length
       if (currentCount > 0 && currentCount !== lastLoggedProfileCount) {
@@ -953,14 +985,13 @@ const fetchProfilesRealtime = async () => {
         }
         addLog(t('log.agentProfile', { current: currentCount, total: total, name: profileName, profession: latestProfile?.profession || t('step2.unknownProfession') }))
 
-        // 如果全部生成完成
         if (expectedTotal.value && currentCount >= expectedTotal.value) {
           addLog(t('log.allProfilesComplete', { count: currentCount }))
         }
       }
     }
   } catch (err) {
-    console.warn('获取 Profiles 失败:', err)
+    console.warn('获取 Profiles 全量失败:', err)
   }
 }
 

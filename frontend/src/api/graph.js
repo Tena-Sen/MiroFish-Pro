@@ -58,6 +58,18 @@ export function getGraphData(graphId) {
 }
 
 /**
+ * 获取图谱轻量摘要（仅节点/边计数）—— 用于高频轮询
+ * @param {String} graphId - 图谱ID
+ * @returns {Promise<{success, data: {graph_id, node_count, edge_count}}>}
+ */
+export function getGraphDataSummary(graphId) {
+  return service({
+    url: `/api/graph/data/${graphId}/summary`,
+    method: 'get'
+  })
+}
+
+/**
  * 获取项目信息
  * @param {String} projectId - 项目ID
  * @returns {Promise}
