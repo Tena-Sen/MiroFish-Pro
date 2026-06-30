@@ -6,9 +6,9 @@
 </br>
 <em>A Simple and Universal Swarm Intelligence Engine, Predicting Anything</em>
 
-[![GitHub Stars](https://img.shields.io/github/stars/Hdwing/MiroFish-Pro?style=flat-square&color=DAA520)](https://github.com/Hdwing/MiroFish-Pro/stargazers)
-[![GitHub Watchers](https://img.shields.io/github/watchers/Hdwing/MiroFish-Pro?style=flat-square)](https://github.com/Hdwing/MiroFish-Pro/watchers)
-[![GitHub Forks](https://img.shields.io/github/forks/Hdwing/MiroFish-Pro?style=flat-square)](https://github.com/Hdwing/MiroFish-Pro/network)
+[![GitHub Stars](https://img.shields.io/github/stars/Tena-Sen/MiroFish-Pro?style=flat-square&color=DAA520)](https://github.com/Tena-Sen/MiroFish-Pro/stargazers)
+[![GitHub Watchers](https://img.shields.io/github/watchers/Tena-Sen/MiroFish-Pro?style=flat-square)](https://github.com/Tena-Sen/MiroFish-Pro/watchers)
+[![GitHub Forks](https://img.shields.io/github/forks/Tena-Sen/MiroFish-Pro?style=flat-square)](https://github.com/Tena-Sen/MiroFish-Pro/network)
 
 [English](./README.md) | [中文文档](./README-ZH.md)
 
@@ -24,7 +24,7 @@
 >
 > - **Original author / 原作者**：[666ghj](https://github.com/666ghj) & [Shanda Group](https://www.shanda.com/)
 > - **Source / 源仓库**：[github.com/666ghj/MiroFish](https://github.com/666ghj/MiroFish)
-> - **This fork / 本仓库**：[github.com/Hdwing/MiroFish-Pro](https://github.com/Hdwing/MiroFish-Pro)
+> - **This fork / 本仓库**：[github.com/Tena-Sen/MiroFish-Pro](https://github.com/Tena-Sen/MiroFish-Pro)
 >
 > ⭐ All credits for the original design, vision, and core engine go to the original authors. Please star their repo to show appreciation.
 >
@@ -34,7 +34,7 @@
 
 ## 📋 What's Different from Upstream
 
-This fork adds **21 commits** focused on production stability and recovery flow. **Zero changes to LLM/prediction logic** — all your simulations and reports work identically to upstream.
+This fork adds **33 commits** focused on production stability, performance, and recovery flow. **Zero changes to LLM/prediction logic** — all your simulations and reports produce identical results to upstream.
 
 ### Major Improvements
 
@@ -48,6 +48,11 @@ This fork adds **21 commits** focused on production stability and recovery flow.
 | **Report Agent** | Fix `ReportManager` `UnboundLocalError` + remove duplicate `save_report` | Report generation and chat no longer crash on common paths |
 | **Logging** | High-frequency `INFO` → `DEBUG` (3k+ lines/day → 0) | Cleaner backend console, easier debugging |
 | **Atomic I/O** | `os.replace` retry with exponential backoff (5 attempts) | Survives transient Windows file locks (OneDrive, AV scans) |
+| **Phase 2 — Async Profile Gen** | `AsyncOpenAI` profile generation with concurrency=40 | ~3× faster Step2 profile batch (does not block event loop) |
+| **Phase 3 — Report Wave Parallel** | `REPORT_DEFAULT_WAVE_SIZE=2` (max 5) — generate N report sections per wave | Report generation ~2× faster with minimal coherence loss |
+| **Phase 4a — Graph Chunk Parallel** | `GRAPH_BUILDER_CHUNK_PARALLEL=3` — entity/relation extraction per chunk parallel | Step1 graph build ~3× faster on large seed corpora |
+| **Auto-Snapshot Resilience** | Periodic auto-snapshot every 5 rounds + keep last 3 | Long simulations no longer lose all progress on backend crash mid-run |
+| **Profile Meta Endpoint** | New `/api/simulation/<id>/profiles/meta` returns only count + mtime | Frontend high-frequency polling no longer re-parses full JSON every tick |
 
 ### Full Commit List
 
@@ -80,7 +85,16 @@ dd9801b  perf(frontend): Process.vue console.log 降为 console.debug
 
 # 2 docs cleanups
 f606a82  docs(simulation): 修正 cleanup_simulation_logs docstring
+
+# 1 Phase 2-4a performance batch
+fd9d5c3  perf(phase2-4a): 异步 profile 生成 + 报告波次并行 + 图谱 chunk 并行 + profile meta 接口
+
+# 2 README rewrites for this fork
+0a84c77  docs(readme): 替换占位符为 fork 维护者
+55caa4a  docs(readme): 重写 README for MiroFish-Pro fork
 ```
+
+> Total fork-specific commits: **33** (stability + UX + Phase 2-4a perf + auto-snapshot)
 
 ---
 
@@ -150,7 +164,7 @@ From serious predictions to playful simulations, every "what if" sees its outcom
 ### 1. Clone & Configure
 
 ```bash
-git clone https://github.com/Hdwing/MiroFish-Pro.git
+git clone https://github.com/Tena-Sen/MiroFish-Pro.git
 cd MiroFish-Pro
 
 # Copy the example configuration file
@@ -226,6 +240,10 @@ Ports: `3000` (frontend) / `5001` (backend).
 | Multiple `final_*` snapshots (re-runs) | ⚠️ auto-picks latest created_at | ✅ user selects by round |
 | Backend restart during simulation | ⚠️ env_status stale 60s+ | ✅ process check catches immediately |
 | Want raw upstream + latest features | ✅ (sync upstream) | (fork may lag) |
+| Large seed corpus (slow Step1 graph build) | ⚠️ chunk-serial entity extraction | ✅ `GRAPH_BUILDER_CHUNK_PARALLEL=3` (Phase 4a) |
+| Many profiles in Step2 (slow persona gen) | ⚠️ ThreadPool blocks event loop | ✅ AsyncOpenAI concurrency=40 (Phase 2) |
+| Long Step4 reports (10+ sections) | ⚠️ fully serial | ✅ wave size 2-5 (Phase 3) |
+| Want auto-snapshot during long runs | ⚠️ manual only | ✅ auto every 5 rounds + keep last 3 |
 
 If you value **predictable recovery from long-running simulations**, this fork is for you.
 
@@ -235,7 +253,7 @@ If you value **predictable recovery from long-running simulations**, this fork i
 
 ### Fork-specific Improvements
 
-All 21 commits in this fork are about **stability and UX**, not feature additions. To sync with upstream:
+All 33 commits in this fork are about **stability, UX, and performance** (Phase 2-4a) — never changes LLM/prediction logic. To sync with upstream:
 
 ```bash
 # Add upstream as a remote (one-time)
@@ -277,7 +295,7 @@ This project inherits the upstream MiroFish license. Please refer to the origina
 
 MiroFish's simulation engine is powered by **[OASIS (Open Agent Social Interaction Simulations)](https://github.com/camel-ai/oasis)**. We sincerely thank the CAMEL-AI team for their open-source contributions!
 
-The 21 stability improvements in this fork were developed independently by the MiroFish-Pro maintainer.
+The 33 stability + performance improvements in this fork were developed independently by the MiroFish-Pro maintainer.
 
 ---
 

@@ -24,6 +24,22 @@
 
 </div>
 
+---
+
+> **📌 公告 / Notice**
+>
+> 本仓库（`MiroFish-Pro`）是 [MiroFish](https://github.com/666ghj/MiroFish) 项目的**社区分叉版本**，专注于**稳定性修复、快照恢复、Step5 UX 改进、Phase 2-4a 性能优化**。
+>
+> - **原作者**：[666ghj](https://github.com/666ghj) & [盛大集团](https://www.shanda.com/)
+> - **源仓库**：[github.com/666ghj/MiroFish](https://github.com/666ghj/MiroFish)
+> - **本仓库**：[github.com/Tena-Sen/MiroFish-Pro](https://github.com/Tena-Sen/MiroFish-Pro)
+>
+> ⭐ 原始设计、愿景和核心引擎的所有功劳归原作者所有。请到原仓库 star 表示支持。
+>
+> 详细改进列表请看 [English README](./README.md#-whats-different-from-upstream)。
+
+---
+
 ## ⚡ 项目概述
 
 **MiroFish** 是一款基于多智能体技术的新一代 AI 预测引擎。通过提取现实世界的种子信息（如突发新闻、政策草案、金融信号），自动构建出高保真的平行数字世界。在此空间内，成千上万个具备独立人格、长期记忆与行为逻辑的智能体进行自由交互与社会演化。你可透过「上帝视角」动态注入变量，精准推演未来走向——**让未来在数字沙盘中预演，助决策在百战模拟后胜出**。
