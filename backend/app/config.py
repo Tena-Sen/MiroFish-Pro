@@ -77,7 +77,13 @@ class Config:
     SIMULATION_AUTO_SNAPSHOT_INTERVAL_ROUNDS = int(os.environ.get('SIMULATION_AUTO_SNAPSHOT_INTERVAL_ROUNDS', '5'))
     # 仅保留最近 K 个 auto 快照（手动快照永不自动清理）
     SIMULATION_AUTO_SNAPSHOTS_KEEP = int(os.environ.get('SIMULATION_AUTO_SNAPSHOTS_KEEP', '3'))
-    
+
+    # Agent persona 缓存（chat-only 启动加速用）
+    # 把 user_info + available_actions 落到磁盘 json,跳过 320 个 SocialAgent 重新实例化
+    AGENT_CACHE_ENABLED = os.environ.get('AGENT_CACHE_ENABLED', 'true').lower() == 'true'
+    AGENT_CACHE_TTL_DAYS = int(os.environ.get('AGENT_CACHE_TTL_DAYS', '7'))
+    AGENT_CACHE_MAX_PER_SIM = int(os.environ.get('AGENT_CACHE_MAX_PER_SIM', '3'))
+
     # OASIS平台可用动作配置
     OASIS_TWITTER_ACTIONS = [
         'CREATE_POST', 'LIKE_POST', 'REPOST', 'FOLLOW', 'DO_NOTHING', 'QUOTE_POST'
@@ -97,8 +103,56 @@ class Config:
     def validate(cls) -> list[str]:
         """验证必要配置"""
         errors: list[str] = []
+
+        # === 必填项 ===
         if not cls.LLM_API_KEY:
             errors.append("LLM_API_KEY 未配置")
         # ZEP_API_KEY 不再是必需项（已切换为本地图谱存储）
+
+        # === 占位符 / 格式校验（防踩隐形坑） ===
+        # 触发条件: 用户在 .env 里写了占位符、值带前后空白、或 URL 路径异常
+        # 这些都会原样进 os.environ,被 OpenAI SDK 当成真实值发出去
+        # 表现: 404 page not found / 403 authorization failed / "model not found" 等
+        # 难定位,所以在启动时直接 fail-fast
+        suspicious_patterns = (
+            "__TODO__", "TODO", "YOUR-API-KEY", "YOUR_KEY",
+            "FILL-IN", "REPLACE-ME", "PLEASE-FILL", "XXXXX",
+            "填写", "替换", "请填", "占位",
+        )
+
+        def _check(name: str, value: str | None, *, allow_empty: bool = False) -> None:
+            """单字段校验：占位符 / 前后空白 / 空值"""
+            if value is None or value == "":
+                if allow_empty:
+                    return
+                errors.append(f"{name} 未配置")
+                return
+            if value != value.strip():
+                # python-dotenv 不会自动 strip,值带前/后空格会原样读进来
+                errors.append(f"{name} 包含前后空白字符: {value!r}")
+            upper = value.upper()
+            for pat in suspicious_patterns:
+                if pat.upper() in upper:
+                    errors.append(
+                        f"{name} 看起来是占位符 ({pat!r})，"
+                        f"未真实填写: {value!r}"
+                    )
+                    break
+
+        # 通用 LLM_* 必须填
+        _check("LLM_API_KEY", cls.LLM_API_KEY)
+        _check("LLM_BASE_URL", cls.LLM_BASE_URL)
+        _check("LLM_MODEL_NAME", cls.LLM_MODEL_NAME)
+
+        # BOOST_* 允许空（fallback 到通用 LLM_*），但填了就要合法
+        for name in (
+            "LLM_BOOST_API_KEY",
+            "LLM_BOOST_BASE_URL",
+            "LLM_BOOST_MODEL_NAME",
+        ):
+            v = os.environ.get(name, "")
+            if v.strip():
+                _check(name, v)
+
         return errors
 

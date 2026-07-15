@@ -9,6 +9,7 @@ OASIS Agent Profile生成器
 """
 
 import json
+import os
 import random
 import time
 import asyncio
@@ -1305,20 +1306,35 @@ class OasisProfileGenerator:
     ):
         """
         保存Profile到文件（根据平台选择正确格式）
-        
+
         OASIS平台格式要求：
         - Twitter: CSV格式
         - Reddit: JSON格式
-        
+
         Args:
             profiles: Profile列表
             file_path: 文件路径
             platform: 平台类型 ("reddit" 或 "twitter")
+
+        Side effect: 写完 profile 后会失效 sim_dir/agent_cache/ 下所有缓存,
+        确保下一次启动子进程会重新构造 SocialAgent 而不是用旧 cache (因为
+        profile 内容已经变了)。
         """
         if platform == "twitter":
             self._save_twitter_csv(profiles, file_path)
         else:
             self._save_reddit_json(profiles, file_path)
+
+        # Agent persona 缓存失效:profile 内容变了,旧 cache 不再生效
+        # 失败只 log,不阻断主流程
+        try:
+            from .agent_cache_manager import AgentCacheManager
+            simulation_dir = os.path.dirname(os.path.abspath(file_path))
+            deleted = AgentCacheManager.invalidate_sim_cache(simulation_dir)
+            if deleted:
+                logger.info(f"Profile 重生成后失效 {deleted} 个 agent cache ({platform}, sim_dir={simulation_dir})")
+        except Exception as e:
+            logger.warning(f"profile 重生成后失效 agent cache 失败 (继续): {e}")
     
     def _save_twitter_csv(self, profiles: List[OasisAgentProfile], file_path: str):
         """

@@ -507,6 +507,7 @@ class SimulationRunner:
         enable_graph_memory_update: bool = False,  # 是否将活动更新到Zep图谱
         graph_id: str = None,  # Zep图谱ID（启用图谱更新时必需）
         start_round: int = 0,  # 从指定轮次开始（用于快照恢复后继续）
+        chat_only: bool = False,  # 仅 chat 模式:跳过 rounds,直接进 IPC wait,agent 加载照常
     ) -> SimulationRunState:
         """
         启动模拟
@@ -518,13 +519,14 @@ class SimulationRunner:
             enable_graph_memory_update: 是否将Agent活动动态更新到Zep图谱
             graph_id: Zep图谱ID（启用图谱更新时必需）
             start_round: 从指定轮次开始（0=从头开始）
+            chat_only: 仅 chat 模式（True 时忽略 rounds,起子进程后直接进 IPC wait）
 
         Returns:
             SimulationRunState
         """
         try:
             return cls._start_simulation_impl(
-                simulation_id, platform, max_rounds, enable_graph_memory_update, graph_id, start_round
+                simulation_id, platform, max_rounds, enable_graph_memory_update, graph_id, start_round, chat_only
             )
         except (ValueError, KeyError):
             raise
@@ -541,8 +543,9 @@ class SimulationRunner:
         enable_graph_memory_update: bool,
         graph_id: str,
         start_round: int,
+        chat_only: bool = False,
     ) -> SimulationRunState:
-        logger.info(f"_start_simulation_impl 开始: simulation_id={simulation_id}, platform={platform}, start_round={start_round}, max_rounds={max_rounds}")
+        logger.info(f"_start_simulation_impl 开始: simulation_id={simulation_id}, platform={platform}, start_round={start_round}, max_rounds={max_rounds}, chat_only={chat_only}")
 
         # 加载模拟配置
         sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
@@ -560,6 +563,15 @@ class SimulationRunner:
         total_hours = time_config.get("total_simulation_hours", 72)
         minutes_per_round = time_config.get("minutes_per_round", 30)
         total_rounds = int(total_hours * 60 / minutes_per_round)
+
+        # chat-only 模式:把 start_round 提到 total_rounds,让下游 for 循环空跑直接进 IPC wait。
+        # 只在用户没显式给 start_round 的情况下覆盖(避免跟快照恢复冲突)。
+        if chat_only and start_round <= 0:
+            start_round = total_rounds
+            logger.info(
+                f"chat-only 模式：effective_start_round = total_rounds = {start_round},"
+                f"子进程 rounds loop 将空跑,直接进入 IPC wait"
+            )
 
         # 记录起始轮次
         actual_start_round = 0
@@ -1987,7 +1999,7 @@ class SimulationRunner:
         simulation_id: str,
         interviews: List[Dict[str, Any]],
         platform: str = None,
-        timeout: float = 120.0
+        timeout: float = 30.0   # 修 #31:从 120s 降到 30s,auto-offline fallback 兜底(总等待 ≤30s)
     ) -> Dict[str, Any]:
         """
         批量采访多个Agent

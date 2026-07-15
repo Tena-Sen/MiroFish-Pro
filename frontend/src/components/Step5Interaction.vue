@@ -198,6 +198,14 @@
           <!-- 恢复期进度由独立的大 banner 接管 (.restart-progress-area),这里不再放小转圈避免双转圈 -->
         </div>
 
+        <!-- 重启成功短暂 banner —— 让用户明确知道"已启动" -->
+        <Transition name="restart-success">
+          <div v-if="showRestartSuccess" class="restart-success-banner">
+            <span class="restart-success-icon">✓</span>
+            <span class="restart-success-text">{{ $t('step5.envRestartSuccessBanner') }}</span>
+          </div>
+        </Transition>
+
         <!-- 恢复期进度区：picker 与大型 progress banner 互斥 -->
         <!-- 设计意图:让用户在 picker 中点击后立刻看到大型 banner,绝不可能错过进度反馈 -->
         <div v-if="props.simulationId && isRestarting" class="restart-progress-area">
@@ -205,6 +213,14 @@
           <div v-if="showSnapshotPicker && availableSnapshots.length > 0" class="snapshot-picker">
             <div class="snapshot-picker-title">{{ $t('step5.snapshotPickerTitle') }}</div>
             <div class="snapshot-picker-hint">{{ $t('step5.snapshotPickerHint') }}</div>
+            <!-- 自动倒计时:5s 不选 → 自动 force fresh start,减少点击次数 -->
+            <div class="snapshot-picker-countdown">
+              <span class="countdown-dot"></span>
+              {{ $t('step5.snapshotPickerCountdown', { seconds: pickerCountdown }) }}
+              <button type="button" class="countdown-skip" @click="chooseFreshStart">
+                {{ $t('step5.snapshotPickerCountdownSkip') }}
+              </button>
+            </div>
             <div class="snapshot-picker-list">
               <div
                 v-for="snap in availableSnapshots"
@@ -417,6 +433,14 @@
                 <span v-if="isRestarting" class="loading-spinner-small"></span>
                 {{ isRestarting ? $t('step5.envRestarting') : $t('step5.envStoppedAction') }}
               </button>
+              <button
+                type="button"
+                class="chat-stopped-btn chat-stopped-btn-secondary"
+                :disabled="isRestarting"
+                @click="handleChatOnlyStart"
+              >
+                {{ $t('step5.envStoppedChatOnlyBtn') }}
+              </button>
             </div>
             <div class="chat-input-row">
               <textarea
@@ -428,6 +452,39 @@
                 rows="1"
                 ref="chatInputRef"
               ></textarea>
+              <!-- 平台选择器: "都问 / 只问 Reddit / 只问 Twitter",默认 both 保留现有行为 -->
+              <div class="platform-selector" role="radiogroup" :aria-label="t('step5.platformLabel')">
+                <button
+                  type="button"
+                  class="platform-pill"
+                  :class="{ active: selectedPlatform === 'both' }"
+                  :aria-pressed="selectedPlatform === 'both'"
+                  :disabled="envStatus === 'stopped' && !envStatusLoading"
+                  @click="selectedPlatform = 'both'"
+                >
+                  {{ t('step5.platformBoth') }}
+                </button>
+                <button
+                  type="button"
+                  class="platform-pill"
+                  :class="{ active: selectedPlatform === 'reddit' }"
+                  :aria-pressed="selectedPlatform === 'reddit'"
+                  :disabled="envStatus === 'stopped' && !envStatusLoading"
+                  @click="selectedPlatform = 'reddit'"
+                >
+                  {{ t('step5.platformReddit') }}
+                </button>
+                <button
+                  type="button"
+                  class="platform-pill"
+                  :class="{ active: selectedPlatform === 'twitter' }"
+                  :aria-pressed="selectedPlatform === 'twitter'"
+                  :disabled="envStatus === 'stopped' && !envStatusLoading"
+                  @click="selectedPlatform = 'twitter'"
+                >
+                  {{ t('step5.platformTwitter') }}
+                </button>
+              </div>
               <button
                 class="send-btn"
                 @click="sendMessage"
@@ -506,6 +563,48 @@
               >
                 <span v-if="isRestarting" class="loading-spinner-small"></span>
                 {{ isRestarting ? $t('step5.envRestarting') : $t('step5.envStoppedAction') }}
+              </button>
+              <button
+                type="button"
+                class="chat-stopped-btn chat-stopped-btn-secondary"
+                :disabled="isRestarting"
+                @click="handleChatOnlyStart"
+              >
+                {{ $t('step5.envStoppedChatOnlyBtn') }}
+              </button>
+            </div>
+
+            <!-- 平台选择器:与 chat 共用 selectedPlatform,语义一致 -->
+            <div class="platform-selector platform-selector-survey" role="radiogroup" :aria-label="t('step5.platformLabel')">
+              <button
+                type="button"
+                class="platform-pill"
+                :class="{ active: selectedPlatform === 'both' }"
+                :aria-pressed="selectedPlatform === 'both'"
+                :disabled="envStatus === 'stopped' && !envStatusLoading"
+                @click="selectedPlatform = 'both'"
+              >
+                {{ t('step5.platformBoth') }}
+              </button>
+              <button
+                type="button"
+                class="platform-pill"
+                :class="{ active: selectedPlatform === 'reddit' }"
+                :aria-pressed="selectedPlatform === 'reddit'"
+                :disabled="envStatus === 'stopped' && !envStatusLoading"
+                @click="selectedPlatform = 'reddit'"
+              >
+                {{ t('step5.platformReddit') }}
+              </button>
+              <button
+                type="button"
+                class="platform-pill"
+                :class="{ active: selectedPlatform === 'twitter' }"
+                :aria-pressed="selectedPlatform === 'twitter'"
+                :disabled="envStatus === 'stopped' && !envStatusLoading"
+                @click="selectedPlatform = 'twitter'"
+              >
+                {{ t('step5.platformTwitter') }}
               </button>
             </div>
 
@@ -597,6 +696,8 @@ const isRestarting = ref(false)
 const restartMode = ref(null) // 'restore' | 'fresh' | null
 const showSnapshotPicker = ref(false)  // 多快照选择器展开状态
 const availableSnapshots = ref([])  // 可恢复的快照列表
+const pickerCountdown = ref(5)         // 倒计时:5s 不选 → 自动 force fresh start
+let pickerCountdownTimer = null       // 倒计时句柄
 // 恢复阶段：'idle' | 'listing' | 'picking' | 'restoring' | 'starting' | 'waiting_alive'
 // 用于 env-status-bar 显示阶段文案 + 进度 banner
 const recoveryStage = ref('idle')
@@ -620,6 +721,44 @@ const stageInfo = computed(() => {
     default:              return { key: 'step5.envRestarting', params: {} }
   }
 })
+
+// 倒计时逻辑:picker 弹出后 5s 不选 → 自动 force fresh start
+// 用户报"每次要点 2 次",这是减少点击次数的最直接办法
+const stopPickerCountdown = () => {
+  if (pickerCountdownTimer) {
+    clearInterval(pickerCountdownTimer)
+    pickerCountdownTimer = null
+  }
+}
+
+watch(showSnapshotPicker, (isShown) => {
+  if (isShown) {
+    pickerCountdown.value = 5
+    stopPickerCountdown()
+    pickerCountdownTimer = setInterval(() => {
+      pickerCountdown.value -= 1
+      if (pickerCountdown.value <= 0) {
+        stopPickerCountdown()
+        // 自动走 fresh start 流程
+        chooseFreshStart()
+      }
+    }, 1000)
+  } else {
+    stopPickerCountdown()
+    pickerCountdown.value = 5  // 重置,下次显示时重新倒计时
+  }
+})
+
+// 重启成功后短暂显示绿色 banner,给用户明确"已启动"反馈
+const showRestartSuccess = ref(false)
+let successTimer = null
+const flashRestartSuccess = () => {
+  showRestartSuccess.value = true
+  if (successTimer) clearTimeout(successTimer)
+  successTimer = setTimeout(() => {
+    showRestartSuccess.value = false
+  }, 4000)
+}
 
 // step5 的辅助:从 snapshot 对象里提取当前轮次
 const getSnapshotRound = (snap) => {
@@ -709,6 +848,25 @@ const handleEnvStoppedAction = async () => {
     recoveryStage.value = 'idle'
     showSnapshotPicker.value = false
     availableSnapshots.value = []
+  }
+}
+
+// 用户点 "Chat-Only" 按钮：跳过 rounds 直接进 IPC wait,只适合只想 chat 不想要完整 simulation 的场景。
+// 不走 snapshot picker,直接走 freshStart 路径(后端翻译成 start_round=total_rounds)。
+const handleChatOnlyStart = async () => {
+  if (!props.simulationId || isRestarting.value) return
+  isRestarting.value = true
+  addLog(t('step5.envStoppedChatOnlyHint'))
+  try {
+    const ok = await doFreshStart({ chatOnly: true })
+    if (!ok) {
+      addLog(t('step5.envStoppedChatOnlyFailed'))
+    }
+  } catch (err) {
+    addLog(t('step5.envStoppedChatOnlyFailed', { error: err.message || '' }))
+  } finally {
+    // doFreshStart 已通过 waitForEnvAlive 路径或直接失败路径内部重置;这里再保险一遍
+    isRestarting.value = false
   }
 }
 
@@ -807,6 +965,7 @@ const resetRestartState = () => {
 // 返回:true = env 已 alive(成功),false = 后端/超时失败
 const doFreshStart = async (opts = {}) => {
   const startRound = opts.startRound ?? 0
+  const chatOnly = opts.chatOnly ?? false
   restartMode.value = 'fresh'
   recoveryStage.value = 'starting'
   addLog(t('step5.envFreshTriggered'))
@@ -815,7 +974,8 @@ const doFreshStart = async (opts = {}) => {
     platform: 'parallel',
     force: true,
     start_round: startRound,  // 0 = 正常从头;3 = 跳过 R0/R1/R2
-    enable_graph_memory_update: true
+    enable_graph_memory_update: true,
+    chat_only: chatOnly        // True 时后端把 start_round 提到 total_rounds,跳过 rounds 直接进 IPC wait
   })
   if (res.success) {
     recoveryStage.value = 'waiting_alive'
@@ -837,6 +997,7 @@ const waitForEnvAlive = async (maxWaitSec = 30) => {
     await refreshEnvStatus()
     if (envStatus.value === 'alive') {
       addLog(t('step5.envRestartSuccess'))
+      flashRestartSuccess()  // ← 短暂绿色 banner,用户能直观看到"已启动"
       resetRestartState()
       return true
     }
@@ -891,6 +1052,10 @@ const selectedAgents = ref(new Set())
 const surveyQuestion = ref('')
 const surveyResults = ref([])
 const isSurveying = ref(false)
+// 平台选择器：'both' = 两个平台都问(默认,后端 fan-out,twitter+reddit 各一次 LLM),
+// 'reddit' / 'twitter' = 只问一个平台(sendToAgent / submitSurvey 都会透传到后端)。
+// 默认 'both' 与历史行为完全一致,不会改变现有用户的体验。
+const selectedPlatform = ref('both')
 
 // Report Data
 const reportOutline = ref(null)
@@ -1180,11 +1345,16 @@ const sendToAgent = async (message) => {
       .slice(-6)
       .map(msg => `${msg.role === 'user' ? '提问者' : '你'}：${msg.content}`)
       .join('\n')
-    prompt = `以下是我们之前的对话：\n${historyContext}\n\n现在我的新问题是：${message}`
+    // 追加反 preamble 指令:MiniMax/Qwen 系模型倾向在 answer 之前写
+    // "让我思考一下..." 元描述,挤掉真正的回答;在用户问题最后追加直接指令。
+    prompt = `以下是我们之前的对话：\n${historyContext}\n\n现在我的新问题是：${message}（请仅给出最终回答,不要任何"让我思考/我需要分析"等前言）`
   }
   
   const res = await interviewAgents({
     simulation_id: props.simulationId,
+    // 透传平台选择:'both' 时传 null,后端默认 fan-out 双平台;
+    // 'reddit'/'twitter' 时传具体平台,后端只跑那一个,响应时间减半。
+    platform: selectedPlatform.value === 'both' ? null : selectedPlatform.value,
     interviews: [{
       agent_id: selectedAgentIndex.value,
       prompt: prompt
@@ -1197,36 +1367,40 @@ const sendToAgent = async (message) => {
     const resultData = res.data.result || res.data
     const resultsDict = resultData.results || resultData
 
-    // 将对象字典转换为数组，查找当前 Agent 的回复
+    // 将对象字典转换为结果对象，查找当前 Agent 的回复
+    // 修复 "agentResult is not defined" — 把 agentResult 提到分支外,保证
+    // 任意分支(对象/数组/缺失)都能在后面的 error 透传里安全引用。
+    // 之前 let agentResult 在 if 块级作用域内,Array 分支走完后引用即 ReferenceError。
     let responseContent = null
+    let agentResult = null
     const agentId = selectedAgentIndex.value
 
-    if (typeof resultsDict === 'object' && !Array.isArray(resultsDict)) {
+    if (typeof resultsDict === 'object' && resultsDict !== null && !Array.isArray(resultsDict)) {
       // 尝试多种可能的 key 格式
       const possibleKeys = [
         `reddit_${agentId}`,
         `twitter_${agentId}`,
         `both_${agentId}`
       ]
-      let agentResult = null
       for (const key of possibleKeys) {
         if (resultsDict[key]) {
           agentResult = resultsDict[key]
           break
         }
       }
-      // 如果没找到特定 key，取第一个可用结果
-      if (!agentResult) {
+      // 如果没找到特定 key，取第一个可用结果(空对象跳过,避免 agentResult=undefined)
+      if (!agentResult && Object.keys(resultsDict).length > 0) {
         agentResult = Object.values(resultsDict)[0]
       }
       if (agentResult) {
         responseContent = agentResult.response || agentResult.answer
       }
     } else if (Array.isArray(resultsDict) && resultsDict.length > 0) {
-      // 兼容数组格式
-      responseContent = resultsDict[0].response || resultsDict[0].answer
+      // 兼容数组格式 — 同步保存到 agentResult,后续 error 分支也能正常引用
+      agentResult = resultsDict[0]
+      responseContent = agentResult.response || agentResult.answer
     }
-    
+
     if (responseContent) {
       chatHistory.value.push({
         role: 'assistant',
@@ -1238,9 +1412,19 @@ const sendToAgent = async (message) => {
         addLog(t('log.offlineInterviewMode'))
       }
       addLog(t('log.agentReplied', { name: selectedAgent.value.username }))
+    } else if (agentResult && agentResult.error) {
+      // 后端 IPC handler 已经把异常写成 result.error,这里显式告诉用户
+      throw new Error(
+        `Agent ${selectedAgent.value.username} 回应失败(${agentResult.error_type || 'unknown'}): ${agentResult.error}`
+      )
     } else {
       throw new Error(t('step5.noResponse'))
     }
+  } else if (res.status === 409 || res.data?.busy) {
+    // 后端检测到 rounds 还没跑完,直接返 409,前端友好提示
+    const cur = res.data?.current_round ?? '?'
+    const tot = res.data?.total_rounds ?? '?'
+    throw new Error(t('step5.envStoppedBusyHint', { current: cur, total: tot }))
   } else {
     const errorMsg = res.error || t('step5.requestFailed')
     if (isEnvNotRunningError(errorMsg)) {
@@ -1299,6 +1483,8 @@ const submitSurvey = async () => {
     
     const res = await interviewAgents({
       simulation_id: props.simulationId,
+      // 透传平台选择(同 sendToAgent)。survey 是 batch interview,顶层 platform 一并透传
+      platform: selectedPlatform.value === 'both' ? null : selectedPlatform.value,
       interviews: interviews
     })
     
@@ -2695,6 +2881,18 @@ onUnmounted(() => {
   cursor: not-allowed;
 }
 
+/* Chat-Only 次级按钮:跟主按钮并排,视觉权重稍低,提示用户"轻量启动"选项 */
+.chat-stopped-btn-secondary {
+  background: #FFFFFF;
+  color: #FF6F00;
+  border: 1px solid #FFB74D;
+}
+.chat-stopped-btn-secondary:hover:not(:disabled) {
+  background: #FFF3E0;
+  border-color: #FF6F00;
+  color: #E65100;
+}
+
 .chat-input {
   flex: 1;
   padding: 12px 16px;
@@ -2738,6 +2936,57 @@ onUnmounted(() => {
 .send-btn:disabled {
   background: #E5E7EB;
   color: #9CA3AF;
+  cursor: not-allowed;
+}
+
+/* 平台选择器:三个 pill 横排,放 chat 输入行内 + survey 提交按钮上方 */
+.platform-selector {
+  display: inline-flex;
+  gap: 4px;
+  padding: 3px;
+  background: #F3F4F6;
+  border: 1px solid #E5E7EB;
+  border-radius: 8px;
+  flex-shrink: 0;
+  align-self: flex-end;
+  margin-bottom: 4px;
+}
+
+.platform-selector-survey {
+  align-self: flex-start;
+  margin-bottom: 0;
+  margin-top: 4px;
+}
+
+.platform-pill {
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  background: transparent;
+  color: #6B7280;
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+  font-family: inherit;
+  line-height: 1.4;
+}
+
+.platform-pill:hover:not(:disabled):not(.active) {
+  background: #FFFFFF;
+  color: #1F2937;
+}
+
+.platform-pill.active {
+  background: #1F2937;
+  color: #FFFFFF;
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+
+.platform-pill:disabled {
+  opacity: 0.5;
   cursor: not-allowed;
 }
 
@@ -3237,6 +3486,97 @@ onUnmounted(() => {
   color: #666;
   margin-bottom: 8px;
   font-size: 11px;
+}
+
+/* 自动倒计时 banner —— 5s 不选就自动 force fresh,减少点击次数 */
+.snapshot-picker-countdown {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: #FFF8E1;
+  border: 1px solid #FFE082;
+  border-radius: 4px;
+  margin-bottom: 10px;
+  font-size: 11px;
+  color: #E65100;
+  font-weight: 500;
+}
+
+.snapshot-picker-countdown .countdown-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #FF6F00;
+  animation: env-spin 1s linear infinite reverse;
+  flex-shrink: 0;
+}
+
+.snapshot-picker-countdown .countdown-skip {
+  margin-left: auto;
+  padding: 3px 10px;
+  background: #FF6F00;
+  color: #FFFFFF;
+  border: none;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.snapshot-picker-countdown .countdown-skip:hover {
+  background: #E65100;
+}
+
+/* 重启成功短暂绿色 banner —— 4s 自动消失 */
+.restart-success-banner {
+  margin: 0 16px 12px;
+  padding: 12px 16px;
+  background: linear-gradient(135deg, #E8F5E9 0%, #C8E6C9 100%);
+  border: 1px solid #81C784;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #2E7D32;
+  font-weight: 600;
+  font-size: 13px;
+  box-shadow: 0 2px 8px rgba(76, 175, 80, 0.15);
+}
+
+.restart-success-icon {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: #4CAF50;
+  color: #FFFFFF;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.restart-success-text {
+  flex: 1;
+}
+
+.restart-success-enter-active,
+.restart-success-leave-active {
+  transition: opacity 0.3s ease, transform 0.3s ease;
+}
+
+.restart-success-enter-from {
+  opacity: 0;
+  transform: translateY(-8px);
+}
+
+.restart-success-leave-to {
+  opacity: 0;
+  transform: translateY(-8px);
 }
 
 .snapshot-picker-list {

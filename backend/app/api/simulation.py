@@ -6,6 +6,7 @@ Step2: Zep实体读取与过滤、OASIS模拟准备与运行（全程自动化�
 import os
 import sys
 import json
+import re
 import traceback
 from datetime import datetime
 from typing import List, Dict, Any
@@ -24,9 +25,32 @@ from ..models.project import ProjectManager
 logger = get_logger('mirofish.api.simulation')
 
 
+def _strip_preamble_offline(text: str) -> str:
+    """离线采访回应削 preamble:与 run_parallel_simulation 内的 _strip_preamble 逻辑一致,只在 Flask 进程这份代码用"""
+    if not text:
+        return text
+    stripped = text.strip()
+    if not stripped:
+        return stripped
+    parts = re.split(r'\n\n+', stripped)
+    if len(parts) <= 1:
+        return stripped
+    for i, p in enumerate(parts):
+        p_strip = p.strip()
+        if not p_strip:
+            continue
+        if p_strip.startswith('我') and len(p_strip) >= 10:
+            kept = '\n\n'.join(parts[i:]).strip()
+            if len(kept) < len(stripped):
+                return kept
+            break
+    return stripped
+
+
 # Interview prompt 优化前缀
 # 添加此前缀可以避免Agent调用工具，直接用文本回复
-INTERVIEW_PROMPT_PREFIX = "结合你的人设、所有的过往记忆与行动，不调用任何工具直接用文本回复我："
+# 追加"不要元描述/思考/规划过程"压制模型 preamble(Qwen系/MiniMax 倾向输出一段'让我思考…')
+INTERVIEW_PROMPT_PREFIX = "结合你的人设、所有的过往记忆与行动，不调用任何工具直接用文本回复我。请只输出最终回答,不要任何分析、思考、规划前的解释段落："
 
 
 def optimize_interview_prompt(prompt: str) -> str:
@@ -190,20 +214,22 @@ def offline_interview_agents_batch(
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.8,
-                max_tokens=1024
+                max_tokens=512  # 缩到 512 强制模型精炼回答,避免冗长 preamble
             )
 
             # 构建结果
             platform_key = item_platform if item_platform else "both"
             result_key = f"{platform_key}_{agent_id}"
+            # 削 preamble(MiniMax/Qwen 倾向输出"让我思考"+ bullet 分析)
+            cleaned = _strip_preamble_offline(response)
             results[result_key] = {
                 "agent_id": agent_id,
-                "response": response,
+                "response": cleaned,
                 "platform": platform_key,
                 "username": agent_name,
                 "mode": "offline"
             }
-            logger.info(f"离线采访 Agent {agent_id} ({agent_name}) 完成")
+            logger.info(f"离线采访 Agent {agent_id} ({agent_name}) 完成({len(cleaned)} chars)")
 
         except Exception as e:
             errors.append(f"Agent {agent_id} 采访失败: {str(e)}")
@@ -1820,6 +1846,7 @@ def start_simulation():
         enable_graph_memory_update = data.get('enable_graph_memory_update', False)  # 可选：是否启用图谱记忆更新
         force = data.get('force', False)  # 可选：强制重新开始
         start_round = data.get('start_round', 0)  # 可选：从指定轮次开始（用于快照恢复后继续）
+        chat_only = data.get('chat_only', False)  # 可选：仅 chat 模式,跳过 rounds 直接进 IPC wait
 
         # 验证 max_rounds 参数
         if max_rounds is not None:
@@ -1938,7 +1965,7 @@ def start_simulation():
             
             logger.info(f"启用图谱记忆更新: simulation_id={simulation_id}, graph_id={graph_id}")
 
-        logger.info(f"准备启动模拟: simulation_id={simulation_id}, platform={platform}, start_round={start_round}, max_rounds={max_rounds}, enable_graph_memory_update={enable_graph_memory_update}")
+        logger.info(f"准备启动模拟: simulation_id={simulation_id}, platform={platform}, start_round={start_round}, max_rounds={max_rounds}, enable_graph_memory_update={enable_graph_memory_update}, chat_only={chat_only}")
 
         # 启动模拟
         run_state = SimulationRunner.start_simulation(
@@ -1947,7 +1974,8 @@ def start_simulation():
             max_rounds=max_rounds,
             enable_graph_memory_update=enable_graph_memory_update,
             graph_id=graph_id,
-            start_round=start_round
+            start_round=start_round,
+            chat_only=chat_only
         )
 
         logger.info(f"模拟启动成功: simulation_id={simulation_id}, runner_status={run_state.runner_status.value}")
@@ -1961,6 +1989,7 @@ def start_simulation():
             response_data['max_rounds_applied'] = max_rounds
         response_data['graph_memory_update_enabled'] = enable_graph_memory_update
         response_data['force_restarted'] = force_restarted
+        response_data['chat_only'] = chat_only
         if enable_graph_memory_update:
             response_data['graph_id'] = graph_id
         
@@ -2748,6 +2777,25 @@ def interview_agents_batch():
         # 检查环境状态
         env_alive = SimulationRunner.check_env_alive(simulation_id)
 
+        # 检查 rounds 是否还在跑(runner alive + current_round < total_rounds)
+        # 在这种状态下 IPC server 还没启动,chat 命令会一直排队等到超时;直接返 409 比假死友好
+        if env_alive:
+            try:
+                _rs = SimulationRunner.get_run_state(simulation_id)
+                if _rs and _rs.current_round < _rs.total_rounds and _rs.total_rounds > 0:
+                    logger.info(
+                        f"chat 被拒绝:rounds 还在跑({_rs.current_round}/{_rs.total_rounds})"
+                    )
+                    return jsonify({
+                        "success": False,
+                        "error": f"模拟世界正在跑第 {_rs.current_round}/{_rs.total_rounds} 轮,稍候再发起采访",
+                        "busy": True,
+                        "current_round": _rs.current_round,
+                        "total_rounds": _rs.total_rounds
+                    }), 409
+            except Exception as _busy_check_err:
+                logger.warning(f"busy 检查失败(继续走 IPC): {_busy_check_err}")
+
         # 优化每个采访项的prompt，添加前缀避免Agent调用工具
         optimized_interviews = []
         for interview in interviews:
@@ -2781,6 +2829,33 @@ def interview_agents_batch():
             "data": result,
             "mode": "online"  # 标记为在线模式
         })
+
+    except TimeoutError as e:
+        # 修 #30:IPC 超时(子进程无响应/卡死) → 自动 fallback 到 offline
+        # 之前用户必须再点一次重试才能触发离线模式,体验差
+        logger.warning(
+            f"批量Interview IPC 超时(超时={timeout}s),自动 fallback 到 offline 模式: "
+            f"simulation_id={simulation_id}, err={e}"
+        )
+        try:
+            result = offline_interview_agents_batch(
+                simulation_id=simulation_id,
+                interviews=optimized_interviews,
+                platform=platform
+            )
+            return jsonify({
+                "success": result.get("success", False),
+                "data": result,
+                "mode": "auto_offline",  # 标记是 IPC 失败后的 fallback
+                "warning": t('api.batchInterviewAutoOffline')
+            })
+        except Exception as offline_err:
+            logger.error(f"offline fallback 也失败: {offline_err}")
+            # 双失败 → 返回原始 504 错误
+            return jsonify({
+                "success": False,
+                "error": t('api.batchInterviewTimeout', error=str(e))
+            }), 504
 
     except ValueError as e:
         return jsonify({
