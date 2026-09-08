@@ -4,6 +4,7 @@ Report API路由
 """
 
 import os
+import re
 import traceback
 import threading
 from flask import request, jsonify, send_file
@@ -18,6 +19,31 @@ from ..utils.logger import get_logger
 from ..utils.locale import t, get_locale, set_locale
 
 logger = get_logger('mirofish.api.report')
+
+
+def _build_download_filename(report) -> str:
+    """
+    构建报告下载文件名：优先用报告标题（清洗文件系统非法字符），回退 report_id。
+
+    标题来源：outline.title →（生成中时也有大纲）markdown 首个 "# 标题" 行。
+    例："1984陕北：阶层惯性与实用主义" → "1984陕北_阶层惯性与实用主义.md"
+    """
+    title = ""
+    if report.outline and report.outline.title:
+        title = report.outline.title.strip()
+    if not title and report.markdown_content:
+        m = re.match(r'^#\s+(.+)$', report.markdown_content.strip(), re.MULTILINE)
+        if m:
+            title = m.group(1).strip()
+    if not title:
+        return f"{report.report_id}.md"
+    # Windows/macOS/Linux 文件名非法字符统一替换为下划线；压缩空白；去尾部点号
+    cleaned = re.sub(r'[\\/:*?"<>|\r\n\t]', '_', title)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip().rstrip('.')
+    cleaned = cleaned[:80]  # 防超长路径
+    if not cleaned:
+        return f"{report.report_id}.md"
+    return f"{cleaned}.md"
 
 
 # ============== 报告生成接口 ==============
@@ -479,7 +505,7 @@ def download_report(report_id: str):
         return send_file(
             buf,
             as_attachment=True,
-            download_name=f"{report_id}.md",
+            download_name=_build_download_filename(report),
             mimetype='text/markdown'
         )
 

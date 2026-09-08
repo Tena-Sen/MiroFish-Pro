@@ -554,12 +554,13 @@ const goBack = () => {
 }
 
 // 下载报告 Markdown：完成后为全文；生成中下载已生成章节（后端现场组装）
+// 文件名用报告标题（如 "1984陕北_阶层惯性与实用主义.md"），无标题回退 reportId
 const isDownloading = ref(false)
 const handleDownloadReport = async () => {
   if (isDownloading.value || !props.reportId) return
   isDownloading.value = true
   try {
-    await downloadReport(props.reportId)
+    await downloadReport(props.reportId, reportOutline.value?.title)
   } catch (err) {
     // 404 JSON 错误体也会以 blob 形式到达这里，尝试解析出后端错误信息
     let msg = err?.message || ''

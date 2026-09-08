@@ -1242,14 +1242,32 @@ def delete_simulation(simulation_id: str):
         # 直接构建目录路径（避免 _get_simulation_dir 创建空目录）
         sim_dir = os.path.join(manager.SIMULATION_DATA_DIR, simulation_id)
 
-        # 删除报告（如果有）
-        report_id = _get_report_id_for_simulation(simulation_id)
-        if report_id:
-            try:
-                ReportManager.delete_report(report_id)
-                logger.info(f"已删除报告: {report_id}")
-            except Exception as e:
-                logger.warning(f"删除报告失败: {e}")
+        # 删除所有关联报告（不止最新一份）：
+        # "重新生成报告"会在同一 simulation 下产生多份 report（旧 report 保留），
+        # 只删最新一份会残留旧报告（磁盘泄漏）。遍历 reports 目录全量清理。
+        deleted_reports = []
+        try:
+            reports_dir = os.path.join(os.path.dirname(__file__), '../../uploads/reports')
+            if os.path.exists(reports_dir):
+                for report_folder in os.listdir(reports_dir):
+                    report_path = os.path.join(reports_dir, report_folder)
+                    if not os.path.isdir(report_path):
+                        continue
+                    meta_file = os.path.join(report_path, "meta.json")
+                    if not os.path.exists(meta_file):
+                        continue
+                    try:
+                        with open(meta_file, 'r', encoding='utf-8') as f:
+                            meta = json.load(f)
+                        if meta.get("simulation_id") == simulation_id:
+                            if ReportManager.delete_report(meta.get("report_id")):
+                                deleted_reports.append(meta.get("report_id"))
+                    except Exception as e:
+                        logger.warning(f"删除报告 {report_folder} 失败: {e}")
+                if deleted_reports:
+                    logger.info(f"已删除 {len(deleted_reports)} 份关联报告: {deleted_reports}")
+        except Exception as e:
+            logger.warning(f"清理关联报告时出错: {e}")
 
         # 删除整个模拟数据目录
         if os.path.exists(sim_dir):
@@ -1263,6 +1281,24 @@ def delete_simulation(simulation_id: str):
                 logger.info(f"已清理空目录: {sim_dir}")
             except OSError:
                 pass  # 目录非空或无法删除，忽略
+
+        # 清理内存中的运行状态（类级 dict 残留会让 run-status API
+        # 在删除后仍返回该模拟的数据）
+        SimulationRunner.purge_run_state(simulation_id)
+
+        # 清理 run-status 稳态缓存中该模拟的所有条目
+        # （缓存为惰性初始化，见 get_run_status；未创建过则跳过）
+        global _run_status_cache
+        try:
+            _run_status_cache
+        except NameError:
+            pass
+        else:
+            stale_keys = [k for k in _run_status_cache if k and k[0] == simulation_id]
+            for k in stale_keys:
+                _run_status_cache.pop(k, None)
+            if stale_keys:
+                logger.info(f"已清理 run-status 缓存条目: {len(stale_keys)} 个")
 
         return jsonify({
             "success": True,

@@ -270,12 +270,35 @@ class SimulationRunner:
         """获取运行状态"""
         if simulation_id in cls._run_states:
             return cls._run_states[simulation_id]
-        
+
         # 尝试从文件加载
         state = cls._load_run_state(simulation_id)
         if state:
             cls._run_states[simulation_id] = state
         return state
+
+    @classmethod
+    def purge_run_state(cls, simulation_id: str) -> None:
+        """
+        从内存中彻底清除一个模拟的所有运行状态（删除推演时调用）。
+
+        清理类级 dict 中的残留条目（模拟停止/完成后这些结构不会自动清理）：
+        - _run_states / _processes / _action_queues / _monitor_threads
+        - _stdout_files / _stderr_files / _graph_memory_enabled
+
+        不删磁盘文件（调用方负责 rmtree 整个模拟目录）。
+        仅在进程确认不在运行时调用（delete_simulation 已保证 RUNNING 时拒绝删除）。
+        """
+        for registry in (
+            cls._run_states,
+            cls._processes,
+            cls._action_queues,
+            cls._monitor_threads,
+            cls._stdout_files,
+            cls._stderr_files,
+            cls._graph_memory_enabled,
+        ):
+            registry.pop(simulation_id, None)
     
     @classmethod
     def _load_run_state(cls, simulation_id: str) -> Optional[SimulationRunState]:
