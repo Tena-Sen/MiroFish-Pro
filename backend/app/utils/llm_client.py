@@ -25,6 +25,78 @@ def _is_unsupported_temperature_error(e: Exception) -> bool:
     return "'temperature'" in msg and ("not supported" in msg or "unsupported" in msg)
 
 
+def _parse_max_tokens_limit(e: Exception) -> Optional[int]:
+    """从服务商 400 错误信息中解析 max_tokens 允许的上限。
+
+    兼容两类报错格式：
+    - "Range of max_tokens should be [10, 2048]"（DeepSeek 等）
+    - "max_tokens must be at most 2048" / "maximum context length is 2048 tokens"
+
+    返回 None 表示不是 max_tokens 范围类错误。
+    """
+    msg = str(e)
+    if "max_tokens" not in msg.lower():
+        return None
+    # 格式1: [10, 2048]
+    m = re.search(r'\[\s*(\d+)\s*,\s*(\d+)\s*\]', msg)
+    if m:
+        return int(m.group(2))
+    # 格式2: at most / maximum / <= 2048
+    m = re.search(r'(?:at most|max(?:imum)?|no more than|<=|≤)\s*(\d+)', msg, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _create_with_fallbacks(create_fn, kwargs):
+    """同步调用 create_fn，遇到已知的参数兼容性问题自动降级重试。
+
+    处理两类问题：
+    1. temperature 不受支持（kimi-k3）→ 移除 temperature 后重试
+    2. max_tokens 超出服务商上限（部分模型限制 [10, 2048]）→ clamp 到上限重试
+    """
+    try:
+        return create_fn(**kwargs)
+    except Exception as e:
+        if _is_unsupported_temperature_error(e):
+            logger.warning(f"模型不支持 temperature 参数，去掉后重试")
+            kwargs = {k: v for k, v in kwargs.items() if k != "temperature"}
+            try:
+                return create_fn(**kwargs)
+            except Exception as e2:
+                e = e2  # temperature 降级后仍失败，继续尝试 max_tokens 降级
+        limit = _parse_max_tokens_limit(e)
+        if limit is not None and limit >= 10 and kwargs.get("max_tokens", 0) > limit:
+            logger.warning(
+                f"服务商限制 max_tokens ≤ {limit}（原请求 {kwargs.get('max_tokens')}），降级重试"
+            )
+            kwargs = dict(kwargs, max_tokens=limit)
+            return create_fn(**kwargs)
+        raise
+
+
+async def _acreate_with_fallbacks(create_fn, kwargs):
+    """异步版 _create_with_fallbacks，降级逻辑完全一致。"""
+    try:
+        return await create_fn(**kwargs)
+    except Exception as e:
+        if _is_unsupported_temperature_error(e):
+            logger.warning(f"模型不支持 temperature 参数，去掉后重试")
+            kwargs = {k: v for k, v in kwargs.items() if k != "temperature"}
+            try:
+                return await create_fn(**kwargs)
+            except Exception as e2:
+                e = e2
+        limit = _parse_max_tokens_limit(e)
+        if limit is not None and limit >= 10 and kwargs.get("max_tokens", 0) > limit:
+            logger.warning(
+                f"服务商限制 max_tokens ≤ {limit}（原请求 {kwargs.get('max_tokens')}），降级重试"
+            )
+            kwargs = dict(kwargs, max_tokens=limit)
+            return await create_fn(**kwargs)
+        raise
+
+
 class LLMClient:
     """LLM客户端"""
     
@@ -75,16 +147,7 @@ class LLMClient:
         if response_format:
             kwargs["response_format"] = response_format
 
-        try:
-            response = self.client.chat.completions.create(**kwargs)
-        except Exception as e:
-            # 修复：部分模型（如 kimi-k3）不支持 temperature 参数，去掉后重试一次
-            if _is_unsupported_temperature_error(e):
-                logger.warning(f"模型 {self.model} 不支持 temperature 参数，去掉后重试")
-                kwargs.pop("temperature", None)
-                response = self.client.chat.completions.create(**kwargs)
-            else:
-                raise
+        response = _create_with_fallbacks(self.client.chat.completions.create, kwargs)
         content = response.choices[0].message.content
         # 部分模型（如MiniMax M2.5）会在content中包含<think>思考内容，需要移除
         content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
@@ -212,16 +275,7 @@ class LLMClientAsync:
         if response_format:
             kwargs["response_format"] = response_format
 
-        try:
-            response = await self.client.chat.completions.create(**kwargs)
-        except Exception as e:
-            # 修复：部分模型（如 kimi-k3）不支持 temperature 参数，去掉后重试一次
-            if _is_unsupported_temperature_error(e):
-                logger.warning(f"模型 {self.model} 不支持 temperature 参数，去掉后重试")
-                kwargs.pop("temperature", None)
-                response = await self.client.chat.completions.create(**kwargs)
-            else:
-                raise
+        response = await _acreate_with_fallbacks(self.client.chat.completions.create, kwargs)
         content = response.choices[0].message.content
         # 复用 LLMClient 的清理逻辑（保证输出一致）
         return re.sub(r'<think>[\s\S]*?</think>', '', content).strip()

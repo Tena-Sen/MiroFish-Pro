@@ -170,20 +170,26 @@
             <template v-else-if="envStatus === 'stopped'">{{ $t('step5.envStopped') }}</template>
             <template v-else>{{ $t('step5.envUnknown') }}</template>
           </span>
-          <!-- 一键恢复入口（智能判断：1+ 快照展示选择器，否则 force 重启） -->
-          <!-- 修复：v-if 改 v-show，避免 picker 展示或重启进行中按钮整段消失 -->
-          <button
-            v-show="envStatus === 'stopped' && !envStatusLoading && !showSnapshotPicker && !isRestarting"
-            class="env-status-action"
-            :disabled="isRestarting"
-            @click="handleEnvStoppedAction"
-            :title="$t('step5.envStoppedHint')"
-          >
-            <span v-if="isRestarting">{{ $t('step5.envRestarting') }}</span>
-            <span v-else-if="restartMode === 'restore'">{{ $t('step5.restoring') }}</span>
-            <span v-else-if="restartMode === 'fresh'">{{ $t('step5.freshStarting') }}</span>
-            <span v-else>{{ $t('step5.envStoppedAction') }}</span>
-          </button>
+          <!-- 环境停止时的唯一操作入口（主按钮:一键恢复）+ 次链接（仅对话模式） -->
+          <!-- 修复：此前 chat/survey 横幅里还各有一组重启按钮，同屏最多 3 个入口；现统一收敛到这里 -->
+          <template v-if="envStatus === 'stopped' && !envStatusLoading && !showSnapshotPicker && !isRestarting">
+            <button
+              class="env-status-action"
+              :disabled="isRestarting"
+              @click="handleEnvStoppedAction"
+              :title="$t('step5.envStoppedHint')"
+            >
+              {{ $t('step5.envStoppedAction') }}
+            </button>
+            <button
+              class="env-status-action-secondary"
+              :disabled="isRestarting"
+              @click="handleChatOnlyStart"
+              :title="$t('step5.envStoppedChatOnlyHint')"
+            >
+              {{ $t('step5.envStoppedChatOnlyBtn') }}
+            </button>
+          </template>
           <!-- 恢复期进度由独立的大 banner 接管 (.restart-progress-area),这里不再放小转圈避免双转圈 -->
         </div>
 
@@ -202,13 +208,10 @@
           <div v-if="showSnapshotPicker && availableSnapshots.length > 0" class="snapshot-picker">
             <div class="snapshot-picker-title">{{ $t('step5.snapshotPickerTitle') }}</div>
             <div class="snapshot-picker-hint">{{ $t('step5.snapshotPickerHint') }}</div>
-            <!-- 自动倒计时:5s 不选 → 自动 force fresh start,减少点击次数 -->
+            <!-- 自动倒计时:5s 不选 → 自动恢复轮次最高的快照（保守默认，绝不自动清数据重跑） -->
             <div class="snapshot-picker-countdown">
               <span class="countdown-dot"></span>
               {{ $t('step5.snapshotPickerCountdown', { seconds: pickerCountdown }) }}
-              <button type="button" class="countdown-skip" @click="chooseFreshStart">
-                {{ $t('step5.snapshotPickerCountdownSkip') }}
-              </button>
             </div>
             <div class="snapshot-picker-list">
               <div
@@ -227,12 +230,6 @@
               </div>
             </div>
             <div class="snapshot-picker-actions">
-              <button
-                class="snapshot-picker-btn fresh"
-                @click="chooseFreshStart"
-              >
-                {{ $t('step5.snapshotPickerFresh') }}
-              </button>
               <button
                 class="snapshot-picker-btn cancel"
                 @click="cancelPickSnapshot"
@@ -409,27 +406,10 @@
 
           <!-- Chat Input -->
           <div class="chat-input-area">
-            <!-- 模拟世界停止时,在输入框上方显眼的内嵌横幅 -->
+            <!-- 模拟世界停止时,在输入框上方的提示横幅(纯文字,操作统一走顶部状态栏) -->
             <div v-if="envStatus === 'stopped' && !envStatusLoading" class="chat-stopped-banner">
               <span class="chat-stopped-icon">⚠</span>
               <span class="chat-stopped-text">{{ $t('step5.envStoppedInlineHint') }}</span>
-              <button
-                type="button"
-                class="chat-stopped-btn"
-                :disabled="isRestarting"
-                @click="handleEnvStoppedAction"
-              >
-                <span v-if="isRestarting" class="loading-spinner-small"></span>
-                {{ isRestarting ? $t('step5.envRestarting') : $t('step5.envStoppedAction') }}
-              </button>
-              <button
-                type="button"
-                class="chat-stopped-btn chat-stopped-btn-secondary"
-                :disabled="isRestarting"
-                @click="handleChatOnlyStart"
-              >
-                {{ $t('step5.envStoppedChatOnlyBtn') }}
-              </button>
             </div>
             <div class="chat-input-row">
               <textarea
@@ -547,27 +527,10 @@
               ></textarea>
             </div>
 
-            <!-- 模拟停止时 survey 顶部也加 banner -->
+            <!-- 模拟停止时 survey 顶部提示横幅(纯文字,操作统一走顶部状态栏) -->
             <div v-if="envStatus === 'stopped' && !envStatusLoading" class="chat-stopped-banner">
               <span class="chat-stopped-icon">⚠</span>
               <span class="chat-stopped-text">{{ $t('step5.envStoppedInlineHint') }}</span>
-              <button
-                type="button"
-                class="chat-stopped-btn"
-                :disabled="isRestarting"
-                @click="handleEnvStoppedAction"
-              >
-                <span v-if="isRestarting" class="loading-spinner-small"></span>
-                {{ isRestarting ? $t('step5.envRestarting') : $t('step5.envStoppedAction') }}
-              </button>
-              <button
-                type="button"
-                class="chat-stopped-btn chat-stopped-btn-secondary"
-                :disabled="isRestarting"
-                @click="handleChatOnlyStart"
-              >
-                {{ $t('step5.envStoppedChatOnlyBtn') }}
-              </button>
             </div>
 
             <!-- 平台选择器:与 chat 共用 selectedPlatform,语义一致 -->
@@ -689,7 +652,6 @@ const refreshEnvStatus = async () => {
 // 同时把整条链路拆成可观察的阶段（listing / picking / restoring / starting / waiting_alive），
 // 在 env-status-bar 显示 spinner + 阶段文案，让前端始终有可见反馈
 const isRestarting = ref(false)
-const restartMode = ref(null) // 'restore' | 'fresh' | null
 const showSnapshotPicker = ref(false)  // 多快照选择器展开状态
 const availableSnapshots = ref([])  // 可恢复的快照列表
 const pickerCountdown = ref(5)         // 倒计时:5s 不选 → 自动 force fresh start
@@ -700,8 +662,7 @@ const recoveryStage = ref('idle')
 
 // 状态机式 picker：pickedSnapshot 由用户点击设置，由 watch 触发下游异步流程
 // 取代之前 Promise-based picker —— 避免 promise race / 用户看不见的状态变化
-const pickedSnapshot = ref(null)        // 当前正在恢复的快照（或 '__FRESH__' 或 null）
-const pendingSnapshotsForPicker = ref([])  // 暂存 listSnapshots 返回值，给 watch 选
+const pickedSnapshot = ref(null)        // 当前正在恢复的快照（或 null）
 // 当前正在恢复的快照名（给文案模板 {name} 用的）
 const restoringSnapshotName = ref('')
 
@@ -718,8 +679,9 @@ const stageInfo = computed(() => {
   }
 })
 
-// 倒计时逻辑:picker 弹出后 5s 不选 → 自动 force fresh start
-// 用户报"每次要点 2 次",这是减少点击次数的最直接办法
+// 倒计时逻辑:picker 弹出后 5s 不选 → 自动恢复 final_ 快照
+// 修复：原逻辑倒计时结束自动「全新启动」(force=true 清数据从 R0 重跑)，
+// 与「一键重启=恢复环境」语义相反且是破坏性操作；改为默认恢复 final_ 快照。
 const stopPickerCountdown = () => {
   if (pickerCountdownTimer) {
     clearInterval(pickerCountdownTimer)
@@ -735,8 +697,11 @@ watch(showSnapshotPicker, (isShown) => {
       pickerCountdown.value -= 1
       if (pickerCountdown.value <= 0) {
         stopPickerCountdown()
-        // 自动走 fresh start 流程
-        chooseFreshStart()
+        // 默认恢复 final_ 快照（完整跑完的世界状态）；
+        // 没有 final_ 才退回轮次最高的快照。picker 只在列表非空时显示，无需空兜底
+        const target = availableSnapshots.value.find(s => s.snapshot_name.startsWith('final_'))
+          || availableSnapshots.value[0]
+        chooseSnapshot(target)
       }
     }, 1000)
   } else {
@@ -787,19 +752,24 @@ const handleEnvStoppedAction = async () => {
       })
 
     availableSnapshots.value = meaningful
-    pendingSnapshotsForPicker.value = meaningful
 
     // Step 2：决定恢复路径
     if (meaningful.length === 0) {
-      // 0 个快照 → force 全新启动（不进入 picker）
-      recoveryStage.value = 'starting'
-      // 直接走 freshStart 流程
-      await doFreshStart()
+      // 0 个快照 → 无世界可恢复，退到 Chat-Only 模式（保留现有数据、不重跑轮次；
+      // 「全新启动=force 清数据重跑 Step3」已删除，重跑模拟属于 Step3 的职责）
+      const ok = await doChatOnlyStart()
+      if (!ok) addLog(t('step5.envStoppedChatOnlyFailed'))
       return
     }
 
-    // 1 个或多个快照 → 等待用户 picker 交互
-    // watcher(pickedSnapshot) 会接管后续：选了快照 → restore + start；选了 __FRESH__ → freshStart
+    // 仅 1 个快照 → 无需选择，直接恢复（消除"唯一选项还要点一次"的多余交互）
+    if (meaningful.length === 1) {
+      pickedSnapshot.value = meaningful[0]
+      return
+    }
+
+    // 多个快照 → 等待用户 picker 交互（5s 倒计时默认恢复 final_ 快照）
+    // watcher(pickedSnapshot) 会接管后续：选了快照 → restore + start
     recoveryStage.value = 'picking'
     showSnapshotPicker.value = true
     // 此处不阻塞。后台 watch 监控 pickedSnapshot 变化触发异步恢复
@@ -807,7 +777,6 @@ const handleEnvStoppedAction = async () => {
     addLog(t('step5.envRestartException', { error: err.message }))
     // 异常分支兜底复位
     isRestarting.value = false
-    restartMode.value = null
     recoveryStage.value = 'idle'
     showSnapshotPicker.value = false
     availableSnapshots.value = []
@@ -821,14 +790,14 @@ const handleChatOnlyStart = async () => {
   isRestarting.value = true
   addLog(t('step5.envStoppedChatOnlyHint'))
   try {
-    const ok = await doFreshStart({ chatOnly: true })
+    const ok = await doChatOnlyStart()
     if (!ok) {
       addLog(t('step5.envStoppedChatOnlyFailed'))
     }
   } catch (err) {
     addLog(t('step5.envStoppedChatOnlyFailed', { error: err.message || '' }))
   } finally {
-    // doFreshStart 已通过 waitForEnvAlive 路径或直接失败路径内部重置;这里再保险一遍
+    // doChatOnlyStart 已通过 waitForEnvAlive 路径或直接失败路径内部重置;这里再保险一遍
     isRestarting.value = false
   }
 }
@@ -840,12 +809,6 @@ const chooseSnapshot = (snapshot) => {
   pickedSnapshot.value = snapshot
 }
 
-// 用户在 picker 里点"全新启动"
-const chooseFreshStart = () => {
-  showSnapshotPicker.value = false
-  pickedSnapshot.value = '__FRESH__'
-}
-
 // 用户取消 picker
 const cancelPickSnapshot = () => {
   showSnapshotPicker.value = false
@@ -853,7 +816,6 @@ const cancelPickSnapshot = () => {
   // 重置整个恢复链
   pickedSnapshot.value = null
   isRestarting.value = false
-  restartMode.value = null
   recoveryStage.value = 'idle'
   addLog(t('step5.envRestoreCancelled'))
 }
@@ -867,19 +829,12 @@ watch(pickedSnapshot, async (newPick) => {
   pickedSnapshot.value = null
 
   try {
-    if (pick === '__FRESH__') {
-      recoveryStage.value = 'starting'
-      await doFreshStart()
-      return
-    }
-
     // 选了一个具体快照
     const targetSnapshot = pick
     addLog(t('step5.envRestoreChosen', { name: targetSnapshot.snapshot_name }))
     // Step 3:恢复选中的快照
     restoringSnapshotName.value = targetSnapshot.snapshot_name  // 给文案 {name} 用
     recoveryStage.value = 'restoring'
-    restartMode.value = 'restore'
     const restoreRes = await restoreSnapshot(props.simulationId, {
       snapshot_name: targetSnapshot.snapshot_name
     })
@@ -914,33 +869,27 @@ watch(pickedSnapshot, async (newPick) => {
 // 复位整个恢复状态 (成功/失败后都用)
 const resetRestartState = () => {
   isRestarting.value = false
-  restartMode.value = null
   recoveryStage.value = 'idle'
   restoringSnapshotName.value = ''
   showSnapshotPicker.value = false
   availableSnapshots.value = []
-  pendingSnapshotsForPicker.value = []
   pickedSnapshot.value = null
 }
 
-// force 全新启动（force=true 重置 + 可选 start_round 跳过开头几轮）
-// opts.startRound:默认 0(从 R0 开始); 设 3 时跳过 R0/R1/R2(用于"从头开始"按钮)
+// Chat-Only 启动：保留世界数据（DB/actions/run_state），跳过剩余轮次直接进 IPC wait。
+// 「全新启动」（force 清数据从 R0 重跑 Step3）已删除——重跑模拟属于 Step3 的职责。
 // 返回:true = env 已 alive(成功),false = 后端/超时失败
-const doFreshStart = async (opts = {}) => {
-  const startRound = opts.startRound ?? 0
-  const chatOnly = opts.chatOnly ?? false
-  restartMode.value = 'fresh'
+const doChatOnlyStart = async () => {
   recoveryStage.value = 'starting'
-  addLog(t('step5.envFreshTriggered'))
+  addLog(t('step5.envStoppedChatOnlyHint'))
   const res = await startSimulation({
     simulation_id: props.simulationId,
     platform: 'parallel',
-    // chat-only 保留世界数据（DB/actions/run_state），不能 force 清理；
+    force: false,
     // 后端会把 start_round 对齐 run_state.json 里的用户实际总轮数，跳过剩余轮次直接进 IPC wait
-    force: !chatOnly,
-    start_round: startRound,  // 0 = 正常从头;3 = 跳过 R0/R1/R2
+    start_round: 0,
     enable_graph_memory_update: true,
-    chat_only: chatOnly        // True 时后端把 start_round 提到 total_rounds,跳过 rounds 直接进 IPC wait
+    chat_only: true
   })
   if (res.success) {
     recoveryStage.value = 'waiting_alive'
@@ -954,7 +903,9 @@ const doFreshStart = async (opts = {}) => {
 }
 
 // 等待 env 状态变 alive —— 进入循环时打标为 waiting_alive
-const waitForEnvAlive = async (maxWaitSec = 30) => {
+// 超时 150s：恢复快照后子进程要加载全部 agent（约 2 分钟）才写心跳，
+// 30s 会在加载中就误报"重启超时"，让用户以为卡住（实际环境稍后会活）
+const waitForEnvAlive = async (maxWaitSec = 150) => {
   recoveryStage.value = 'waiting_alive'
   const startTime = Date.now()
   while (Date.now() - startTime < maxWaitSec * 1000) {
@@ -2831,46 +2782,6 @@ onUnmounted(() => {
   line-height: 1.4;
 }
 
-.chat-stopped-btn {
-  flex-shrink: 0;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 12px;
-  background: #FF6F00;
-  color: #FFFFFF;
-  border: 1px solid #FF6F00;
-  border-radius: 4px;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: all 0.15s;
-  white-space: nowrap;
-}
-
-.chat-stopped-btn:hover:not(:disabled) {
-  background: #E65100;
-  border-color: #E65100;
-}
-
-.chat-stopped-btn:disabled {
-  background: #FFB74D;
-  border-color: #FFB74D;
-  cursor: not-allowed;
-}
-
-/* Chat-Only 次级按钮:跟主按钮并排,视觉权重稍低,提示用户"轻量启动"选项 */
-.chat-stopped-btn-secondary {
-  background: #FFFFFF;
-  color: #FF6F00;
-  border: 1px solid #FFB74D;
-}
-.chat-stopped-btn-secondary:hover:not(:disabled) {
-  background: #FFF3E0;
-  border-color: #FF6F00;
-  color: #E65100;
-}
-
 .chat-input {
   flex: 1;
   padding: 12px 16px;
@@ -3433,6 +3344,25 @@ onUnmounted(() => {
   border-color: #FB8C00;
 }
 
+/* 次级入口：仅对话模式（与主按钮并排，视觉上弱一级） */
+.env-status-action-secondary {
+  margin-left: 6px;
+  padding: 4px 10px;
+  border: 1px solid #D1D5DB;
+  background: transparent;
+  color: #6B7280;
+  border-radius: 4px;
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.env-status-action-secondary:hover {
+  background: #F3F4F6;
+  border-color: #9CA3AF;
+  color: #374151;
+}
+
 /* 多快照选择器（≥2 个 final_/fail_ 快照时） */
 .snapshot-picker {
   margin: 0 16px 12px;
@@ -3455,7 +3385,7 @@ onUnmounted(() => {
   font-size: 11px;
 }
 
-/* 自动倒计时 banner —— 5s 不选就自动 force fresh,减少点击次数 */
+/* 自动倒计时 banner —— 5s 不选自动恢复最新快照 */
 .snapshot-picker-countdown {
   display: flex;
   align-items: center;
@@ -3478,23 +3408,6 @@ onUnmounted(() => {
   background: #FF6F00;
   animation: env-spin 1s linear infinite reverse;
   flex-shrink: 0;
-}
-
-.snapshot-picker-countdown .countdown-skip {
-  margin-left: auto;
-  padding: 3px 10px;
-  background: #FF6F00;
-  color: #FFFFFF;
-  border: none;
-  border-radius: 3px;
-  font-size: 10px;
-  font-weight: 600;
-  cursor: pointer;
-  white-space: nowrap;
-}
-
-.snapshot-picker-countdown .countdown-skip:hover {
-  background: #E65100;
 }
 
 /* 重启成功短暂绿色 banner —— 4s 自动消失 */
@@ -3603,11 +3516,6 @@ onUnmounted(() => {
 
 .snapshot-picker-btn:hover {
   background: #F5F5F5;
-}
-
-.snapshot-picker-btn.fresh {
-  border-color: #FF9800;
-  color: #E65100;
 }
 
 .snapshot-picker-btn.cancel {
