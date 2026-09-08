@@ -92,13 +92,16 @@
           <span class="card-progress" :class="getProgressClass(project)">
             <span class="status-dot">●</span> {{ formatRounds(project) }}
           </span>
-          <!-- 删除按钮 -->
+          <!-- 删除按钮 —— 移到 card-footer 内,改用图标 + 文字,避免误点 -->
           <button
-            class="delete-btn"
+            type="button"
+            class="card-delete-btn"
             :title="$t('history.deleteSimulation')"
-            @click.stop="confirmDelete(project)"
+            @mousedown.stop
+            @click.stop.prevent="confirmDelete(project)"
           >
-            ×
+            <span class="delete-icon">🗑</span>
+            <span class="delete-text">{{ $t('history.deleteSimulation') }}</span>
           </button>
         </div>
 
@@ -178,6 +181,14 @@
                 <span class="btn-text">{{ $t('history.step2Button') }}</span>
               </button>
               <button 
+                class="modal-btn btn-simulation-run" 
+                @click="goToSimulationRun"
+              >
+                <span class="btn-step">Step3</span>
+                <span class="btn-icon">▶</span>
+                <span class="btn-text">{{ $t('history.step3Button') }}</span>
+              </button>
+              <button 
                 class="modal-btn btn-report" 
                 @click="goToReport"
                 :disabled="!selectedProject.report_id"
@@ -216,6 +227,12 @@
                 <div class="delete-target">
                   {{ formatSimulationId(deleteTarget?.simulation_id) }}
                 </div>
+
+                <!-- 错误信息内嵌显示(替代浏览器 alert) -->
+                <div v-if="deleteError" class="delete-error">
+                  <div class="delete-error-icon">⚠</div>
+                  <div class="delete-error-text">{{ deleteError }}</div>
+                </div>
               </div>
             </div>
             <div class="modal-actions">
@@ -223,7 +240,18 @@
                 <span class="btn-icon">✕</span>
                 <span class="btn-text">{{ $t('common.cancel') }}</span>
               </button>
-              <button class="modal-btn btn-delete" @click="executeDelete" :disabled="deleting">
+              <!-- 运行中冲突:一键停止 + 删除 -->
+              <button
+                v-if="isRunningConflict"
+                class="modal-btn btn-delete-stop"
+                @click="stopAndDelete"
+                :disabled="deleting"
+                :title="$t('history.stopAndDeleteHint')"
+              >
+                <span class="btn-icon">⏹</span>
+                <span class="btn-text">{{ deleting ? $t('common.loading') : $t('history.stopAndDelete') }}</span>
+              </button>
+              <button v-else class="modal-btn btn-delete" @click="executeDelete" :disabled="deleting">
                 <span class="btn-icon">🗑</span>
                 <span class="btn-text">{{ deleting ? $t('common.loading') : $t('common.confirm') }}</span>
               </button>
@@ -239,7 +267,7 @@
 import { ref, computed, onMounted, onUnmounted, onActivated, watch, nextTick } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { getSimulationHistory, deleteSimulation } from '../api/simulation'
+import { getSimulationHistory, deleteSimulation, stopSimulation } from '../api/simulation'
 
 const router = useRouter()
 const route = useRoute()
@@ -452,15 +480,29 @@ const closeModal = () => {
 }
 
 // 删除相关功能
+const deleteError = ref('')        // 错误信息(显示在 modal 内,不再弹 alert)
+const isRunningConflict = ref(false) // 标记是否是"模拟运行中"导致失败
+
 const confirmDelete = (project) => {
   deleteTarget.value = project
+  deleteError.value = ''
+  isRunningConflict.value = false
   showDeleteConfirm.value = true
+}
+
+// 检测错误信息里是否包含"运行中"关键字,提供"停止 + 删除"一键路径
+const detectRunningConflict = (msg) => {
+  if (!msg) return false
+  const s = String(msg)
+  return s.includes('运行中') || s.includes('正在运行') || s.includes('running')
 }
 
 const executeDelete = async () => {
   if (!deleteTarget.value?.simulation_id) return
-  
+
   deleting.value = true
+  deleteError.value = ''
+  isRunningConflict.value = false
   try {
     const response = await deleteSimulation(deleteTarget.value.simulation_id)
     if (response.success) {
@@ -469,16 +511,45 @@ const executeDelete = async () => {
       showDeleteConfirm.value = false
       deleteTarget.value = null
     } else {
-      alert(response.error || t('common.error'))
-      showDeleteConfirm.value = false
-      deleteTarget.value = null
+      // 失败保留 modal,把错误写到 modal 内,不弹 alert
+      const errMsg = response.error || t('common.error')
+      deleteError.value = errMsg
+      isRunningConflict.value = detectRunningConflict(errMsg)
     }
   } catch (error) {
     console.error('删除推演失败:', error)
-    const errorMsg = error?.response?.data?.error || error?.message || t('common.error')
-    alert(errorMsg)
-    showDeleteConfirm.value = false
-    deleteTarget.value = null
+    const errMsg = error?.response?.data?.error || error?.message || t('common.error')
+    deleteError.value = errMsg
+    isRunningConflict.value = detectRunningConflict(errMsg)
+  } finally {
+    deleting.value = false
+  }
+}
+
+// 一键:停止模拟 + 再删
+const stopAndDelete = async () => {
+  if (!deleteTarget.value?.simulation_id || deleting.value) return
+  deleting.value = true
+  try {
+    const stopRes = await stopSimulation({ simulation_id: deleteTarget.value.simulation_id })
+    if (!stopRes.success) {
+      deleteError.value = `停止失败: ${stopRes.error || '未知错误'}`
+      deleting.value = false
+      return
+    }
+    // 停止成功,再次尝试删除
+    const delRes = await deleteSimulation(deleteTarget.value.simulation_id)
+    if (delRes.success) {
+      projects.value = projects.value.filter(p => p.simulation_id !== deleteTarget.value.simulation_id)
+      showDeleteConfirm.value = false
+      deleteTarget.value = null
+    } else {
+      const errMsg = delRes.error || t('common.error')
+      deleteError.value = `停止后再删仍失败: ${errMsg}`
+      isRunningConflict.value = detectRunningConflict(errMsg)
+    }
+  } catch (e) {
+    deleteError.value = `停止+删除异常: ${e.message || e}`
   } finally {
     deleting.value = false
   }
@@ -500,6 +571,17 @@ const goToSimulation = () => {
   if (selectedProject.value?.simulation_id) {
     router.push({
       name: 'Simulation',
+      params: { simulationId: selectedProject.value.simulation_id }
+    })
+    closeModal()
+  }
+}
+
+// 导航到开始模拟页面（SimulationRun - Step3）
+const goToSimulationRun = () => {
+  if (selectedProject.value?.simulation_id) {
+    router.push({
+      name: 'SimulationRun',
       params: { simulationId: selectedProject.value.simulation_id }
     })
     closeModal()
@@ -1034,36 +1116,47 @@ onUnmounted(() => {
 .card-footer .card-progress.in-progress { color: #F59E0B; }
 .card-footer .card-progress.not-started { color: #9CA3AF; }
 
-/* 删除按钮 */
-.delete-btn {
-  position: absolute;
-  top: -8px;
-  right: -8px;
-  width: 20px;
-  height: 20px;
-  background: #EF4444;
-  color: white;
-  border: 2px solid white;
-  border-radius: 50%;
-  font-size: 14px;
-  line-height: 1;
-  cursor: pointer;
-  display: flex;
+/* 删除按钮 —— 移到卡片内,正常文档流,带图标的红色小按钮 */
+.card-delete-btn {
+  position: relative;       /* 在 flex 流里即可,不再漂浮 */
+  z-index: 5;               /* 高于卡片自身的 z-index,绝对不会被卡片点击误触发 */
+  display: inline-flex;
   align-items: center;
-  justify-content: center;
-  opacity: 0;
-  transition: all 0.3s ease;
-  z-index: 10;
+  gap: 4px;
+  padding: 4px 8px;
+  background: #FEF2F2;
+  color: #DC2626;
+  border: 1px solid #FECACA;
+  border-radius: 4px;
+  font-family: 'Inter', 'Noto Sans SC', sans-serif;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
-.project-card:hover .delete-btn {
-  opacity: 1;
+.card-delete-btn:hover {
+  background: #FEE2E2;
+  border-color: #FCA5A5;
+  color: #B91C1C;
 }
 
-.delete-btn:hover {
-  background: #DC2626;
-  transform: scale(1.2);
+.card-delete-btn:active {
+  background: #FECACA;
 }
+
+.card-delete-btn .delete-icon {
+  font-size: 11px;
+  line-height: 1;
+}
+
+.card-delete-btn .delete-text {
+  line-height: 1;
+}
+
+/* 底部装饰线 */
 
 /* 底部装饰线 */
 .card-bottom-line {
@@ -1370,18 +1463,20 @@ onUnmounted(() => {
 /* 导航按钮 */
 .modal-actions {
   display: flex;
-  gap: 16px;
+  flex-wrap: wrap;
+  gap: 12px;
   padding: 20px 32px;
   background: #FFFFFF;
 }
 
 .modal-btn {
   flex: 1;
+  min-width: 100px;
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 8px;
-  padding: 16px;
+  padding: 14px 12px;
   border: 1px solid #E5E7EB;
   border-radius: 8px;
   background: #FFFFFF;
@@ -1428,6 +1523,7 @@ onUnmounted(() => {
 
 .modal-btn.btn-project .btn-icon { color: #3B82F6; }
 .modal-btn.btn-simulation .btn-icon { color: #F59E0B; }
+.modal-btn.btn-simulation-run .btn-icon { color: #8B5CF6; }
 .modal-btn.btn-report .btn-icon { color: #10B981; }
 
 .modal-btn:hover:not(:disabled) .btn-text {
@@ -1480,6 +1576,32 @@ onUnmounted(() => {
   margin-top: 8px;
 }
 
+/* 错误信息(替代浏览器 alert) */
+.delete-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: #FEF2F2;
+  border: 1px solid #FECACA;
+  border-radius: 6px;
+  color: #991B1B;
+}
+
+.delete-error-icon {
+  flex-shrink: 0;
+  font-size: 16px;
+  line-height: 1.2;
+}
+
+.delete-error-text {
+  flex: 1;
+  font-size: 12px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
 .btn-delete {
   background: #EF4444 !important;
   border-color: #EF4444 !important;
@@ -1492,6 +1614,21 @@ onUnmounted(() => {
 .btn-delete:hover:not(:disabled) {
   background: #DC2626 !important;
   border-color: #DC2626 !important;
+}
+
+/* "停止 + 删除" 一键按钮 —— 橙黄色调,跟纯红的"删除"区分 */
+.btn-delete-stop {
+  background: #F59E0B !important;
+  border-color: #F59E0B !important;
+}
+
+.btn-delete-stop .btn-text {
+  color: white !important;
+}
+
+.btn-delete-stop:hover:not(:disabled) {
+  background: #D97706 !important;
+  border-color: #D97706 !important;
 }
 
 .btn-cancel {
@@ -1507,7 +1644,8 @@ onUnmounted(() => {
   background: #F9FAFB !important;
 }
 
-.btn-delete:disabled {
+.btn-delete:disabled,
+.btn-delete-stop:disabled {
   opacity: 0.6;
   cursor: not-allowed;
 }

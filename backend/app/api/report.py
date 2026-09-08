@@ -4,6 +4,7 @@ Report API路由
 """
 
 import os
+import re
 import traceback
 import threading
 from flask import request, jsonify, send_file
@@ -18,6 +19,31 @@ from ..utils.logger import get_logger
 from ..utils.locale import t, get_locale, set_locale
 
 logger = get_logger('mirofish.api.report')
+
+
+def _build_download_filename(report) -> str:
+    """
+    构建报告下载文件名：优先用报告标题（清洗文件系统非法字符），回退 report_id。
+
+    标题来源：outline.title →（生成中时也有大纲）markdown 首个 "# 标题" 行。
+    例："1984陕北：阶层惯性与实用主义" → "1984陕北_阶层惯性与实用主义.md"
+    """
+    title = ""
+    if report.outline and report.outline.title:
+        title = report.outline.title.strip()
+    if not title and report.markdown_content:
+        m = re.match(r'^#\s+(.+)$', report.markdown_content.strip(), re.MULTILINE)
+        if m:
+            title = m.group(1).strip()
+    if not title:
+        return f"{report.report_id}.md"
+    # Windows/macOS/Linux 文件名非法字符统一替换为下划线；压缩空白；去尾部点号
+    cleaned = re.sub(r'[\\/:*?"<>|\r\n\t]', '_', title)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip().rstrip('.')
+    cleaned = cleaned[:80]  # 防超长路径
+    if not cleaned:
+        return f"{report.report_id}.md"
+    return f"{cleaned}.md"
 
 
 # ============== 报告生成接口 ==============
@@ -433,39 +459,56 @@ def list_reports():
 def download_report(report_id: str):
     """
     下载报告（Markdown格式）
-    
-    返回Markdown文件
+
+    返回Markdown文件。
+    生成中下载时 full_report.md 尚未写入，回退为现场组装已生成章节（部分报告），
+    避免下载到空文件。
     """
     try:
         report = ReportManager.get_report(report_id)
-        
+
         if not report:
             return jsonify({
                 "success": False,
                 "error": t('api.reportNotFound', id=report_id)
             }), 404
-        
+
         md_path = ReportManager._get_report_markdown_path(report_id)
-        
-        if not os.path.exists(md_path):
-            # 如果MD文件不存在，生成一个临时文件
-            import tempfile
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False) as f:
-                f.write(report.markdown_content)
-                temp_path = f.name
-            
+
+        if os.path.exists(md_path):
             return send_file(
-                temp_path,
+                md_path,
                 as_attachment=True,
                 download_name=f"{report_id}.md"
             )
-        
+
+        # full_report.md 不存在（生成中）：优先用持久化的 markdown_content，
+        # 为空时现场从已生成的章节文件组装部分报告
+        content = report.markdown_content or ""
+        if not content:
+            header = ""
+            if report.outline:
+                header += f"# {report.outline.title}\n\n"
+                header += f"> {report.outline.summary}\n\n"
+            header += "---\n\n"
+            sections = ReportManager.get_generated_sections(report_id)
+            if not sections:
+                return jsonify({
+                    "success": False,
+                    "error": "报告尚未生成任何章节，请等待生成开始后再下载"
+                }), 404
+            body = "".join(s["content"] for s in sections)
+            content = header + body
+
+        import io
+        buf = io.BytesIO(content.encode('utf-8'))
         return send_file(
-            md_path,
+            buf,
             as_attachment=True,
-            download_name=f"{report_id}.md"
+            download_name=_build_download_filename(report),
+            mimetype='text/markdown'
         )
-        
+
     except Exception as e:
         logger.error(f"下载报告失败: {str(e)}")
         return jsonify({

@@ -16,6 +16,7 @@ from queue import Queue, Empty
 from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.locale import get_locale, set_locale
+from .graph_backend import get_graph_backend
 from .graph_store import GraphStore
 
 logger = get_logger('mirofish.graph_memory_updater')
@@ -178,7 +179,11 @@ class ZepGraphMemoryUpdater:
 
     def __init__(self, graph_id: str, api_key: Optional[str] = None):
         self.graph_id = graph_id
-        self._store = GraphStore(graph_id)
+        # 按 Config.GRAPH_BACKEND 选择后端；两者都实现 add_single_episode 接口
+        self._backend = get_graph_backend(graph_id)
+        # 兼容历史调用方：保留 _store 指向 GraphStore 或 Zep 后端
+        self._store = self._backend if hasattr(self._backend, "store") else self._backend
+        # local 后端的 GraphStore 暴露 add_single_episode；zep 后端 backend 自身实现。
 
         self._activity_queue: Queue = Queue()
         self._platform_buffers: Dict[str, List[AgentActivity]] = {
@@ -281,8 +286,8 @@ class ZepGraphMemoryUpdater:
 
         for attempt in range(self.MAX_RETRIES):
             try:
-                # 使用 GraphStore 添加 episode
-                self._store.add_single_episode(combined_text, episode_type="agent_activity")
+                # 通过统一后端添加 episode（local 走 GraphStore，zep 走 Zep Cloud）
+                self._backend.add_single_episode(combined_text, episode_type="agent_activity")
 
                 self._total_sent += 1
                 self._total_items_sent += len(activities)

@@ -77,6 +77,141 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 
 
+AGENT_MEMORY_DIR_NAME = "agent_memory"
+RANDOM_STATE_DIR_NAME = "random_state"
+RUNTIME_STATE_DIR_NAME = "runtime_state"
+
+
+def _tupleize_random_state(value):
+    if isinstance(value, list):
+        return tuple(_tupleize_random_state(item) for item in value)
+    return value
+
+
+def _oasis_random_module():
+    try:
+        import importlib
+        return importlib.import_module("oasis.social_platform.platform").random
+    except Exception:
+        return random
+
+
+def _write_json_atomic(path: str, data: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
+
+
+def _runtime_state_path(simulation_dir: str, platform_name: str) -> str:
+    return os.path.join(simulation_dir, RUNTIME_STATE_DIR_NAME, f"{platform_name}.json")
+
+
+def _random_state_path(simulation_dir: str, platform_name: str) -> str:
+    return os.path.join(simulation_dir, RANDOM_STATE_DIR_NAME, f"{platform_name}.json")
+
+
+def _agent_memory_dir(simulation_dir: str, platform_name: str) -> str:
+    return os.path.join(simulation_dir, AGENT_MEMORY_DIR_NAME, platform_name)
+
+
+def _reset_persistent_runtime_state(simulation_dir: str, platform_name: str) -> None:
+    import shutil
+    for path in (
+        _agent_memory_dir(simulation_dir, platform_name),
+        _runtime_state_path(simulation_dir, platform_name),
+        _random_state_path(simulation_dir, platform_name),
+    ):
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        elif os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def _load_random_state(simulation_dir: str, platform_name: str) -> None:
+    path = _random_state_path(simulation_dir, platform_name)
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        python_state = data.get("python_random_state")
+        oasis_state = data.get("oasis_random_state")
+        if python_state is not None:
+            random.setstate(_tupleize_random_state(python_state))
+        if oasis_state is not None:
+            _oasis_random_module().setstate(_tupleize_random_state(oasis_state))
+    except Exception as e:
+        _subprocess_logger.warning(f"加载 {platform_name} random state 失败(继续): {e}")
+
+
+def _load_agent_memories(simulation_dir: str, agent_graph, platform_name: str) -> None:
+    memory_dir = _agent_memory_dir(simulation_dir, platform_name)
+    if not os.path.isdir(memory_dir):
+        return
+    for agent_id, agent in agent_graph.get_agents():
+        path = os.path.join(memory_dir, f"{agent_id}.json")
+        if not os.path.exists(path):
+            continue
+        try:
+            agent.load_memory_from_path(path)
+        except Exception as e:
+            _subprocess_logger.warning(
+                f"加载 {platform_name} Agent {agent_id} memory 失败(继续): {e}"
+            )
+
+
+def _save_runtime_state(simulation_dir: str, agent_graph, platform_name: str,
+                        completed_round: int, total_rounds: int) -> None:
+    memory_dir = _agent_memory_dir(simulation_dir, platform_name)
+    os.makedirs(memory_dir, exist_ok=True)
+    for agent_id, agent in agent_graph.get_agents():
+        try:
+            agent.save_memory(os.path.join(memory_dir, f"{agent_id}.json"))
+        except Exception as e:
+            _subprocess_logger.warning(
+                f"保存 {platform_name} Agent {agent_id} memory 失败(继续): {e}"
+            )
+
+    oasis_random = _oasis_random_module()
+    _write_json_atomic(
+        _random_state_path(simulation_dir, platform_name),
+        {
+            "python_random_state": list(random.getstate()),
+            "oasis_random_state": list(oasis_random.getstate()),
+            "updated_at": datetime.now().isoformat(),
+        },
+    )
+    _write_json_atomic(
+        _runtime_state_path(simulation_dir, platform_name),
+        {
+            "platform": platform_name,
+            "completed_round": completed_round,
+            "next_round": completed_round + 1,
+            "total_rounds": total_rounds,
+            "updated_at": datetime.now().isoformat(),
+        },
+    )
+
+
+def _load_runtime_state(simulation_dir: str, agent_graph, platform_name: str) -> Dict[str, Any]:
+    _load_random_state(simulation_dir, platform_name)
+    _load_agent_memories(simulation_dir, agent_graph, platform_name)
+    path = _runtime_state_path(simulation_dir, platform_name)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        _subprocess_logger.warning(f"加载 {platform_name} runtime state 失败(继续): {e}")
+        return {}
+
+
 # 全局变量：用于信号处理
 _shutdown_event = None
 _cleanup_done = False
@@ -156,6 +291,235 @@ def init_logging_for_simulation(simulation_dir: str):
 
 
 from action_logger import SimulationLogManager, PlatformActionLogger
+
+# 模块级 logger —— 用于 Interview / Chat 故障排查,带 traceback 落进 simulation.log
+_subprocess_logger = logging.getLogger("mirofish.subprocess")
+if not _subprocess_logger.handlers:
+    _sh = logging.StreamHandler()  # Popen 把 stderr → simulation.log,stderr+stdout 同一文件
+    _sh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - [Interview] %(message)s"))
+    _subprocess_logger.addHandler(_sh)
+    _subprocess_logger.setLevel(logging.INFO)
+_subprocess_logger.propagate = False
+
+# ============================================================================
+# Agent persona 缓存(chat-only 启动加速用)
+# 见 backend/app/services/agent_cache_manager.py,本文件直接 import 用,逻辑全在那里
+# ============================================================================
+try:
+    from app.services.agent_cache_manager import AgentCacheManager, CachePlatform as _CachePlatform
+except Exception as _cache_import_err:
+    AgentCacheManager = None
+    _CachePlatform = None
+    _subprocess_logger.warning(f"agent_cache_manager 导入失败(降级为常规模拟): {_cache_import_err}")
+
+
+def _try_load_cached_agent_graph(simulation_dir: str, profile_path: str, config_path: str, model, available_actions, platform_name: str):
+    """
+    试从 cache 加载 agent_graph。Cache 命中且 hash 匹配 → (AgentGraph, True);
+    否则 → (None, False),调用方回退到 generate_*_agent_graph。
+
+    复用 OASIS 的 SocialAgent.__init__ 把 user_info 组装回 AgentGraph,
+    这样加载出的实例与正常路径行为字节级一致。
+    """
+    if AgentCacheManager is None or _CachePlatform is None:
+        return None, False
+    try:
+        cache_platform = _CachePlatform.TWITTER if platform_name == "twitter" else _CachePlatform.REDDIT
+        profile_sha = AgentCacheManager.sha256_file(profile_path)
+        config_sha = AgentCacheManager.sha256_file(config_path)
+        payload = AgentCacheManager.load_cache_data(
+            simulation_dir,
+            cache_platform,
+            profile_sha256=profile_sha,
+            config_sha256=config_sha,
+        )
+        if not payload:
+            return None, False
+
+        from oasis.social_agent.agent import SocialAgent
+        from oasis.social_agent.agent_graph import AgentGraph
+        from oasis.social_platform.config.user import UserInfo
+        from oasis.social_platform.typing import ActionType as _AT
+
+        agents_data = payload.get("agents") or []
+        agent_graph = AgentGraph()
+        for ad in agents_data:
+            try:
+                ui_dict = ad.get("user_info") or {}
+                ui = UserInfo(
+                    user_name=ui_dict.get("user_name") or ui_dict.get("name", ""),
+                    name=ui_dict.get("name") or ui_dict.get("user_name", ""),
+                    description=ui_dict.get("description") or "",
+                    profile=ui_dict.get("profile") or {"nodes": [], "edges": [], "other_info": {}},
+                    recsys_type=ui_dict.get("recsys_type") or platform_name,
+                    is_controllable=bool(ui_dict.get("is_controllable", False)),
+                )
+                # available_actions:从 cache 读回来的 str list (e.g. "create_post")
+                # 重新映射回 ActionType。ActionType 通常是小写字符串"create_post"等
+                actions_str = ad.get("available_actions") or []
+                actions = []
+                for s in actions_str:
+                    if not isinstance(s, str):
+                        continue
+                    # 跳过 Python repr 字符串(老 bug 污染的 cache 文件里出现"object at 0x..")
+                    if s.startswith("<") and "object at 0x" in s:
+                        continue
+                    try:
+                        actions.append(_AT(s))
+                    except (KeyError, ValueError):
+                        pass
+                if not actions:
+                    # 安全默认:根本没人能动 —— 否则 chat 路径不能 fallback 任何动作
+                    actions = [_AT.DO_NOTHING]
+
+                agent = SocialAgent(
+                    agent_id=int(ad["agent_id"]),
+                    user_info=ui,
+                    model=model,
+                    agent_graph=agent_graph,
+                    available_actions=actions,
+                )
+                agent_graph.add_agent(agent)
+            except Exception as e:
+                _subprocess_logger.warning(f"加载单个 agent 失败(已跳过): {e}")
+                continue
+
+        _subprocess_logger.info(
+            f"[{platform_name}] 命中 agent cache,跳过 {len(agents_data)} 个 SocialAgent 构造"
+        )
+        return agent_graph, True
+    except Exception as e:
+        _subprocess_logger.warning(f"load_cached_agent_graph 解析失败(回退重生成): {e}")
+        return None, False
+
+
+def _strip_preamble(text: str) -> str:
+    """
+    去掉模型回复开头的"让我思考 / 我需要分析 / 用户要求..."前缀,只留角色实际发言。
+
+    启发式:大部分 LLM 会在 paragraph 1-N 用元描述/分析解释自己要干啥,然后 \n\n + 第一段
+    以 "我" 开头(≥10 字符)进入真正的角色对白。一旦找到这个 split boundary 就
+    从 boundary 开始返回,丢前面所有段落。
+
+    鲁棒性:
+    - 没找到边界 → 原样返回(不冒险)
+    - 找不到 "我" 开头段落 → 原样返回
+    - 单段无 \n\n 分隔 → 原样返回
+    """
+    import re
+    if not text:
+        return text
+
+    stripped = text.strip()
+    if not stripped:
+        return stripped
+
+    # 用 2+ 个换行做硬分隔(OASIS 或 LLM 通常都会用空段表示段落)
+    parts = re.split(r'\n\n+', stripped)
+    if len(parts) <= 1:
+        return stripped  # 没有段落边界,放弃剥
+
+    # 找第一个明显是角色对白的段(以 "我" 开头,长度 ≥ 10)
+    # 排除纯 "我" + 标点的短句
+    for i, p in enumerate(parts):
+        p_strip = p.strip()
+        if not p_strip:
+            continue
+        if p_strip.startswith('我') and len(p_strip) >= 10:
+            kept = '\n\n'.join(parts[i:]).strip()
+            if len(kept) < len(stripped):
+                _subprocess_logger.info(
+                    f"剥 preamble: {len(stripped)} -> {len(kept)} chars "
+                    f"(丢弃 {len(parts) - i} 段)"
+                )
+                return kept
+            break  # 没缩短就别剥
+
+    return stripped  # 兜底原样
+
+
+def _extract_interview_content(response) -> str:
+    """
+    防御性提取 perform_interview 的回复内容。不同模型/wrapper 返回结构差异,这里逐级兜底:
+
+    优先级(任一成功即返回):
+      0. response["content"] / response.get("content")  (OASIS 0.2.x 当前版本真的返回 dict)
+      1. response.output_messages[0].content             (CAMEL 标准结构,大多数模型)
+      2. response.content                               (有些模型 / wrapper 直接给)
+      3. response.choices[0].message.content            (OpenAI 原始风格)
+      4. str(response)                                  (最终兜底, 但要拒绝返回 dict/list repr)
+
+
+    识别"假回复":出现 dict/list repr 都是失败,会让前端显示 dump。
+    """
+    if response is None:
+        raise ValueError("perform_interview 返回 None")
+    # 路径 0:OASIS 0.2.x perform_interview 实际返回 dict
+    # 形如 {"user_id": int, "prompt": [...], "content": "<LLM 答复>", "success": bool}
+    # 不识别这一层 → 后端就会误以为模型出错,前端弹"performinterview 返回的不是 LLM 答案"
+    try:
+        if isinstance(response, dict):
+            for key in ("content", "response", "answer", "message"):
+                v = response.get(key)
+                if isinstance(v, str) and v.strip():
+                    return v
+    except Exception:
+        pass
+    # 路径 1
+    try:
+        return response.output_messages[0].content
+    except (AttributeError, IndexError, TypeError):
+        pass
+    # 路径 2
+    try:
+        c = getattr(response, "content", None)
+        if c:
+            return c if isinstance(c, str) else str(c)
+    except Exception:
+        pass
+    # 路径 3
+    try:
+        return response.choices[0].message.content
+    except (AttributeError, IndexError, TypeError, KeyError):
+        pass
+    # 路径 4:只能依赖 str。**关键:如果是 dict / list repr(以 { 或 [ 开头),那其实是请求
+    # prompt 的 repr 而不是 LLM 回复,直接失败抛错。**否则前端会把 prompt 当作 agent 回复显示。
+    s = str(response)
+    if not s or s.strip() in ("None", "<object>", "<ChatAgentResponse>"):
+        raise ValueError(f"无法从 perform_interview 返回对象提取内容(type={type(response).__name__})")
+    s_strip = s.lstrip()
+    if s_strip.startswith("{") or s_strip.startswith("["):
+        # 听起来像 dict/list repr —— 是 prompt 而不是 answer
+        raise ValueError(
+            f"perform_interview 返回的不是 LLM 答案(type={type(response).__name__}, "
+            f"preview={s[:100]!r})"
+        )
+    return s
+
+
+def _save_agent_graph_to_cache(simulation_dir: str, agent_graph, profile_path: str, config_path: str, platform_name: str) -> None:
+    """保存 agent_graph 的 persona 数据到 disk cache。失败只警告不报错。"""
+    if AgentCacheManager is None or _CachePlatform is None:
+        return
+    try:
+        cache_platform = _CachePlatform.TWITTER if platform_name == "twitter" else _CachePlatform.REDDIT
+        # AgentGraph 用 agent_mappings 字段(dict[int, SocialAgent]),不是 agents。
+        # 用属性存在性判断避免老版本 OASIS 兼容失败时炸掉主流程。
+        if hasattr(agent_graph, "agent_mappings") and agent_graph.agent_mappings:
+            agent_iter = agent_graph.agent_mappings.values()
+        elif hasattr(agent_graph, "get_agents"):
+            agent_iter = [a for _, a in agent_graph.get_agents()]
+        else:
+            agent_iter = []
+        AgentCacheManager.save_cache(
+            simulation_dir,
+            cache_platform,
+            list(agent_iter),
+            profile_path=profile_path,
+            config_path=config_path,
+        )
+    except Exception as e:
+        _subprocess_logger.warning(f"save_agent_graph_to_cache 失败 ({platform_name}): {e}")
 
 try:
     from camel.models import ModelFactory
@@ -416,7 +780,7 @@ class ParallelIPCHandler:
     async def handle_batch_interview(self, command_id: str, interviews: List[Dict], platform: str = None) -> bool:
         """
         处理批量采访命令
-        
+
         Args:
             command_id: 命令ID
             interviews: [{"agent_id": int, "prompt": str, "platform": str(optional)}, ...]
@@ -429,7 +793,7 @@ class ParallelIPCHandler:
         twitter_interviews = []
         reddit_interviews = []
         both_platforms_interviews = []  # 需要同时采访两个平台的
-        
+
         for interview in interviews:
             item_platform = interview.get("platform", platform)
             if item_platform == "twitter":
@@ -439,70 +803,89 @@ class ParallelIPCHandler:
             else:
                 # 未指定平台：两个平台都采访
                 both_platforms_interviews.append(interview)
-        
+
         # 把 both_platforms_interviews 拆分到两个平台
         if both_platforms_interviews:
             if self.twitter_env:
                 twitter_interviews.extend(both_platforms_interviews)
             if self.reddit_env:
                 reddit_interviews.extend(both_platforms_interviews)
-        
+
         results = {}
-        
+
+        # 修 #32: 直接调 agent.perform_interview(prompt) 跳过 env.step
+        # 之前用 env.step() 触发 update_rec_table(读全表+重算推荐矩阵),rounds 跑完后
+        # 这步会阻塞 30-120s,导致 IPC 超时 → 用户看到"假启动"
+        # 新方案:直接走 LLM 调用 + 通过 channel 自动 record trace
+        # 性能:从 30-120s 降到 5-15s(纯 LLM 调用时间)
+
         # 处理Twitter平台的采访
-        if twitter_interviews and self.twitter_env:
-            try:
-                twitter_actions = {}
-                for interview in twitter_interviews:
-                    agent_id = interview.get("agent_id")
-                    prompt = interview.get("prompt", "")
+        if twitter_interviews and self.twitter_env and self.twitter_agent_graph:
+            _subprocess_logger.info(f"开始处理 Twitter 采访: count={len(twitter_interviews)}, command_id={command_id}")
+            for interview in twitter_interviews:
+                agent_id = interview.get("agent_id")
+                prompt = interview.get("prompt", "")
+                try:
+                    agent = self.twitter_agent_graph.get_agent(agent_id)
+                    # 直接 LLM 调用 —— perform_interview 内部已经通过 channel record 到 trace
+                    response = await agent.perform_interview(prompt)
+                    # 防御性提取:不同 LLM 包装返回结构差异,逐级兜底
                     try:
-                        agent = self.twitter_agent_graph.get_agent(agent_id)
-                        twitter_actions[agent] = ManualAction(
-                            action_type=ActionType.INTERVIEW,
-                            action_args={"prompt": prompt}
-                        )
-                    except Exception as e:
-                        print(f"  警告: 无法获取Twitter Agent {agent_id}: {e}")
-                
-                if twitter_actions:
-                    await self.twitter_env.step(twitter_actions)
-                    
-                    for interview in twitter_interviews:
-                        agent_id = interview.get("agent_id")
-                        result = self._get_interview_result(agent_id, "twitter")
-                        result["platform"] = "twitter"
-                        results[f"twitter_{agent_id}"] = result
-            except Exception as e:
-                print(f"  Twitter批量Interview失败: {e}")
-        
+                        content = _extract_interview_content(response)
+                    except Exception as _extract_err:
+                        raise _extract_err  # 让外层 except 捕获并填充 error
+                    # 削 preamble:MiniMax/Qwen 系倾向在 answer 前写一段"让我思考/我需要分析"
+                    content = _strip_preamble(content)
+                    results[f"twitter_{agent_id}"] = {
+                        "agent_id": agent_id,
+                        "response": content,
+                        "platform": "twitter",
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    _subprocess_logger.info(f"Twitter Interview agent {agent_id} 完成 ({len(content)} chars)")
+                except Exception as e:
+                    _subprocess_logger.exception(f"Twitter Interview agent {agent_id} 失败")
+                    results[f"twitter_{agent_id}"] = {
+                        "agent_id": agent_id,
+                        "response": None,
+                        "platform": "twitter",
+                        "error": str(e),
+                        "error_type": type(e).__name__
+                    }
+
         # 处理Reddit平台的采访
-        if reddit_interviews and self.reddit_env:
-            try:
-                reddit_actions = {}
-                for interview in reddit_interviews:
-                    agent_id = interview.get("agent_id")
-                    prompt = interview.get("prompt", "")
+        if reddit_interviews and self.reddit_env and self.reddit_agent_graph:
+            _subprocess_logger.info(f"开始处理 Reddit 采访: count={len(reddit_interviews)}, command_id={command_id}")
+            for interview in reddit_interviews:
+                agent_id = interview.get("agent_id")
+                prompt = interview.get("prompt", "")
+                try:
+                    agent = self.reddit_agent_graph.get_agent(agent_id)
+                    response = await agent.perform_interview(prompt)
+                    # 防御性提取:不同 LLM 包装返回结构差异,逐级兜底
                     try:
-                        agent = self.reddit_agent_graph.get_agent(agent_id)
-                        reddit_actions[agent] = ManualAction(
-                            action_type=ActionType.INTERVIEW,
-                            action_args={"prompt": prompt}
-                        )
-                    except Exception as e:
-                        print(f"  警告: 无法获取Reddit Agent {agent_id}: {e}")
-                
-                if reddit_actions:
-                    await self.reddit_env.step(reddit_actions)
-                    
-                    for interview in reddit_interviews:
-                        agent_id = interview.get("agent_id")
-                        result = self._get_interview_result(agent_id, "reddit")
-                        result["platform"] = "reddit"
-                        results[f"reddit_{agent_id}"] = result
-            except Exception as e:
-                print(f"  Reddit批量Interview失败: {e}")
-        
+                        content = _extract_interview_content(response)
+                    except Exception as _extract_err:
+                        raise _extract_err  # 让外层 except 捕获并填充 error
+                    # 削 preamble:MiniMax/Qwen 系倾向在 answer 前写一段"让我思考/我需要分析"
+                    content = _strip_preamble(content)
+                    results[f"reddit_{agent_id}"] = {
+                        "agent_id": agent_id,
+                        "response": content,
+                        "platform": "reddit",
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    _subprocess_logger.info(f"Reddit Interview agent {agent_id} 完成 ({len(content)} chars)")
+                except Exception as e:
+                    _subprocess_logger.exception(f"Reddit Interview agent {agent_id} 失败")
+                    results[f"reddit_{agent_id}"] = {
+                        "agent_id": agent_id,
+                        "response": None,
+                        "platform": "reddit",
+                        "error": str(e),
+                        "error_type": type(e).__name__
+                    }
+
         if results:
             self.send_response(command_id, "completed", result={
                 "interviews_count": len(results),
@@ -513,7 +896,9 @@ class ParallelIPCHandler:
         else:
             self.send_response(command_id, "failed", error="没有成功的采访")
             return False
-    
+
+
+
     def _get_interview_result(self, agent_id: int, platform: str) -> Dict[str, Any]:
         """从数据库获取最新的Interview结果"""
         db_path = os.path.join(self.simulation_dir, f"{platform}_simulation.db")
@@ -981,56 +1366,20 @@ def _get_comment_info(
     return None
 
 
-def create_model(config: Dict[str, Any], use_boost: bool = False):
-    """
-    创建LLM模型
-    
-    支持双 LLM 配置，用于并行模拟时提速：
-    - 通用配置：LLM_API_KEY, LLM_BASE_URL, LLM_MODEL_NAME
-    - 加速配置（可选）：LLM_BOOST_API_KEY, LLM_BOOST_BASE_URL, LLM_BOOST_MODEL_NAME
-    
-    如果配置了加速 LLM，并行模拟时可以让不同平台使用不同的 API 服务商，提高并发能力。
-    
-    Args:
-        config: 模拟配置字典
-        use_boost: 是否使用加速 LLM 配置（如果可用）
-    """
-    # 检查是否有加速配置
-    boost_api_key = os.environ.get("LLM_BOOST_API_KEY", "")
-    boost_base_url = os.environ.get("LLM_BOOST_BASE_URL", "")
-    boost_model = os.environ.get("LLM_BOOST_MODEL_NAME", "")
-    has_boost_config = bool(boost_api_key)
-    
-    # 根据参数和配置情况选择使用哪个 LLM
-    if use_boost and has_boost_config:
-        # 使用加速配置
-        llm_api_key = boost_api_key
-        llm_base_url = boost_base_url
-        llm_model = boost_model or os.environ.get("LLM_MODEL_NAME", "")
-        config_label = "[加速LLM]"
-    else:
-        # 使用通用配置
-        llm_api_key = os.environ.get("LLM_API_KEY", "")
-        llm_base_url = os.environ.get("LLM_BASE_URL", "")
-        llm_model = os.environ.get("LLM_MODEL_NAME", "")
-        config_label = "[通用LLM]"
-    
-    # 如果 .env 中没有模型名，则使用 config 作为备用
-    if not llm_model:
-        llm_model = config.get("llm_model", "gpt-4o-mini")
-    
-    # 设置 camel-ai 所需的环境变量
+def create_model(config: Dict[str, Any]):
+    """创建统一 LLM 模型，所有平台共用 LLM_* 配置。"""
+    llm_api_key = os.environ.get("LLM_API_KEY", "")
+    llm_base_url = os.environ.get("LLM_BASE_URL", "")
+    llm_model = os.environ.get("LLM_MODEL_NAME", "") or config.get("llm_model", "gpt-4o-mini")
+
     if llm_api_key:
         os.environ["OPENAI_API_KEY"] = llm_api_key
-    
     if not os.environ.get("OPENAI_API_KEY"):
         raise ValueError("缺少 API Key 配置，请在项目根目录 .env 文件中设置 LLM_API_KEY")
-    
     if llm_base_url:
         os.environ["OPENAI_API_BASE_URL"] = llm_base_url
-    
-    print(f"{config_label} model={llm_model}, base_url={llm_base_url[:40] if llm_base_url else '默认'}...")
-    
+
+    print(f"[统一LLM] model={llm_model}, base_url={llm_base_url[:40] if llm_base_url else '默认'}...")
     return ModelFactory.create(
         model_platform=ModelPlatformType.OPENAI,
         model_type=llm_model,
@@ -1043,42 +1392,56 @@ def get_active_agents_for_round(
     current_hour: int,
     round_num: int
 ) -> List:
-    """根据时间和配置决定本轮激活哪些Agent"""
+    """根据时间和配置决定本轮激活哪些Agent。
+
+    修复（r0→r9 跳号 / R1~R8 0 action）：
+    之前实现用 simulated_hour 判定 peak/off_peak，再用 multiplier 缩小 target_count，
+    再用 activity_level=0.5 二次过滤。结果每轮真正激活的 agent 数 ≈ 1~3，
+    大部分 round 几乎没人做事，actions.jsonl 出现 R0/R9/R10 突然冒出来。
+    根本原因：simulated_hour = (round_num * 30) // 60 % 24 在前 10 轮全部落在 off_peak [0..5]，
+    multiplier=0.3 把可用人数压到 ~1.5，再被 activity_level=0.5 砍一半，最终经常 0~2 个 agent。
+
+    新实现：全天随机激活，不依赖 hour 决定人数。
+    - target_count 在 base_min~base_max 之间均匀采样（不再乘 peak/off_peak 倍率）
+    - activity_level 仍用于 agent 候选筛选（保持"不是所有 agent 都必须活跃"语义）
+    - 业务不变：仍是随机抽样，只是每轮都能保证有足够的人在做事
+    """
     time_config = config.get("time_config", {})
     agent_configs = config.get("agent_configs", [])
-    
+
     base_min = time_config.get("agents_per_hour_min", 5)
     base_max = time_config.get("agents_per_hour_max", 20)
-    
-    peak_hours = time_config.get("peak_hours", [9, 10, 11, 14, 15, 20, 21, 22])
-    off_peak_hours = time_config.get("off_peak_hours", [0, 1, 2, 3, 4, 5])
-    
-    if current_hour in peak_hours:
-        multiplier = time_config.get("peak_activity_multiplier", 1.5)
-    elif current_hour in off_peak_hours:
-        multiplier = time_config.get("off_peak_activity_multiplier", 0.3)
-    else:
-        multiplier = 1.0
-    
-    target_count = int(random.uniform(base_min, base_max) * multiplier)
-    
+
+    # 修复：取消 peak/off_peak 倍率，全天均匀采样
+    target_count = int(random.uniform(base_min, base_max))
+
     candidates = []
     for cfg in agent_configs:
         agent_id = cfg.get("agent_id", 0)
-        active_hours = cfg.get("active_hours", list(range(8, 23)))
         activity_level = cfg.get("activity_level", 0.5)
-        
-        if current_hour not in active_hours:
-            continue
-        
+
+        # 修复（R4~R8 0 actions）：忽略 agent 自己的 active_hours 过滤。
+        # 之前：每个 agent 有 active_hours 字段，hour 不在该区间就被过滤。
+        # simulation_config.json 里大部分 agent 的 active_hours 是 [9,10,11,14,15,16,17]，
+        # 所以 R4~R8（hour 4~8）几乎所有 agent 都被过滤 → candidates 为空 → 0 actions。
+        # 现在：全天随机，不再因 hour 跳过 agent。
+        # active_hours 字段保留但忽略（兼容老 config）
+
         if random.random() < activity_level:
             candidates.append(agent_id)
-    
+
     selected_ids = random.sample(
-        candidates, 
+        candidates,
         min(target_count, len(candidates))
     ) if candidates else []
-    
+
+    # 诊断日志：每轮打印激活的 agent 数量，方便排查"R4~R8 0 actions"问题
+    if _subprocess_logger:
+        _subprocess_logger.info(
+            f"[R{round_num + 1}/hour={simulated_hour if 'simulated_hour' in dir() else '?'}] "
+            f"candidates={len(candidates)}, selected={len(selected_ids)}, target={target_count}"
+        )
+
     active_agents = []
     for agent_id in selected_ids:
         try:
@@ -1086,7 +1449,7 @@ def get_active_agents_for_round(
             active_agents.append((agent_id, agent))
         except Exception:
             pass
-    
+
     return active_agents
 
 
@@ -1096,6 +1459,150 @@ class PlatformSimulation:
         self.env = None
         self.agent_graph = None
         self.total_actions = 0
+
+
+# ========================================================================
+# 快照恢复(resume)模式：检测 DB 是否来自快照，决定是否跳过 signup/reset
+# 见 OASIS 0.2.5 platform.running() + agents_generator.connect_platform_channel
+# ========================================================================
+async def _resume_platform_env(env, agent_graph, platform_name: str, start_round: int,
+                               minutes_per_round: int, log_info,
+                               db_path: Optional[str] = None) -> None:
+    """
+    把 snapshot DB 已落地的 OASIS 平台状态连接到 in-memory agent_graph。
+    - 启动 platform.running() 协程(替代 env.reset() 默认的启动方式)
+    - 用 connect_platform_channel 把 env.channel 挂到每个 agent 的 channel + env.action.channel
+    - 恢复 Twitter sandbox_clock.time_step / Reddit pl_utils.start_time,让新动作的时间与快照后续轮次连续
+
+    平台时间恢复策略:
+    - 优先从 trace 表读 MAX(created_at) 决定起点,确保 resume 后写入的时间严格大于历史最大时间
+      (避免与 snapshot 中已经存在的最后一条记录时间冲突)
+    - 当 trace 表为空或读取失败时,回退到 start_round 推算的起点
+    """
+    try:
+        from oasis.social_agent.agents_generator import connect_platform_channel
+    except Exception as _e:
+        log_info(f"导入 connect_platform_channel 失败,resume 模式不可用: {_e}")
+        raise
+
+    # 把 env 的 channel 接到所有 agent 上
+    env.agent_graph = connect_platform_channel(channel=env.channel,
+                                               agent_graph=agent_graph)
+
+    # 手动启动 platform 主循环(替代 env.reset() 内部的 platform_task)
+    env.platform_task = asyncio.create_task(env.platform.running())
+
+    # 读取 trace 表历史最大 created_at,作为平台时钟恢复的依据
+    max_created_at = _trace_max_created_at(db_path) if db_path else None
+
+    # 恢复平台时间状态,避免新动作的时间戳从 0/现在 开始
+    try:
+        if platform_name == "twitter":
+            # Twitter 用 sandbox_clock.time_step(整数)作为 created_at,每 step() +1
+            # 从 trace 表历史 max(created_at) + 1 恢复,保证新写入的 created_at 紧接历史最大时间
+            if max_created_at is not None:
+                try:
+                    new_time_step = max(int(start_round), int(max_created_at) + 1)
+                except (TypeError, ValueError):
+                    new_time_step = int(start_round)
+            else:
+                new_time_step = int(start_round)
+            env.platform.sandbox_clock.time_step = new_time_step
+            log_info(
+                f"[Resume] Twitter sandbox_clock.time_step 已恢复为 {new_time_step}"
+                f"(来源: trace MAX(created_at)={max_created_at}, start_round={start_round}),"
+                f"下一轮 step() 后将写入 created_at={new_time_step + 1}"
+            )
+        elif platform_name == "reddit":
+            # Reddit 用 time_transfer:start_time + k*(now - real_start_time)
+            # k=60 → 1 真实秒 = 60 模拟秒 = 1 模拟分钟
+            # 想要新动作的 created_at 约等于 "快照后下一轮"的模拟时间。
+            # 优先从 trace 表历史 max(created_at) 推导 real_start_time:
+            #   created_at = real_start_time + k * (real_now - real_start_time)
+            #   ⇒ real_start_time = real_now - (created_at - real_start_time) / k
+            # 若 trace 表为空或读取失败,则回退到 start_round 推算的 offset。
+            from datetime import datetime, timedelta
+            real_now = datetime.now()
+            new_start_time: Optional[datetime] = None
+            fallback_offset_seconds = (start_round * minutes_per_round) / 60.0
+
+            if max_created_at is not None:
+                try:
+                    # Reddit 的 created_at 是 ISO 字符串
+                    last_sim_time = datetime.fromisoformat(str(max_created_at))
+                    next_sim_time = last_sim_time + timedelta(minutes=minutes_per_round)
+                    clock = env.platform.sandbox_clock
+                    clock_real_start = getattr(clock, "real_start_time", real_now)
+                    k = getattr(clock, "k", 60)
+                    elapsed_real_seconds = (real_now - clock_real_start).total_seconds()
+                    new_start_time = next_sim_time - timedelta(
+                        seconds=k * elapsed_real_seconds
+                    )
+                    log_info(
+                        f"[Resume] Reddit start_time 基于 trace MAX(created_at)={max_created_at} 推导,"
+                        f"next_sim_time={next_sim_time.isoformat()}"
+                    )
+                except (TypeError, ValueError) as _parse_err:
+                    log_info(
+                        f"[Resume] Reddit trace created_at 解析失败,使用当前时间作为恢复基准: {_parse_err}"
+                    )
+                    new_start_time = real_now
+
+            if new_start_time is None:
+                new_start_time = real_now
+                log_info(
+                    "[Resume] Reddit trace 不可用,使用当前时间作为恢复基准"
+                )
+
+            # Platform 和 PlatformUtils 都持有 start_time,两处保持一致
+            env.platform.start_time = new_start_time
+            try:
+                env.platform.pl_utils.start_time = new_start_time
+            except Exception:
+                pass
+            log_info(
+                f"[Resume] Reddit start_time 已设置为 {new_start_time.isoformat()},"
+                f"新动作时间将从快照后下一模拟时间开始"
+            )
+    except Exception as _te:
+        log_info(f"[Resume] 恢复平台时钟失败(继续): {_te}")
+
+
+def _trace_max_rowid(db_path: str) -> int:
+    """读取现有 trace 表的最大 rowid,用于 resume 模式让 last_rowid 跳过历史动作"""
+    if not os.path.exists(db_path):
+        return 0
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT IFNULL(MAX(rowid), 0) FROM trace")
+        row = cursor.fetchone()
+        conn.close()
+        return int(row[0]) if row else 0
+    except Exception:
+        return 0
+
+
+def _trace_max_created_at(db_path: str) -> Optional[Any]:
+    """读取现有 trace 表的最大 created_at,用于 resume 模式恢复平台时钟。
+
+    - Twitter 的 created_at 是整数(time_step)
+    - Reddit 的 created_at 是 ISO 字符串
+    返回原始类型(Union[int, str, None]),调用方按平台类型解读。
+    """
+    if not os.path.exists(db_path):
+        return None
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT MAX(created_at) FROM trace")
+        row = cursor.fetchone()
+        conn.close()
+        if not row or row[0] is None:
+            return None
+        return row[0]
+    except Exception:
+        return None
 
 
 async def run_twitter_simulation(
@@ -1115,82 +1622,141 @@ async def run_twitter_simulation(
         main_logger: 主日志管理器
         max_rounds: 最大模拟轮数（可选，用于截断过长的模拟）
         start_round: 从指定轮次开始（0=从头开始）
+                       >0 且快照 DB 存在时进入 resume 模式:不删 DB、不 reset、不 signup、不发初始帖
 
     Returns:
         PlatformSimulation: 包含env和agent_graph的结果对象
     """
     result = PlatformSimulation()
-    
+
     def log_info(msg):
         if main_logger:
             main_logger.info(f"[Twitter] {msg}")
         print(f"[Twitter] {msg}")
-    
+
     log_info("初始化...")
-    
-    # Twitter 使用通用 LLM 配置
-    model = create_model(config, use_boost=False)
-    
+
+    # Twitter 与 Reddit 共用统一 LLM 配置
+    model = create_model(config)
+
     # OASIS Twitter使用CSV格式
     profile_path = os.path.join(simulation_dir, "twitter_profiles.csv")
     if not os.path.exists(profile_path):
         log_info(f"错误: Profile文件不存在: {profile_path}")
         return result
-    
-    result.agent_graph = await generate_twitter_agent_graph(
-        profile_path=profile_path,
-        model=model,
-        available_actions=TWITTER_ACTIONS,
+
+    # Agent persona 缓存:有 cache 且 hash 匹配 → 跳过 320 个 SocialAgent 构造(省 ~30-50s)
+    _twitter_config_path = os.path.join(simulation_dir, "simulation_config.json")
+    cached_graph, cache_hit = _try_load_cached_agent_graph(
+        simulation_dir, profile_path, _twitter_config_path, model, TWITTER_ACTIONS, "twitter"
     )
-    
+    if cache_hit and cached_graph is not None:
+        result.agent_graph = cached_graph
+    else:
+        result.agent_graph = await generate_twitter_agent_graph(
+            profile_path=profile_path,
+            model=model,
+            available_actions=TWITTER_ACTIONS,
+        )
+        # 异步写 cache(不阻塞主流程);cache hit miss 是常见情况
+        _save_agent_graph_to_cache(
+            simulation_dir, result.agent_graph, profile_path, _twitter_config_path, "twitter"
+        )
+
     # 从配置文件获取 Agent 真实名称映射（使用 entity_name 而非默认的 Agent_X）
     agent_names = get_agent_names_from_config(config)
     # 如果配置中没有某个 agent，则使用 OASIS 的默认名称
     for agent_id, agent in result.agent_graph.get_agents():
         if agent_id not in agent_names:
             agent_names[agent_id] = getattr(agent, 'name', f'Agent_{agent_id}')
-    
+
     db_path = os.path.join(simulation_dir, "twitter_simulation.db")
-    if os.path.exists(db_path):
-        try:
-            os.remove(db_path)
-        except PermissionError:
-            # Windows 文件锁定问题，等待后重试
-            import time
-            time.sleep(2)
+    db_exists_before = os.path.exists(db_path)
+
+    # ------------------------------------------------------------------
+    # Resume 模式判定:
+    #   start_round > 0 且 DB 已存在(快照恢复后由 restore_snapshot 写入)
+    #   → 跳过 DB 删除 + env.reset() + 初始帖子,直接接管 snapshot 的世界状态
+    # ------------------------------------------------------------------
+    is_resume = start_round > 0 and db_exists_before
+    if is_resume:
+        log_info(
+            f"检测到快照恢复场景:start_round={start_round} 且 DB 已存在({db_path}) → 进入 resume 模式"
+            f"(不删 DB / 不 reset / 不 signup / 不发初始帖,直接接管 snapshot 世界状态)"
+        )
+    else:
+        if db_exists_before:
             try:
                 os.remove(db_path)
             except PermissionError:
-                # 如果仍然锁定，使用新文件名
-                db_path = os.path.join(simulation_dir, f"twitter_simulation_{int(time.time())}.db")
-                log_info(f"原数据库文件被锁定，使用新文件: {db_path}")
-    
+                # Windows 文件锁定问题，等待后重试
+                import time
+                time.sleep(2)
+                try:
+                    os.remove(db_path)
+                except PermissionError:
+                    # 如果仍然锁定，使用新文件名
+                    db_path = os.path.join(simulation_dir, f"twitter_simulation_{int(time.time())}.db")
+                    log_info(f"原数据库文件被锁定，使用新文件: {db_path}")
+
     result.env = oasis.make(
         agent_graph=result.agent_graph,
         platform=oasis.DefaultPlatformType.TWITTER,
         database_path=db_path,
         semaphore=30,  # 限制最大并发 LLM 请求数，防止 API 过载
     )
-    
-    await result.env.reset()
-    log_info("环境已启动")
-    
-    if action_logger:
+
+    if is_resume:
+        # 用 platform.running() + connect_platform_channel 接管 snapshot DB,
+        # 完全跳过 env.reset() —— 它会通过 generate_custom_agents 重跑 signup 污染 DB
+        time_config_for_resume = config.get("time_config", {})
+        minutes_per_round_for_resume = time_config_for_resume.get("minutes_per_round", 30)
+        # 关键修复（双平台轮次错位）：resume 时用本平台 runtime_state.json 里的
+        # completed_round 修正起始轮次，而不是沿用统一 start_round。
+        # 场景：快照时 Twitter 跑完 R3、Reddit 只跑完 R2，run_state.current_round
+        # 取 max=3 → 统一 start_round=3 → Reddit 主循环 range(3,..) 从 R4 开始，
+        # Reddit 的 R3 被直接跳过。各平台按自身进度续跑才能对齐。
+        runtime_state = _load_runtime_state(simulation_dir, result.agent_graph, "twitter")
+        completed_round = runtime_state.get("completed_round")
+        if isinstance(completed_round, int) and completed_round >= 0:
+            if completed_round != start_round:
+                log_info(
+                    f"[Resume] Twitter 按本平台进度修正起始轮次: {start_round} -> {completed_round}"
+                    f"（本平台已完成 R1~R{completed_round}，将从 R{completed_round + 1} 续跑）"
+                )
+            start_round = completed_round
+        await _resume_platform_env(
+            env=result.env,
+            agent_graph=result.agent_graph,
+            platform_name="twitter",
+            start_round=start_round,
+            minutes_per_round=minutes_per_round_for_resume,
+            log_info=log_info,
+            db_path=db_path,
+        )
+        log_info("[Resume] Twitter 环境已从快照恢复,保留 DB 中所有历史用户/帖子/关注")
+    else:
+        _reset_persistent_runtime_state(simulation_dir, "twitter")
+        await result.env.reset()
+        log_info("环境已启动")
+
+    if action_logger and not is_resume:
         action_logger.log_simulation_start(config)
-    
+
     total_actions = 0
-    last_rowid = 0  # 跟踪数据库中最后处理的行号（使用 rowid 避免 created_at 格式差异）
-    
-    # 执行初始事件
+    # Resume 模式:last_rowid 从 DB 当前最大 rowid 开始,避免把历史动作重复落盘
+    last_rowid = _trace_max_rowid(db_path) if is_resume else 0
+
+    # 执行初始事件 —— resume 模式跳过(初始帖已在 snapshot DB 中,不需要再发一次)
     event_config = config.get("event_config", {})
     initial_posts = event_config.get("initial_posts", [])
-    
+
     # 记录 round 0 开始（初始事件阶段）
-    if action_logger:
+    if action_logger and not is_resume:
         action_logger.log_round_start(0, 0)  # round 0, simulated_hour 0
-    
+
     initial_action_count = 0
-    if initial_posts:
+    if initial_posts and not is_resume:
         initial_actions = {}
         for post in initial_posts:
             agent_id = post.get("poster_agent_id", 0)
@@ -1201,7 +1767,7 @@ async def run_twitter_simulation(
                     action_type=ActionType.CREATE_POST,
                     action_args={"content": content}
                 )
-                
+
                 if action_logger:
                     action_logger.log_action(
                         round_num=0,
@@ -1214,13 +1780,18 @@ async def run_twitter_simulation(
                     initial_action_count += 1
             except Exception:
                 pass
-        
+
         if initial_actions:
             await result.env.step(initial_actions)
             log_info(f"已发布 {len(initial_actions)} 条初始帖子")
-    
+    elif is_resume and initial_posts:
+        log_info(
+            f"[Resume] 跳过 {len(initial_posts)} 条 initial_posts,"
+            f"它们已在 snapshot DB 中(action_logger 不会再重复记录)"
+        )
+
     # 记录 round 0 结束
-    if action_logger:
+    if action_logger and not is_resume:
         action_logger.log_round_end(0, initial_action_count)
     
     # 主模拟循环
@@ -1239,6 +1810,14 @@ async def run_twitter_simulation(
         total_rounds = min(total_rounds, max_rounds)
         if total_rounds < original_rounds:
             log_info(f"轮数已截断: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
+
+    # chat-only 模式检测:start_round >= total_rounds → 主循环是空 range,直接跳到 IPC wait。
+    # 在循环前显式打日志,运维一眼能看出是否走了 chat-only 快路径。
+    if start_round >= total_rounds:
+        log_info(
+            f"Chat-only 模式:start_round={start_round} >= total_rounds={total_rounds},"
+            f"rounds 循环空跑,直接进入 IPC wait。Step 5 chat 可立即使用。"
+        )
 
     start_time = datetime.now()
 
@@ -1290,20 +1869,29 @@ async def run_twitter_simulation(
         
         if action_logger:
             action_logger.log_round_end(round_num + 1, round_action_count)
-        
+
+        # 持久化 agent memory + Python/OASIS random state(每轮)
+        _save_runtime_state(
+            simulation_dir,
+            result.env.agent_graph,
+            "twitter",
+            round_num + 1,
+            total_rounds,
+        )
+
         if (round_num + 1) % 20 == 0:
             progress = (round_num + 1) / total_rounds * 100
             log_info(f"Day {simulated_day}, {simulated_hour:02d}:00 - Round {round_num + 1}/{total_rounds} ({progress:.1f}%)")
-    
+
     # 注意：不关闭环境，保留给Interview使用
-    
+
     if action_logger:
         action_logger.log_simulation_end(total_rounds, total_actions)
-    
+
     result.total_actions = total_actions
     elapsed = (datetime.now() - start_time).total_seconds()
     log_info(f"模拟循环完成! 耗时: {elapsed:.1f}秒, 总动作: {total_actions}")
-    
+
     return result
 
 
@@ -1324,81 +1912,133 @@ async def run_reddit_simulation(
         main_logger: 主日志管理器
         max_rounds: 最大模拟轮数（可选，用于截断过长的模拟）
         start_round: 从指定轮次开始（0=从头开始）
+                       >0 且快照 DB 存在时进入 resume 模式:不删 DB、不 reset、不 signup、不发初始帖
 
     Returns:
         PlatformSimulation: 包含env和agent_graph的结果对象
     """
     result = PlatformSimulation()
-    
+
     def log_info(msg):
         if main_logger:
             main_logger.info(f"[Reddit] {msg}")
         print(f"[Reddit] {msg}")
-    
+
     log_info("初始化...")
-    
-    # Reddit 使用加速 LLM 配置（如果有的话，否则回退到通用配置）
-    model = create_model(config, use_boost=True)
-    
+
+    # Reddit 与 Twitter 使用同一套全局 LLM 配置
+    model = create_model(config)
+
     profile_path = os.path.join(simulation_dir, "reddit_profiles.json")
     if not os.path.exists(profile_path):
         log_info(f"错误: Profile文件不存在: {profile_path}")
         return result
-    
-    result.agent_graph = await generate_reddit_agent_graph(
-        profile_path=profile_path,
-        model=model,
-        available_actions=REDDIT_ACTIONS,
+
+    # Agent persona 缓存:同上 Reddit 路径(见 _try_load_cached_agent_graph 注释)
+    _reddit_config_path = os.path.join(simulation_dir, "simulation_config.json")
+    cached_graph, cache_hit = _try_load_cached_agent_graph(
+        simulation_dir, profile_path, _reddit_config_path, model, REDDIT_ACTIONS, "reddit"
     )
-    
+    if cache_hit and cached_graph is not None:
+        result.agent_graph = cached_graph
+    else:
+        result.agent_graph = await generate_reddit_agent_graph(
+            profile_path=profile_path,
+            model=model,
+            available_actions=REDDIT_ACTIONS,
+        )
+        _save_agent_graph_to_cache(
+            simulation_dir, result.agent_graph, profile_path, _reddit_config_path, "reddit"
+        )
+
     # 从配置文件获取 Agent 真实名称映射（使用 entity_name 而非默认的 Agent_X）
     agent_names = get_agent_names_from_config(config)
     # 如果配置中没有某个 agent，则使用 OASIS 的默认名称
     for agent_id, agent in result.agent_graph.get_agents():
         if agent_id not in agent_names:
             agent_names[agent_id] = getattr(agent, 'name', f'Agent_{agent_id}')
-    
+
     db_path = os.path.join(simulation_dir, "reddit_simulation.db")
-    if os.path.exists(db_path):
-        try:
-            os.remove(db_path)
-        except PermissionError:
-            # Windows 文件锁定问题，等待后重试
-            import time
-            time.sleep(2)
+    db_exists_before = os.path.exists(db_path)
+
+    # ------------------------------------------------------------------
+    # Resume 模式判定:与 Twitter 同语义
+    # ------------------------------------------------------------------
+    is_resume = start_round > 0 and db_exists_before
+    if is_resume:
+        log_info(
+            f"检测到快照恢复场景:start_round={start_round} 且 DB 已存在({db_path}) → 进入 resume 模式"
+            f"(不删 DB / 不 reset / 不 signup / 不发初始帖,直接接管 snapshot 世界状态)"
+        )
+    else:
+        if db_exists_before:
             try:
                 os.remove(db_path)
             except PermissionError:
-                # 如果仍然锁定，使用新文件名
-                db_path = os.path.join(simulation_dir, f"reddit_simulation_{int(time.time())}.db")
-                log_info(f"原数据库文件被锁定，使用新文件: {db_path}")
-    
+                # Windows 文件锁定问题，等待后重试
+                import time
+                time.sleep(2)
+                try:
+                    os.remove(db_path)
+                except PermissionError:
+                    # 如果仍然锁定，使用新文件名
+                    db_path = os.path.join(simulation_dir, f"reddit_simulation_{int(time.time())}.db")
+                    log_info(f"原数据库文件被锁定，使用新文件: {db_path}")
+
     result.env = oasis.make(
         agent_graph=result.agent_graph,
         platform=oasis.DefaultPlatformType.REDDIT,
         database_path=db_path,
         semaphore=30,  # 限制最大并发 LLM 请求数，防止 API 过载
     )
-    
-    await result.env.reset()
-    log_info("环境已启动")
-    
+
+    if is_resume:
+        time_config_for_resume = config.get("time_config", {})
+        minutes_per_round_for_resume = time_config_for_resume.get("minutes_per_round", 30)
+        # 关键修复（双平台轮次错位）：与 Twitter 同语义——resume 时用本平台
+        # runtime_state.json 的 completed_round 修正起始轮次，避免落后的平台
+        # 被统一 start_round 强行对齐到领先平台的轮次而跳轮。
+        runtime_state = _load_runtime_state(simulation_dir, result.agent_graph, "reddit")
+        completed_round = runtime_state.get("completed_round")
+        if isinstance(completed_round, int) and completed_round >= 0:
+            if completed_round != start_round:
+                log_info(
+                    f"[Resume] Reddit 按本平台进度修正起始轮次: {start_round} -> {completed_round}"
+                    f"（本平台已完成 R1~R{completed_round}，将从 R{completed_round + 1} 续跑）"
+                )
+            start_round = completed_round
+        await _resume_platform_env(
+            env=result.env,
+            agent_graph=result.agent_graph,
+            platform_name="reddit",
+            start_round=start_round,
+            minutes_per_round=minutes_per_round_for_resume,
+            log_info=log_info,
+            db_path=db_path,
+        )
+        log_info("[Resume] Reddit 环境已从快照恢复,保留 DB 中所有历史用户/帖子/评论")
+    else:
+        _reset_persistent_runtime_state(simulation_dir, "reddit")
+        await result.env.reset()
+        log_info("环境已启动")
+
     if action_logger:
         action_logger.log_simulation_start(config)
-    
+
     total_actions = 0
-    last_rowid = 0  # 跟踪数据库中最后处理的行号（使用 rowid 避免 created_at 格式差异）
-    
-    # 执行初始事件
+    # Resume 模式:last_rowid 从 DB 当前最大 rowid 开始
+    last_rowid = _trace_max_rowid(db_path) if is_resume else 0
+
+    # 执行初始事件 —— resume 模式跳过
     event_config = config.get("event_config", {})
     initial_posts = event_config.get("initial_posts", [])
-    
+
     # 记录 round 0 开始（初始事件阶段）
-    if action_logger:
+    if action_logger and not is_resume:
         action_logger.log_round_start(0, 0)  # round 0, simulated_hour 0
-    
+
     initial_action_count = 0
-    if initial_posts:
+    if initial_posts and not is_resume:
         initial_actions = {}
         for post in initial_posts:
             agent_id = post.get("poster_agent_id", 0)
@@ -1417,7 +2057,7 @@ async def run_reddit_simulation(
                         action_type=ActionType.CREATE_POST,
                         action_args={"content": content}
                     )
-                
+
                 if action_logger:
                     action_logger.log_action(
                         round_num=0,
@@ -1430,13 +2070,18 @@ async def run_reddit_simulation(
                     initial_action_count += 1
             except Exception:
                 pass
-        
+
         if initial_actions:
             await result.env.step(initial_actions)
             log_info(f"已发布 {len(initial_actions)} 条初始帖子")
-    
+    elif is_resume and initial_posts:
+        log_info(
+            f"[Resume] 跳过 {len(initial_posts)} 条 initial_posts,"
+            f"它们已在 snapshot DB 中(action_logger 不会再重复记录)"
+        )
+
     # 记录 round 0 结束
-    if action_logger:
+    if action_logger and not is_resume:
         action_logger.log_round_end(0, initial_action_count)
     
     # 主模拟循环
@@ -1455,6 +2100,14 @@ async def run_reddit_simulation(
         total_rounds = min(total_rounds, max_rounds)
         if total_rounds < original_rounds:
             log_info(f"轮数已截断: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
+
+    # chat-only 模式检测:start_round >= total_rounds → 主循环是空 range,直接跳到 IPC wait。
+    # 在循环前显式打日志,运维一眼能看出是否走了 chat-only 快路径。
+    if start_round >= total_rounds:
+        log_info(
+            f"Chat-only 模式:start_round={start_round} >= total_rounds={total_rounds},"
+            f"rounds 循环空跑,直接进入 IPC wait。Step 5 chat 可立即使用。"
+        )
 
     start_time = datetime.now()
 
@@ -1506,21 +2159,55 @@ async def run_reddit_simulation(
         
         if action_logger:
             action_logger.log_round_end(round_num + 1, round_action_count)
-        
+
+        # 持久化 agent memory + Python/OASIS random state(每轮)
+        _save_runtime_state(
+            simulation_dir,
+            result.env.agent_graph,
+            "reddit",
+            round_num + 1,
+            total_rounds,
+        )
+
         if (round_num + 1) % 20 == 0:
             progress = (round_num + 1) / total_rounds * 100
             log_info(f"Day {simulated_day}, {simulated_hour:02d}:00 - Round {round_num + 1}/{total_rounds} ({progress:.1f}%)")
-    
+
     # 注意：不关闭环境，保留给Interview使用
-    
+
     if action_logger:
         action_logger.log_simulation_end(total_rounds, total_actions)
-    
+
     result.total_actions = total_actions
     elapsed = (datetime.now() - start_time).total_seconds()
     log_info(f"模拟循环完成! 耗时: {elapsed:.1f}秒, 总动作: {total_actions}")
-    
+
     return result
+
+
+async def _env_status_heartbeat_loop(simulation_dir: str):
+    """
+    后台心跳任务:每 30s 刷一次 env_status.json 的 timestamp。
+    让前端 check_env_alive(60s 过期窗口)在 rounds 长时间跑期间也返回 True。
+    修 #27:Step 5 进入发现 env_status 过期的根因。
+    """
+    try:
+        from app.services.simulation_ipc import SimulationIPCClient
+    except Exception:
+        return
+
+    ipc_client = SimulationIPCClient(simulation_dir)
+    try:
+        while True:
+            await asyncio.sleep(30)
+            try:
+                ipc_client._update_env_status("alive")
+            except Exception:
+                # 心跳失败不要让 task 死掉 —— 下一轮再试
+                pass
+    except asyncio.CancelledError:
+        # 收到取消信号(主流程退出),静默退出
+        pass
 
 
 async def main():
@@ -1611,11 +2298,27 @@ async def main():
     log_manager.info("=" * 60)
     
     start_time = datetime.now()
-    
+
     # 存储两个平台的模拟结果
     twitter_result: Optional[PlatformSimulation] = None
     reddit_result: Optional[PlatformSimulation] = None
-    
+
+    # 优化 #27:env_status 早期 alive + 后台心跳
+    # 之前只在 wait_for_commands 阶段调用 update_status("alive"),rounds 期间(可能跑几十分钟)
+    # env_status.json 没有 timestamp 刷新,前端 check_env_alive 会因为 timestamp 过期返回 False
+    # → IPC 命令堆积 / Step5 504 / 用户以为死了
+    # 修法:rounds 一开始就写 alive + 启动后台心跳每 30s 刷一次 timestamp
+    heartbeat_task: Optional[asyncio.Task] = None
+    if wait_for_commands:
+        try:
+            from app.services.simulation_ipc import SimulationIPCClient
+            early_ipc = SimulationIPCClient(simulation_dir)
+            early_ipc._update_env_status("alive")
+            heartbeat_task = asyncio.create_task(_env_status_heartbeat_loop(simulation_dir))
+            log_manager.info("已标记 env_status=alive,启动后台心跳(30s/次)")
+        except Exception as e:
+            log_manager.info(f"早期 alive 标记失败(继续): {e}")
+
     if args.twitter_only:
         twitter_result = await run_twitter_simulation(config, simulation_dir, twitter_logger, log_manager, args.max_rounds, args.start_round)
     elif args.reddit_only:
@@ -1671,7 +2374,15 @@ async def main():
         
         log_manager.info("\n关闭环境...")
         ipc_handler.update_status("stopped")
-    
+
+    # 取消 env_status 心跳任务(rounds 期间后台跑的),避免它继续覆盖 stopped 标记
+    if heartbeat_task is not None:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
+
     # 关闭环境
     if twitter_result and twitter_result.env:
         await twitter_result.env.close()

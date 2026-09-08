@@ -157,6 +157,56 @@
       </div>
     </div>
 
+    <!-- 轮数选择提示 — 直接进入 Step3 全新启动时，先询问本次模拟轮数 -->
+    <div class="auto-restore-prompt rounds-prompt" v-if="showRoundsPrompt">
+      <div class="prompt-content">
+        <svg class="prompt-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10"></circle>
+          <polyline points="12 6 12 12 16 14"></polyline>
+        </svg>
+        <div class="prompt-text">
+          <span class="prompt-title">{{ $t('step3.roundsPromptTitle') }}</span>
+          <span class="prompt-desc">
+            {{ roundsConfigLoading ? $t('step3.roundsPromptLoading') : $t('step3.roundsPromptDesc', { rounds: promptAutoRounds || 40 }) }}
+          </span>
+        </div>
+        <input
+          type="number"
+          class="rounds-input"
+          v-model.number="promptRounds"
+          min="10"
+          :max="promptAutoRounds || undefined"
+          :disabled="roundsConfigLoading"
+        />
+      </div>
+      <div class="prompt-actions">
+        <button class="prompt-btn primary" :disabled="roundsConfigLoading" @click="handleRoundsPromptConfirm">
+          {{ $t('step3.roundsPromptStart') }}
+        </button>
+        <button class="prompt-btn secondary" @click="handleRoundsPromptCancel">
+          {{ $t('step3.roundsPromptCancel') }}
+        </button>
+      </div>
+    </div>
+
+    <!-- 轮数选择被取消后：保留重新配置入口，避免无法启动 -->
+    <div class="auto-restore-prompt" v-if="roundsPromptDismissed && !showRoundsPrompt && phase === 0 && !isStarting">
+      <div class="prompt-content">
+        <svg class="prompt-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+          <polygon points="5 3 19 12 5 21 5 3"></polygon>
+        </svg>
+        <div class="prompt-text">
+          <span class="prompt-title">{{ $t('step3.roundsDismissedTitle') }}</span>
+          <span class="prompt-desc">{{ $t('step3.roundsDismissedDesc') }}</span>
+        </div>
+      </div>
+      <div class="prompt-actions">
+        <button class="prompt-btn primary" @click="reopenRoundsPrompt">
+          {{ $t('step3.roundsPromptStart') }}
+        </button>
+      </div>
+    </div>
+
     <!-- Main Content: Dual Timeline -->
     <div class="main-content-area" ref="scrollContainer">
       <!-- Timeline Header -->
@@ -278,19 +328,59 @@
                 <template v-if="action.action_type === 'FOLLOW'">
                   <div class="follow-info">
                     <svg class="icon-small" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="8.5" cy="7" r="4"></circle><line x1="20" y1="8" x2="20" y2="14"></line><line x1="23" y1="11" x2="17" y2="11"></line></svg>
-                    <span class="follow-label">Followed @{{ action.action_args?.target_user || action.action_args?.user_id || 'User' }}</span>
+                    <span class="follow-label">Followed @{{ action.action_args?.target_user_name || action.action_args?.target_user || action.action_args?.user_id || 'User' }}</span>
                   </div>
                 </template>
 
-                <!-- UPVOTE / DOWNVOTE -->
-                <template v-if="action.action_type === 'UPVOTE_POST' || action.action_type === 'DOWNVOTE_POST'">
+                <!-- UPVOTE / DOWNVOTE / DISLIKE: 帖子投票 -->
+                <template v-if="['UPVOTE_POST', 'DOWNVOTE_POST', 'DISLIKE_POST'].includes(action.action_type)">
                   <div class="vote-info">
                     <svg v-if="action.action_type === 'UPVOTE_POST'" class="icon-small" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"></polyline></svg>
                     <svg v-else class="icon-small" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
-                    <span class="vote-label">{{ action.action_type === 'UPVOTE_POST' ? 'Upvoted' : 'Downvoted' }} Post</span>
+                    <span class="vote-label">
+                      {{ action.action_type === 'UPVOTE_POST' ? 'Upvoted' : (action.action_type === 'DOWNVOTE_POST' ? 'Downvoted' : 'Disliked') }}
+                      @{{ action.action_args?.post_author_name || 'User' }}'s post
+                    </span>
                   </div>
                   <div v-if="action.action_args?.post_content" class="voted-content">
                     "{{ truncateContent(action.action_args.post_content, 120) }}"
+                  </div>
+                </template>
+
+                <!-- LIKE_COMMENT / DISLIKE_COMMENT: 评论投票 -->
+                <template v-if="action.action_type === 'LIKE_COMMENT' || action.action_type === 'DISLIKE_COMMENT'">
+                  <div class="vote-info">
+                    <svg v-if="action.action_type === 'LIKE_COMMENT'" class="icon-small filled" viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg>
+                    <svg v-else class="icon-small" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+                    <span class="vote-label">{{ action.action_type === 'LIKE_COMMENT' ? 'Liked' : 'Disliked' }} @{{ action.action_args?.comment_author_name || 'User' }}'s comment</span>
+                  </div>
+                  <div v-if="action.action_args?.comment_content" class="voted-content">
+                    "{{ truncateContent(action.action_args.comment_content, 120) }}"
+                  </div>
+                </template>
+
+                <!-- MUTE: 屏蔽用户 -->
+                <template v-if="action.action_type === 'MUTE'">
+                  <div class="follow-info">
+                    <svg class="icon-small" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"></line></svg>
+                    <span class="follow-label">Muted @{{ action.action_args?.target_user_name || action.action_args?.user_id || 'User' }}</span>
+                  </div>
+                </template>
+
+                <!-- SEARCH_USER: 搜索用户 -->
+                <template v-if="action.action_type === 'SEARCH_USER'">
+                  <div class="search-info">
+                    <svg class="icon-small" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+                    <span class="search-label">Search User:</span>
+                    <span class="search-query">"{{ action.action_args?.query || action.action_args?.user_name || '' }}"</span>
+                  </div>
+                </template>
+
+                <!-- TREND: 查看热榜 -->
+                <template v-if="action.action_type === 'TREND'">
+                  <div class="idle-info">
+                    <svg class="icon-small" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"></polyline><polyline points="17 6 23 6 23 12"></polyline></svg>
+                    <span class="idle-label">Checked Trending Topics</span>
                   </div>
                 </template>
 
@@ -302,9 +392,11 @@
                   </div>
                 </template>
 
-                <!-- 通用回退：未知类型或有 content 但未被上述处理 -->
-                <div v-if="!['CREATE_POST', 'QUOTE_POST', 'REPOST', 'LIKE_POST', 'CREATE_COMMENT', 'SEARCH_POSTS', 'FOLLOW', 'UPVOTE_POST', 'DOWNVOTE_POST', 'DO_NOTHING'].includes(action.action_type) && action.action_args?.content" class="content-text">
-                  {{ action.action_args.content }}
+                <!-- 通用回退：未知类型，或已知类型但 enrich 字段缺失导致正文为空。
+                     有 content 显示内容，否则显示动作类型，保证卡片永不空白 -->
+                <div v-if="!knownActionTypes.includes(action.action_type) || isCardBodyEmpty(action)" class="content-text">
+                  <template v-if="action.action_args?.content">{{ action.action_args.content }}</template>
+                  <template v-else>{{ getActionTypeLabel(action.action_type) }}</template>
                 </div>
               </div>
 
@@ -402,7 +494,7 @@
           <div class="restore-choice-options">
             <label class="restore-choice-option">
               <input type="radio" name="restoreMode" value="continue" v-model="restoreMode" />
-              <span class="option-label">{{ $t('log.snapshotRestoreContinueFromSnapshot', { round: selectedSnapshot?.run_state?.current_round || 0 }) }}</span>
+              <span class="option-label">{{ snapshotContinueLabel(selectedSnapshot) }}</span>
             </label>
             <label class="restore-choice-option">
               <input type="radio" name="restoreMode" value="start_over" v-model="restoreMode" />
@@ -459,7 +551,8 @@ import {
   createSnapshot,
   listSnapshots,
   restoreSnapshot,
-  deleteSnapshot
+  deleteSnapshot,
+  getSimulationConfig
 } from '../api/simulation'
 import { generateReport } from '../api/report'
 
@@ -495,6 +588,10 @@ const pollErrorCount = ref(0)
 const pollErrorBanner = ref('')  // 非空时显示横幅
 const allActions = ref([]) // 所有动作（增量累积）
 const actionIds = shallowRef(new Set()) // 用于去重的动作ID集合（shallowRef 保证 Set 响应式）
+// 方案 B：每个 round 都单独打印一条日志 —— 记录已发过日志的 round（按平台分别追踪）
+// 修复 r0→r7 跳号：之前只在 current_round 跳变时打一条，OASIS 单轮快完成时一次轮询覆盖多轮，会丢中间 round 日志
+const emittedTwitterRounds = new Set()
+const emittedRedditRounds = new Set()
 const scrollContainer = ref(null)
 
 // 快照相关状态
@@ -510,12 +607,46 @@ const selectedSnapshot = ref(null)
 const restoreStartRound = ref(null) // 恢复快照时指定的 start_round
 const wasRestored = ref(false) // 标记是否刚从快照恢复
 const showAutoRestorePrompt = ref(false) // 自动检测到的可恢复快照提示
+let autoRestoreTimer = null // 30s 兜底计时器（用户通过任何路径恢复/启动后必须取消）
+
+// 收起自动恢复提示并取消 30s 兜底计时器
+// 修复（恢复后计时器仍触发）：用户可能不点提示按钮，而是直接通过快照面板
+// 恢复并启动了模拟——此时提示若不收起、计时器若不取消，30s 后会误弹轮数选择
+const dismissAutoRestorePrompt = () => {
+  showAutoRestorePrompt.value = false
+  if (autoRestoreTimer) {
+    clearTimeout(autoRestoreTimer)
+    autoRestoreTimer = null
+  }
+}
 const latestSnapshotForRestore = ref(null) // 自动检测到的最新快照
+// 直接进入 Step3（历史入口 / Step4 回退 / Step5 重启）全新启动时的轮数选择
+const showRoundsPrompt = ref(false) // 轮数选择提示
+const roundsConfigLoading = ref(false) // 推荐轮数加载中
+const promptAutoRounds = ref(null) // 配置自动计算的推荐轮数
+const promptRounds = ref(40) // 用户输入的轮数（默认 40，与 Step2 推荐一致）
+const pendingMaxRounds = ref(null) // 弹窗确认后待生效的轮数
+const roundsPromptDismissed = ref(false) // 用户取消轮数选择后，保留重新打开入口
 
 // Computed
 // 按时间顺序显示动作（最新的在最后面，即底部）
+// 修复（快照恢复后时间轴降序）：后端 get_all_actions 按时间戳降序返回，
+// 恢复后的首轮轮询会把全部历史动作一次性按"最新在前"的顺序插入，
+// 直接按插入顺序渲染会让时间轴卡片 R9 在顶、R1 在底。
+// 统一按（轮次, 时间戳, 插入顺序）升序排列，与实时模拟"最新在底部"一致。
 const chronologicalActions = computed(() => {
   return allActions.value
+    .map((a, idx) => ({ a, idx }))
+    .sort((x, y) => {
+      const ra = x.a.round_num ?? 0
+      const rb = y.a.round_num ?? 0
+      if (ra !== rb) return ra - rb
+      const ta = x.a.timestamp || ''
+      const tb = y.a.timestamp || ''
+      if (ta !== tb) return ta < tb ? -1 : 1
+      return x.idx - y.idx
+    })
+    .map(({ a }) => a)
 })
 
 // 各平台动作计数
@@ -558,6 +689,9 @@ const resetAllState = (preserveRestore = false) => {
   runStatus.value = {}
   allActions.value = []
   actionIds.value = new Set()
+  // 方案 B：重置时同时清空已发日志的 round 集合，避免重启模拟后旧 round 被跳过
+  emittedTwitterRounds.clear()
+  emittedRedditRounds.clear()
   prevTwitterRound.value = 0
   prevRedditRound.value = 0
   prevTwitterActions.value = 0
@@ -621,9 +755,13 @@ const doStartSimulation = async () => {
 
     // 仅非快照恢复模式传 max_rounds
     // 快照恢复后 total_rounds 已由快照恢复，不应再被 max_rounds 截断
-    if (!isFromRestore && props.maxRounds) {
-      params.max_rounds = props.maxRounds
-      addLog(t('log.setMaxRounds', { rounds: props.maxRounds }))
+    if (!isFromRestore) {
+      // 优先用 Step2 传入的轮数；其次用直接进入时弹窗选择的轮数
+      const rounds = props.maxRounds || pendingMaxRounds.value
+      if (rounds) {
+        params.max_rounds = rounds
+        addLog(t('log.setMaxRounds', { rounds }))
+      }
     }
 
     addLog(t('log.graphMemoryUpdateEnabled'))
@@ -909,9 +1047,19 @@ const fetchRunStatusDetail = async () => {
       // 使用 all_actions 获取完整的动作列表
       const serverActions = res.data.all_actions || []
 
+      // 修复（重放日志"累计"恒为总数）：快照恢复后的首轮轮询会一次性加入全部
+      // 历史动作，若日志统一在循环后取 twitterActionsCount，每轮显示的都是
+      // 最终总数。先记录本次加入前的基准值，逐轮累加还原真实累计进度。
+      const twitterBase = twitterActionsCount.value
+      const redditBase = redditActionsCount.value
+
       // 增量添加新动作（去重）
       let newActionsAdded = 0
       let firstNewAction = null
+      // 方案 B：扫描本次新增动作里出现的 round_num，按平台分别累计，轮询结束后按 round 升序逐条打日志
+      // 即使一次轮询覆盖了 r0..r7 共 8 轮，也会按顺序打 8 行，不会跳号
+      const twitterRoundCounts = new Map() // round_num → 本次新增的 twitter 动作数
+      const redditRoundCounts = new Map()
       serverActions.forEach(action => {
         // 生成唯一ID
         const actionId = action.id || `${action.timestamp}-${action.platform}-${action.agent_id}-${action.action_type}`
@@ -924,11 +1072,41 @@ const fetchRunStatusDetail = async () => {
           })
           newActionsAdded++
           if (!firstNewAction) firstNewAction = `R${action.round_num} ${action.platform}/${action.action_type}/${action.agent_name}`
+
+          // 累计每个 round 的新增动作数（用于逐 round 日志）
+          const r = action.round_num || 0
+          if (r > 0) {
+            const m = action.platform === 'twitter' ? twitterRoundCounts : (action.platform === 'reddit' ? redditRoundCounts : null)
+            if (m) m.set(r, (m.get(r) || 0) + 1)
+          }
         }
       })
       // 仅在真的有新动作时才往 UI 面板打一行（其它时候完全静默）
       if (newActionsAdded > 0) {
         addLog(`[Detail-Poll] +${newActionsAdded} new | first: ${firstNewAction}`)
+      }
+
+      // 方案 B：每个 round 都单独打印一行日志（按 round 升序，避免 r0→r7 跳号）
+      // 同一轮不会被重复打印（用 emitted* Sets 去重）
+      if (twitterRoundCounts.size > 0) {
+        const rounds = [...twitterRoundCounts.keys()].sort((a, b) => a - b)
+        let twitterCum = twitterBase
+        for (const r of rounds) {
+          twitterCum += twitterRoundCounts.get(r)
+          if (emittedTwitterRounds.has(r)) continue
+          emittedTwitterRounds.add(r)
+          addLog(`[✅ R${r}] Plaza +${twitterRoundCounts.get(r)} actions (累计 ${twitterCum})`)
+        }
+      }
+      if (redditRoundCounts.size > 0) {
+        const rounds = [...redditRoundCounts.keys()].sort((a, b) => a - b)
+        let redditCum = redditBase
+        for (const r of rounds) {
+          redditCum += redditRoundCounts.get(r)
+          if (emittedRedditRounds.has(r)) continue
+          emittedRedditRounds.add(r)
+          addLog(`[✅ R${r}] Community +${redditRoundCounts.get(r)} actions (累计 ${redditCum})`)
+        }
       }
 
       // 不自动滚动，让用户自由查看时间轴
@@ -945,6 +1123,33 @@ const fetchRunStatusDetail = async () => {
 }
 
 // Helpers
+// 已有专属卡片模板的动作类型（其余类型走通用回退，保证卡片永不空白）
+const knownActionTypes = [
+  'CREATE_POST', 'QUOTE_POST', 'REPOST', 'LIKE_POST', 'CREATE_COMMENT',
+  'SEARCH_POSTS', 'FOLLOW', 'UPVOTE_POST', 'DOWNVOTE_POST', 'DISLIKE_POST',
+  'LIKE_COMMENT', 'DISLIKE_COMMENT', 'MUTE', 'SEARCH_USER', 'TREND', 'DO_NOTHING',
+]
+
+// 判断专属模板是否会渲染出空卡片
+// 后端 _enrich_action_context 查库失败时静默跳过（原帖被删/info_json 解析失败等），
+// 字段会缺失。以下类型的模板内容全部是 v-if，字段缺失时卡片正文空白：
+//   CREATE_POST: 依赖 content；QUOTE_POST: 依赖 quote_content/original_content；
+//   CREATE_COMMENT: 依赖 content 或 post_id
+// 其余类型（REPOST/FOLLOW/投票/搜索等）至少有一条常显 info 行，永不空白
+const isCardBodyEmpty = (action) => {
+  const args = action.action_args || {}
+  switch (action.action_type) {
+    case 'CREATE_POST':
+      return !args.content
+    case 'QUOTE_POST':
+      return !args.quote_content && !args.original_content
+    case 'CREATE_COMMENT':
+      return !args.content && !args.post_id
+    default:
+      return false
+  }
+}
+
 const getActionTypeLabel = (type) => {
   const labels = {
     'CREATE_POST': 'POST',
@@ -955,9 +1160,14 @@ const getActionTypeLabel = (type) => {
     'DO_NOTHING': 'IDLE',
     'FOLLOW': 'FOLLOW',
     'SEARCH_POSTS': 'SEARCH',
+    'SEARCH_USER': 'SEARCH',
+    'TREND': 'TREND',
+    'MUTE': 'MUTE',
     'QUOTE_POST': 'QUOTE',
     'UPVOTE_POST': 'UPVOTE',
-    'DOWNVOTE_POST': 'DOWNVOTE'
+    'DOWNVOTE_POST': 'DOWNVOTE',
+    'DISLIKE_POST': 'DISLIKE',
+    'DISLIKE_COMMENT': 'DISLIKE'
   }
   return labels[type] || type || 'UNKNOWN'
 }
@@ -969,11 +1179,16 @@ const getActionTypeClass = (type) => {
     'LIKE_POST': 'badge-action',
     'CREATE_COMMENT': 'badge-comment',
     'LIKE_COMMENT': 'badge-action',
+    'DISLIKE_COMMENT': 'badge-action',
     'QUOTE_POST': 'badge-post',
     'FOLLOW': 'badge-meta',
     'SEARCH_POSTS': 'badge-meta',
+    'SEARCH_USER': 'badge-meta',
+    'TREND': 'badge-meta',
+    'MUTE': 'badge-meta',
     'UPVOTE_POST': 'badge-action',
     'DOWNVOTE_POST': 'badge-action',
+    'DISLIKE_POST': 'badge-action',
     'DO_NOTHING': 'badge-idle'
   }
   return classes[type] || 'badge-default'
@@ -1074,18 +1289,29 @@ onMounted(() => {
     const fromStep5Restart = route.query.from === 'step5_restart'
 
     if (!fromStep5Restart) {
-      // 普通入口（首次进入 / 从 Step4 回退）：显示自动恢复提示
-      checkAndPromptRestoreSnapshot()
+      // 普通入口（首次进入 / 从 Step4 回退）：
+      // 防护（force=true 误清理快照）：
+      // 之前 doStartSimulation() 立即 fire  force=true 会清空 actions.jsonl 和 run_state.json，
+      // 把所有历史的 R0~Rn actions 抹掉，导致前面 OASIS 跑的成果丢失。
+      // 修复：先 checkAndPromptRestoreSnapshotAsync() 等待用户选择；
+      //   - 如果用户选"恢复快照"：doRestoreStart() 用 start_round=N 不带 force=true 启动
+      //   - 如果用户选"force 全新启动"或没有 snapshot：才走原 force=true 路径
+      checkAndPromptRestoreSnapshotAsync()
     } else {
       addLog(t('log.step3RestartFromStep5'))
+      // 重启也是全新 force 启动，同样先让用户确认本次模拟轮数
+      openRoundsPrompt()
     }
-    // 无论哪种入口，都自动启动（doStartSimulation 内部 force=true 清理旧状态）
-    doStartSimulation()
   }
 })
 
 onUnmounted(() => {
   stopPolling()
+  // 清理自动恢复提示的 30s 兜底计时器，避免组件销毁后仍触发 openRoundsPrompt
+  if (autoRestoreTimer) {
+    clearTimeout(autoRestoreTimer)
+    autoRestoreTimer = null
+  }
 })
 
 // ==================== 快照相关方法 ====================
@@ -1198,6 +1424,144 @@ const checkAndPromptRestoreSnapshot = async () => {
   }
 }
 
+// 防护（force=true 误清理快照）：异步版本
+// 检查快照是否存在有意义快照（final_/fail_）；如有，把选择交给用户：
+//   - 选 "恢复快照"：调用 doRestoreStart(snapshot)，跳过 force=true
+//   - 选 "force 全新启动"：调用 doStartSimulation() 走原 force=true 路径
+//   - 30 秒无响应 / 没有 snapshot：自动 force=true
+const checkAndPromptRestoreSnapshotAsync = async () => {
+  if (!props.simulationId) {
+    doStartSimulation()
+    return
+  }
+
+  let hasMeaningfulSnapshot = false
+  try {
+    const res = await listSnapshots(props.simulationId)
+    if (res.success && res.data?.snapshots?.length > 0) {
+      const snapshots = [...res.data.snapshots].sort((a, b) => {
+        const tA = new Date(a.created_at || 0).getTime()
+        const tB = new Date(b.created_at || 0).getTime()
+        return tB - tA
+      })
+      const latest = snapshots[0]
+      const isFinal = latest.snapshot_name.startsWith('final_')
+      const isFail = latest.snapshot_name.startsWith('fail_')
+      if (isFinal || isFail) {
+        hasMeaningfulSnapshot = true
+        latestSnapshotForRestore.value = latest
+        addLog(t('log.hasPreviousSnapshot', { name: latest.snapshot_name }))
+        showAutoRestorePrompt.value = true
+      }
+    }
+  } catch (err) {
+    console.warn('检测快照失败:', err)
+  }
+
+  if (!hasMeaningfulSnapshot) {
+    // 没有有意义快照：全新 force 启动前先让用户选择本次模拟的轮数
+    openRoundsPrompt()
+    return
+  }
+
+  // 有快照：等用户选择。showAutoRestorePrompt=true 后用户点 UI 按钮（详见模板）：
+  //   - "从快照继续" → handleContinueAutoRestore → 恢复弹窗
+  //   - "force 全新启动" → handleAutoRestoreDismiss → openRoundsPrompt（force=true）
+  // 这里什么都不做，等 UI 回调。
+  // 30 秒兜底：避免用户没看到提示，sim 卡死。
+  // 兜底不再自动 force 启动（会误清快照），改为收起提示并进入轮数选择。
+  // 双重防护：用户可能已通过快照面板恢复并启动了模拟（dismissAutoRestorePrompt
+  // 会取消本计时器）；即使计时器未被取消（旧路径），模拟已运行时也不再弹轮数选择
+  autoRestoreTimer = setTimeout(() => {
+    autoRestoreTimer = null
+    if (!showAutoRestorePrompt.value || isStarting.value) return
+    showAutoRestorePrompt.value = false
+    if (phase.value === 1 || runStatus.value.twitter_running || runStatus.value.reddit_running) {
+      // 模拟已通过其他路径启动，无需再选轮数
+      return
+    }
+    addLog('30秒未选择，进入轮数选择')
+    openRoundsPrompt()
+  }, 30000)
+}
+
+// 自动恢复取消（用户点 "force 全新启动" 按钮时调用）
+const handleAutoRestoreDismiss = () => {
+  dismissAutoRestorePrompt()
+  openRoundsPrompt()
+}
+
+// ==================== 全新启动轮数选择 ====================
+
+// 直接进入 Step3（历史入口 / Step4 回退 / Step5 重启）时的全新启动：
+// 不再默默以默认轮数 force 启动，先弹出轮数选择，由用户确认本次模拟轮数
+const openRoundsPrompt = async () => {
+  // Step2 流程已带轮数（query 参数传入），无需再询问
+  if (props.maxRounds) {
+    doStartSimulation()
+    return
+  }
+
+  showRoundsPrompt.value = true
+  roundsPromptDismissed.value = false
+  roundsConfigLoading.value = true
+  try {
+    // 获取模拟配置，计算推荐轮数（与 Step2 autoGeneratedRounds 同口径）
+    const res = await getSimulationConfig(props.simulationId)
+    if (res.success && res.data?.time_config) {
+      const totalHours = res.data.time_config.total_simulation_hours
+      const minutesPerRound = res.data.time_config.minutes_per_round
+      if (totalHours && minutesPerRound) {
+        const calculated = Math.max(Math.floor((totalHours * 60) / minutesPerRound), 40)
+        promptAutoRounds.value = calculated
+        promptRounds.value = calculated
+        addLog(t('log.autoRoundsDetected', { rounds: calculated }))
+      }
+    }
+  } catch (err) {
+    console.warn('获取模拟配置失败:', err)
+  } finally {
+    roundsConfigLoading.value = false
+  }
+}
+
+// 轮数选择确认：按用户输入的轮数全新启动
+const handleRoundsPromptConfirm = () => {
+  let rounds = parseInt(promptRounds.value, 10)
+  if (!rounds || rounds < 10) {
+    addLog(t('log.invalidRoundsInput'))
+    return
+  }
+  // 超过推荐轮数时按推荐轮数截断（与 Step2 滑条上限一致）
+  if (promptAutoRounds.value && rounds > promptAutoRounds.value) {
+    addLog(t('log.roundsCapped', { auto: promptAutoRounds.value }))
+    rounds = promptAutoRounds.value
+  }
+
+  pendingMaxRounds.value = rounds
+  showRoundsPrompt.value = false
+  doStartSimulation()
+}
+
+// 轮数选择取消：不启动模拟，收起提示但保留重新打开入口
+const handleRoundsPromptCancel = () => {
+  showRoundsPrompt.value = false
+  roundsPromptDismissed.value = true
+  addLog(t('log.roundsPromptCancelled'))
+}
+
+// 重新打开轮数选择（用户点了收起提示中的启动入口）
+const reopenRoundsPrompt = () => {
+  roundsPromptDismissed.value = false
+  openRoundsPrompt()
+}
+
+// 快照时间解析（容错：解析失败返回 0，排最前）
+const snapshotTime = (s) => {
+  const t = Date.parse(s?.created_at)
+  return Number.isNaN(t) ? 0 : t
+}
+
 // 列出快照
 const handleListSnapshots = async () => {
   if (!props.simulationId) return
@@ -1206,7 +1570,10 @@ const handleListSnapshots = async () => {
     const res = await listSnapshots(props.simulationId)
 
     if (res.success) {
-      snapshots.value = res.data.snapshots || []
+      // 后端返回倒序（最新在前）；面板卡片按时间升序展示（最旧在前，符合时间线阅读习惯）
+      snapshots.value = [...(res.data.snapshots || [])].sort(
+        (a, b) => snapshotTime(a) - snapshotTime(b)
+      )
       showSnapshotPanel.value = true
       // 关闭恢复选择对话框，避免显示不一致的状态
       showRestoreChoice.value = false
@@ -1231,13 +1598,15 @@ const handleContinueAutoRestore = () => {
   selectedSnapshot.value = latestSnapshotForRestore.value
   restoreMode.value = 'continue'
   showRestoreChoice.value = true
-  showAutoRestorePrompt.value = false
+  dismissAutoRestorePrompt()
 }
 
 // 忽略自动恢复提示
 const handleIgnoreAutoRestore = () => {
-  showAutoRestorePrompt.value = false
+  dismissAutoRestorePrompt()
   latestSnapshotForRestore.value = null
+  // 不自动启动（避免 force 误清快照），但显示"开始模拟"入口避免死局
+  roundsPromptDismissed.value = true
 }
 
 // 取消恢复操作
@@ -1245,6 +1614,74 @@ const handleCancelRestore = () => {
   showRestoreChoice.value = false
   selectedSnapshot.value = null
   restoreMode.value = 'continue'
+}
+
+// 双平台轮次描述：已完成的平台显示"已完成全部 N 轮"，未完成的显示各自下一轮。
+// 避免 completed_round >= total_rounds 时仍显示"从第 N+1 轮开始"的越界误导
+// （例：total=10、Plaza 完成 R10、Community 完成 R7 →
+//   "Plaza 已完成全部 10 轮 / Community 从第 8 轮开始"）
+const platformRoundsLabel = (twRound, rdRound, totalRounds) => {
+  if (!Number.isInteger(totalRounds) || totalRounds <= 0) return null
+  if (!Number.isInteger(twRound) || !Number.isInteger(rdRound)) return null
+  const twDone = twRound >= totalRounds
+  const rdDone = rdRound >= totalRounds
+  if (twDone && rdDone) {
+    return t('log.snapshotRestoreAllDone', { total: totalRounds })
+  }
+  if (twDone) {
+    return t('log.snapshotRestoreTwDone', { total: totalRounds, reddit: rdRound + 1 })
+  }
+  if (rdDone) {
+    return t('log.snapshotRestoreRdDone', { total: totalRounds, twitter: twRound + 1 })
+  }
+  return t('log.snapshotRestorePlatformRounds', { twitter: twRound + 1, reddit: rdRound + 1 })
+}
+
+// 快照"从快照继续"的轮次描述：优先用 runtime_rounds（子进程每轮落盘的真实进度），
+// 旧快照无该字段时回退 run_state（monitor 落盘，可能滞后一轮）
+const snapshotContinueLabel = (snapshot) => {
+  const rs = snapshot?.run_state
+  const rt = snapshot?.runtime_rounds
+  const tw = rt?.twitter ?? rs?.twitter_current_round
+  const rd = rt?.reddit ?? rs?.reddit_current_round
+  const label = platformRoundsLabel(tw, rd, rs?.total_rounds)
+  return label ?? t('log.snapshotRestoreContinueFromSnapshot', { round: rs?.current_round || 0 })
+}
+
+// 模拟运行中的切换前处理：先停止当前模拟，并把当前进度保存为快照
+// 1. 必须先停：运行中的进程会持续写 actions.jsonl / run_state.json，
+//    与恢复快照/全新启动存在文件竞争
+// 2. 保存现场：force 全新启动会清空日志，恢复其他快照会覆盖当前状态，
+//    先留一份 pre_restore 快照保证当前进度可回溯
+const stopAndSnapshotCurrentRun = async () => {
+  const isRunning = phase.value === 1 || runStatus.value.twitter_running || runStatus.value.reddit_running
+  if (!isRunning) return
+
+  // 1. 停止当前模拟进程
+  addLog(t('log.stoppingSim'))
+  const stopRes = await stopSimulation({ simulation_id: props.simulationId })
+  if (!stopRes.success) {
+    const msg = stopRes.error || ''
+    // 后端报"未在运行"说明进程已停止，可继续；其他错误中止切换
+    if (!(msg.includes('未在运行') || msg.toLowerCase().includes('not running'))) {
+      throw new Error(msg || t('common.unknownError'))
+    }
+  }
+  addLog(t('log.simStoppedSuccess'))
+  stopPolling()
+  phase.value = 0
+
+  // 2. 保存当前进度快照（名称带轮次+时间戳，避免覆盖）
+  const currentRound = runStatus.value.current_round || 0
+  const ts = new Date().toISOString().slice(11, 19).replace(/:/g, '')
+  const snapName = `pre_restore_R${currentRound}_${ts}`
+  const snapRes = await createSnapshot(props.simulationId, { snapshot_name: snapName })
+  if (snapRes.success) {
+    addLog(t('log.preRestoreSnapshotCreated', { name: snapRes.data.snapshot_name }))
+  } else {
+    // 快照失败不阻断切换，仅提示当前进度无法回溯
+    addLog(t('log.preRestoreSnapshotFailed', { error: snapRes.error || t('common.unknownError') }))
+  }
 }
 
 // 执行恢复（从弹窗确认）
@@ -1255,9 +1692,25 @@ const doRestoreSnapshot = async () => {
   showRestoreChoice.value = false
   isRestoringSnapshot.value = true
 
-  const isContinue = restoreMode.value === 'continue'
+  // 用户没有点自动恢复提示的按钮，而是直接通过快照面板选择了恢复：
+  // 收起提示并取消 30s 兜底计时器，避免恢复启动后再误弹轮数选择
+  dismissAutoRestorePrompt()
 
   try {
+    // 模拟运行中：先停止当前模拟并保存现场快照，再执行所选操作
+    await stopAndSnapshotCurrentRun()
+
+    // "从头开始"：无需恢复快照文件（恢复了也是带旧状态重跑，毫无意义）。
+    // 直接走全新启动流程：先选轮数，再 force=true 清空旧状态、从第 0 轮重跑所有轮次
+    if (restoreMode.value !== 'continue') {
+      selectedSnapshot.value = null
+      showSnapshotPanel.value = false
+      addLog(t('log.snapshotStartOverDirect', { name: snapshot.snapshot_name }))
+      openRoundsPrompt()
+      return
+    }
+
+    // "从快照继续"：恢复快照文件，再以 start_round=N 启动（不带 force=true）
     addLog(t('log.snapshotRestoring', { name: snapshot.snapshot_name }))
 
     const res = await restoreSnapshot(props.simulationId, {
@@ -1266,19 +1719,23 @@ const doRestoreSnapshot = async () => {
 
     if (res.success) {
       // 使用后端返回的 current_round，而不是本地计算的值
-      const restoredCurrentRound = res.data.current_round || 0
-      const startRound = isContinue ? restoredCurrentRound : 0
+      const startRound = res.data.current_round || 0
 
       addLog(t('log.snapshotRestored', { name: res.data.snapshot_name }))
-      if (isContinue) {
-        addLog(t('log.snapshotRestoreContinueFromSnapshot', { round: startRound + 1 }))
+      // 双平台独立轮次：已完成的平台显示"已完成"，未完成的显示各自下一轮
+      // （例：Plaza 完成 10/10 → "Plaza 已完成全部 10 轮"，而非"从第 11 轮开始"）
+      const roundsLabel = platformRoundsLabel(
+        res.data.twitter_round, res.data.reddit_round, res.data.total_rounds
+      )
+      if (roundsLabel) {
+        addLog(roundsLabel)
       } else {
-        addLog(t('log.snapshotRestoreStartOver'))
+        addLog(t('log.snapshotRestoreContinueFromSnapshot', { round: startRound + 1 }))
       }
 
       // 设置恢复标记，阻止 doStartSimulation 误传 max_rounds
       wasRestored.value = true
-      restoreStartRound.value = isContinue && startRound > 0 ? startRound : null
+      restoreStartRound.value = startRound > 0 ? startRound : null
 
       // 恢复文件后，调用 doStartSimulation 启动模拟进程
       // doStartSimulation 内部会先 resetAllState 清空前端数据，然后调用后端 start_simulation
@@ -1290,7 +1747,7 @@ const doRestoreSnapshot = async () => {
       wasRestored.value = false
     }
   } catch (err) {
-    addLog(t('log.snapshotRestoreException', { error: err.message }))
+    addLog(t('log.snapshotRestoreAborted', { error: err.message }))
     wasRestored.value = false
   } finally {
     isRestoringSnapshot.value = false
@@ -2309,6 +2766,40 @@ const handleDeleteSnapshot = async (snapshotName) => {
 .prompt-btn.secondary:hover {
   background: #F5F5F5;
   border-color: #CCC;
+}
+
+/* 轮数选择提示中的输入框 */
+.rounds-prompt .prompt-content {
+  align-items: center;
+}
+
+.rounds-input {
+  flex-shrink: 0;
+  width: 90px;
+  padding: 6px 10px;
+  border: 1px solid #DDD;
+  border-radius: 4px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 14px;
+  font-weight: 600;
+  color: #333;
+  text-align: center;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.rounds-input:focus {
+  border-color: #0066CC;
+}
+
+.rounds-input:disabled {
+  background: #F5F5F5;
+  color: #999;
+}
+
+.rounds-input::-webkit-outer-spin-button,
+.rounds-input::-webkit-inner-spin-button {
+  opacity: 1;
 }
 
 .btn-icon {

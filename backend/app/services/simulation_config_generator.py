@@ -1,4 +1,4 @@
-﻿"""
+"""
 模拟配置智能生成器
 使用LLM根据模拟需求,文档内容,图谱信息自动生成细致的模拟参数
 实现全程自动化,无需人工设置参数
@@ -643,9 +643,42 @@ class SimulationConfigGenerator:
             agents_per_hour_min = max(1, agents_per_hour_max // 2)
             logger.warning(f"agents_per_hour_min >= max,已修正为 {agents_per_hour_min}")
         
+        # 修复（下游除零/空转）：LLM 越界输出的时间字段必须钳制。
+        # minutes_per_round=0 → Step3 启动时 (total_hours*60)//minutes_per_round
+        # 直接 ZeroDivisionError 崩掉子进程；
+        # total_simulation_hours 异常（0/负数/超大）→ 推荐轮数为 0 空转或爆炸。
+        total_hours_raw = result.get("total_simulation_hours", 72)
+        if not isinstance(total_hours_raw, (int, float)) or isinstance(total_hours_raw, bool) or total_hours_raw <= 0:
+            logger.warning(f"total_simulation_hours 非法 ({total_hours_raw!r})，回退默认 72")
+            total_hours_raw = 72
+        total_hours = max(1, int(total_hours_raw))
+        if total_hours > 336:
+            logger.warning(f"total_simulation_hours 过大 ({total_hours})，已钳制到 336")
+            total_hours = 336
+        
+        minutes_per_round_raw = result.get("minutes_per_round", 60)
+        if not isinstance(minutes_per_round_raw, (int, float)) or isinstance(minutes_per_round_raw, bool) or minutes_per_round_raw <= 0:
+            logger.warning(f"minutes_per_round 非法 ({minutes_per_round_raw!r})，回退默认 60")
+            minutes_per_round_raw = 60
+        minutes_per_round = int(minutes_per_round_raw)
+        if minutes_per_round > 240:
+            logger.warning(f"minutes_per_round 过大 ({minutes_per_round})，已钳制到 240")
+            minutes_per_round = 240
+        elif minutes_per_round < 5:
+            logger.warning(f"minutes_per_round 过小 ({minutes_per_round})，已钳制到 5")
+            minutes_per_round = 5
+        
+        # 保证至少 1 轮：total_rounds = total_hours*60 // minutes_per_round >= 1
+        if total_hours * 60 // minutes_per_round < 1:
+            logger.warning(
+                f"时间配置导致总轮数为 0 (hours={total_hours}, minutes_per_round={minutes_per_round})，"
+                f"minutes_per_round 调整为 60"
+            )
+            minutes_per_round = 60
+        
         return TimeSimulationConfig(
-            total_simulation_hours=result.get("total_simulation_hours", 72),
-            minutes_per_round=result.get("minutes_per_round", 60),  # 默认每轮1小时
+            total_simulation_hours=total_hours,
+            minutes_per_round=minutes_per_round,
             agents_per_hour_min=agents_per_hour_min,
             agents_per_hour_max=agents_per_hour_max,
             peak_hours=result.get("peak_hours", [19, 20, 21, 22]),

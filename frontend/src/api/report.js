@@ -58,3 +58,29 @@ export const getReport = (reportId) => {
 export const chatWithReport = (data) => {
   return requestWithRetry(() => service.post('/api/report/chat', data), 3, 1000)
 }
+
+/**
+ * 下载报告 Markdown 文件（生成中下载已生成的部分章节）
+ * @param {string} reportId
+ * @param {string} [title] - 报告标题（用作下载文件名；不传回退 reportId）
+ */
+export const downloadReport = async (reportId, title) => {
+  // blob 响应绕过 JSON 拦截器（Blob 无 success 字段，拦截器原样返回）
+  const blob = await service.get(`/api/report/${reportId}/download`, { responseType: 'blob' })
+  // 文件名用报告标题：清洗文件系统非法字符，回退 reportId
+  const base = (title || '')
+    .replace(/[\\/:*?"<>|\r\n\t]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[. ]+$/, '')
+    .slice(0, 80)
+  const filename = `${base || reportId}.md`
+  const url = window.URL.createObjectURL(new Blob([blob]))
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  window.URL.revokeObjectURL(url)
+}

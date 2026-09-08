@@ -6,6 +6,7 @@ Step2: Zep实体读取与过滤、OASIS模拟准备与运行（全程自动化�
 import os
 import sys
 import json
+import re
 import traceback
 from datetime import datetime
 from typing import List, Dict, Any
@@ -24,9 +25,32 @@ from ..models.project import ProjectManager
 logger = get_logger('mirofish.api.simulation')
 
 
+def _strip_preamble_offline(text: str) -> str:
+    """离线采访回应削 preamble:与 run_parallel_simulation 内的 _strip_preamble 逻辑一致,只在 Flask 进程这份代码用"""
+    if not text:
+        return text
+    stripped = text.strip()
+    if not stripped:
+        return stripped
+    parts = re.split(r'\n\n+', stripped)
+    if len(parts) <= 1:
+        return stripped
+    for i, p in enumerate(parts):
+        p_strip = p.strip()
+        if not p_strip:
+            continue
+        if p_strip.startswith('我') and len(p_strip) >= 10:
+            kept = '\n\n'.join(parts[i:]).strip()
+            if len(kept) < len(stripped):
+                return kept
+            break
+    return stripped
+
+
 # Interview prompt 优化前缀
 # 添加此前缀可以避免Agent调用工具，直接用文本回复
-INTERVIEW_PROMPT_PREFIX = "结合你的人设、所有的过往记忆与行动，不调用任何工具直接用文本回复我："
+# 追加"不要元描述/思考/规划过程"压制模型 preamble(Qwen系/MiniMax 倾向输出一段'让我思考…')
+INTERVIEW_PROMPT_PREFIX = "结合你的人设、所有的过往记忆与行动，不调用任何工具直接用文本回复我。请只输出最终回答,不要任何分析、思考、规划前的解释段落："
 
 
 def optimize_interview_prompt(prompt: str) -> str:
@@ -190,20 +214,22 @@ def offline_interview_agents_batch(
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.8,
-                max_tokens=1024
+                max_tokens=512  # 缩到 512 强制模型精炼回答,避免冗长 preamble
             )
 
             # 构建结果
             platform_key = item_platform if item_platform else "both"
             result_key = f"{platform_key}_{agent_id}"
+            # 削 preamble(MiniMax/Qwen 倾向输出"让我思考"+ bullet 分析)
+            cleaned = _strip_preamble_offline(response)
             results[result_key] = {
                 "agent_id": agent_id,
-                "response": response,
+                "response": cleaned,
                 "platform": platform_key,
                 "username": agent_name,
                 "mode": "offline"
             }
-            logger.info(f"离线采访 Agent {agent_id} ({agent_name}) 完成")
+            logger.info(f"离线采访 Agent {agent_id} ({agent_name}) 完成({len(cleaned)} chars)")
 
         except Exception as e:
             errors.append(f"Agent {agent_id} 采访失败: {str(e)}")
@@ -608,6 +634,36 @@ def prepare_simulation():
                 })
             else:
                 logger.info(f"模拟 {simulation_id} 未准备完成，将启动准备任务")
+
+        # 修复（重复 prepare 竞态）：原实现只检查"已完成"，不检查"正在准备中"。
+        # 准备进行期间再次请求（双击/网络重试/force_regenerate）会启动第二个后台线程：
+        # - 双倍 LLM 调用（46 个人设 + N 批配置生成，纯烧钱）
+        # - 两线程并发原子写同一批文件（reddit_profiles.json / simulation_config.json /
+        #   simulation_state.json），后写覆盖先写
+        # 基于 TaskManager 内存任务判断（而非 state.status）：任务在创建后端线程前
+        # 同步注册；后端重启后内存任务清空，卡在 PREPARING 的陈旧状态可自愈重新发起。
+        # 注意：force_regenerate 也会被拦——force 的语义是"完成后重新生成"，
+        # 不是"打断进行中的准备"（如需打断请重启后端）。
+        _task_manager = TaskManager()
+        _active_task = None
+        for _task in _task_manager.list_tasks(task_type="simulation_prepare"):
+            if (
+                _task.get("status") in ("pending", "processing")
+                and (_task.get("metadata") or {}).get("simulation_id") == simulation_id
+            ):
+                _active_task = _task
+                break
+        if _active_task:
+            logger.warning(
+                f"模拟 {simulation_id} 已有进行中的准备任务 {_active_task['task_id']}，拒绝重复准备"
+            )
+            return jsonify({
+                "success": False,
+                "error": t('api.simulationPreparing'),
+                "task_id": _active_task["task_id"],
+                "status": "preparing"
+            }), 409
+
         
         # 从项目获取必要信息
         project = ProjectManager.get_project(state.project_id)
@@ -1176,24 +1232,54 @@ def delete_simulation(simulation_id: str):
             }), 404
 
         # 检查是否有正在运行的模拟
+        # 修复（陈旧 RUNNING 状态误拒删 / 孤儿进程句柄毁删）：
+        # 后端重启 / Flask reloader 自动重载后 run_state.json 的 runner_status
+        # 停在 RUNNING（无人更新），但进程可能已死或成孤儿。
+        # 仅【后端托管且活着】的进程才拒绝删除（用户应先停止）；
+        # 孤儿进程（后端失联）查杀后放行，避免 Windows 文件句柄让 rmtree 失败。
         run_state = SimulationRunner.get_run_state(simulation_id)
         if run_state and run_state.runner_status == RunnerStatus.RUNNING:
-            return jsonify({
-                "success": False,
-                "error": "模拟正在运行中，请先停止后再删除"
-            }), 400
+            _managed_proc = SimulationRunner._processes.get(simulation_id)
+            if _managed_proc is not None and _managed_proc.poll() is None:
+                return jsonify({
+                    "success": False,
+                    "error": "模拟正在运行中，请先停止后再删除"
+                }), 400
+            # 真实进程已死（陈旧状态）或孤儿进程：查杀孤儿（若在）后放行删除
+            SimulationRunner._kill_orphan_subprocess(simulation_id, reason="删除推演前孤儿查杀")
+            logger.info(
+                f"删除推演: run_state 为 RUNNING 但非托管活进程（后端重启陈旧状态/孤儿），放行删除 {simulation_id}"
+            )
 
         # 直接构建目录路径（避免 _get_simulation_dir 创建空目录）
         sim_dir = os.path.join(manager.SIMULATION_DATA_DIR, simulation_id)
 
-        # 删除报告（如果有）
-        report_id = _get_report_id_for_simulation(simulation_id)
-        if report_id:
-            try:
-                ReportManager.delete_report(report_id)
-                logger.info(f"已删除报告: {report_id}")
-            except Exception as e:
-                logger.warning(f"删除报告失败: {e}")
+        # 删除所有关联报告（不止最新一份）：
+        # "重新生成报告"会在同一 simulation 下产生多份 report（旧 report 保留），
+        # 只删最新一份会残留旧报告（磁盘泄漏）。遍历 reports 目录全量清理。
+        deleted_reports = []
+        try:
+            reports_dir = os.path.join(os.path.dirname(__file__), '../../uploads/reports')
+            if os.path.exists(reports_dir):
+                for report_folder in os.listdir(reports_dir):
+                    report_path = os.path.join(reports_dir, report_folder)
+                    if not os.path.isdir(report_path):
+                        continue
+                    meta_file = os.path.join(report_path, "meta.json")
+                    if not os.path.exists(meta_file):
+                        continue
+                    try:
+                        with open(meta_file, 'r', encoding='utf-8') as f:
+                            meta = json.load(f)
+                        if meta.get("simulation_id") == simulation_id:
+                            if ReportManager.delete_report(meta.get("report_id")):
+                                deleted_reports.append(meta.get("report_id"))
+                    except Exception as e:
+                        logger.warning(f"删除报告 {report_folder} 失败: {e}")
+                if deleted_reports:
+                    logger.info(f"已删除 {len(deleted_reports)} 份关联报告: {deleted_reports}")
+        except Exception as e:
+            logger.warning(f"清理关联报告时出错: {e}")
 
         # 删除整个模拟数据目录
         if os.path.exists(sim_dir):
@@ -1207,6 +1293,24 @@ def delete_simulation(simulation_id: str):
                 logger.info(f"已清理空目录: {sim_dir}")
             except OSError:
                 pass  # 目录非空或无法删除，忽略
+
+        # 清理内存中的运行状态（类级 dict 残留会让 run-status API
+        # 在删除后仍返回该模拟的数据）
+        SimulationRunner.purge_run_state(simulation_id)
+
+        # 清理 run-status 稳态缓存中该模拟的所有条目
+        # （缓存为惰性初始化，见 get_run_status；未创建过则跳过）
+        global _run_status_cache
+        try:
+            _run_status_cache
+        except NameError:
+            pass
+        else:
+            stale_keys = [k for k in _run_status_cache if k and k[0] == simulation_id]
+            for k in stale_keys:
+                _run_status_cache.pop(k, None)
+            if stale_keys:
+                logger.info(f"已清理 run-status 缓存条目: {len(stale_keys)} 个")
 
         return jsonify({
             "success": True,
@@ -1326,9 +1430,21 @@ def get_simulation_profiles_realtime(simulation_id: str):
                     with open(profiles_file, 'r', encoding='utf-8') as f:
                         profiles = json.load(f)
                 else:
+                    # Twitter CSV 字段归一化为 reddit JSON 同样的字段名（前端一套代码读两个平台）
+                    # CSV 列：name / username / description (= bio) / user_char (= persona) / profession
                     with open(profiles_file, 'r', encoding='utf-8') as f:
                         reader = csv.DictReader(f)
-                        profiles = list(reader)
+                        for row in reader:
+                            profiles.append({
+                                "realname": row.get("realname", "") or row.get("name", ""),
+                                "name": row.get("name", ""),
+                                "username": row.get("username", ""),
+                                "bio": row.get("bio", "") or row.get("description", ""),
+                                "persona": row.get("persona", "") or row.get("user_char", ""),
+                                "profession": row.get("profession", "未知"),
+                                "entity_type": row.get("entity_type", "Entity"),
+                                "user_id": row.get("user_id", ""),
+                            })
             except (json.JSONDecodeError, Exception) as e:
                 logger.warning(f"读取 profiles 文件失败（可能正在写入中）: {e}")
                 profiles = []
@@ -1820,6 +1936,7 @@ def start_simulation():
         enable_graph_memory_update = data.get('enable_graph_memory_update', False)  # 可选：是否启用图谱记忆更新
         force = data.get('force', False)  # 可选：强制重新开始
         start_round = data.get('start_round', 0)  # 可选：从指定轮次开始（用于快照恢复后继续）
+        chat_only = data.get('chat_only', False)  # 可选：仅 chat 模式,跳过 rounds 直接进 IPC wait
 
         # 验证 max_rounds 参数
         if max_rounds is not None:
@@ -1902,11 +2019,39 @@ def start_simulation():
 
                 # 如果是强制模式，清理运行日志
                 if force:
-                    logger.info(f"强制模式：清理模拟日志 {simulation_id}")
-                    cleanup_result = SimulationRunner.cleanup_simulation_logs(simulation_id)
-                    if not cleanup_result.get("success"):
-                        logger.warning(f"清理日志时出现警告: {cleanup_result.get('errors')}")
-                    force_restarted = True
+                    # 修复（force 启动摧毁刚恢复的快照世界）：
+                    # 场景：用户恢复快照后（或前端 wasRestored 状态丢失时）点击启动，
+                    # 前端传 force=true → cleanup_simulation_logs 删除刚恢复的
+                    # DB / runtime_state / run_state.json → 子进程从 R0 全新重跑，
+                    # 恢复操作完全白费。
+                    # 防护：run_state.json 中存在 restored_at（restore_snapshot 写入，
+                    # 尚未被启动消费）说明世界刚被快照恢复、还没跑过 —— 不清理，
+                    # 改走快照恢复路径（_start_simulation_impl 会检测 restored_at
+                    # 并以 resume 模式续跑）。
+                    _force_guard_skip = False
+                    try:
+                        _rs_path = os.path.join(
+                            SimulationRunner.RUN_STATE_DIR, simulation_id, "run_state.json"
+                        )
+                        if os.path.exists(_rs_path):
+                            with open(_rs_path, 'r', encoding='utf-8') as _f:
+                                _rs_data = json.load(_f)
+                            if _rs_data.get("restored_at") and _rs_data.get("runner_status") in ("idle", ""):
+                                _force_guard_skip = True
+                    except Exception as _ge:
+                        logger.warning(f"force 防护检查失败（按原逻辑继续清理）: {_ge}")
+
+                    if _force_guard_skip:
+                        logger.info(
+                            f"force 启动防护：检测到快照恢复标记（restored_at 未消费），"
+                            f"跳过清理以保留恢复的世界，改为 resume 模式续跑 {simulation_id}"
+                        )
+                    else:
+                        logger.info(f"强制模式：清理模拟日志 {simulation_id}")
+                        cleanup_result = SimulationRunner.cleanup_simulation_logs(simulation_id)
+                        if not cleanup_result.get("success"):
+                            logger.warning(f"清理日志时出现警告: {cleanup_result.get('errors')}")
+                        force_restarted = True
 
                 # 重置状态为 ready
                 logger.info(f"模拟 {simulation_id} 准备工作已完成，重置状态为 ready（原状态: {state.status.value}）")
@@ -1938,7 +2083,7 @@ def start_simulation():
             
             logger.info(f"启用图谱记忆更新: simulation_id={simulation_id}, graph_id={graph_id}")
 
-        logger.info(f"准备启动模拟: simulation_id={simulation_id}, platform={platform}, start_round={start_round}, max_rounds={max_rounds}, enable_graph_memory_update={enable_graph_memory_update}")
+        logger.info(f"准备启动模拟: simulation_id={simulation_id}, platform={platform}, start_round={start_round}, max_rounds={max_rounds}, enable_graph_memory_update={enable_graph_memory_update}, chat_only={chat_only}")
 
         # 启动模拟
         run_state = SimulationRunner.start_simulation(
@@ -1947,7 +2092,8 @@ def start_simulation():
             max_rounds=max_rounds,
             enable_graph_memory_update=enable_graph_memory_update,
             graph_id=graph_id,
-            start_round=start_round
+            start_round=start_round,
+            chat_only=chat_only
         )
 
         logger.info(f"模拟启动成功: simulation_id={simulation_id}, runner_status={run_state.runner_status.value}")
@@ -1961,6 +2107,7 @@ def start_simulation():
             response_data['max_rounds_applied'] = max_rounds
         response_data['graph_memory_update_enabled'] = enable_graph_memory_update
         response_data['force_restarted'] = force_restarted
+        response_data['chat_only'] = chat_only
         if enable_graph_memory_update:
             response_data['graph_id'] = graph_id
         
@@ -2099,7 +2246,19 @@ def get_run_status(simulation_id: str):
             })
 
         state_dict = run_state.to_dict()
-        cache_key = (simulation_id, state_dict.get("updated_at", ""))
+        # 修复（chat-only 恢复后完成状态被缓存吞掉）：
+        # B3 缓存原以 updated_at 为唯一 key，而 updated_at 只在 add_action
+        # （新 agent 动作）时刷新。恢复"两平台均已完成"的快照时子进程零新动作，
+        # updated_at 永不变化 → monitor 置 COMPLETED 后缓存仍命中启动时缓存的
+        # running 响应 → 前端永远看不到 completed，Step 4 卡死。
+        # 修复：key 纳入完成判定相关字段，任一状态跃迁即失效缓存重建响应。
+        cache_key = (
+            simulation_id,
+            state_dict.get("updated_at", ""),
+            state_dict.get("runner_status", ""),
+            state_dict.get("twitter_completed", False),
+            state_dict.get("reddit_completed", False),
+        )
 
         if cache_key in _run_status_cache:
             # 优化 B3：稳态短路 — 同一 updated_at 直接复用上次 JSON 字符串
@@ -2748,6 +2907,25 @@ def interview_agents_batch():
         # 检查环境状态
         env_alive = SimulationRunner.check_env_alive(simulation_id)
 
+        # 检查 rounds 是否还在跑(runner alive + current_round < total_rounds)
+        # 在这种状态下 IPC server 还没启动,chat 命令会一直排队等到超时;直接返 409 比假死友好
+        if env_alive:
+            try:
+                _rs = SimulationRunner.get_run_state(simulation_id)
+                if _rs and _rs.current_round < _rs.total_rounds and _rs.total_rounds > 0:
+                    logger.info(
+                        f"chat 被拒绝:rounds 还在跑({_rs.current_round}/{_rs.total_rounds})"
+                    )
+                    return jsonify({
+                        "success": False,
+                        "error": f"模拟世界正在跑第 {_rs.current_round}/{_rs.total_rounds} 轮,稍候再发起采访",
+                        "busy": True,
+                        "current_round": _rs.current_round,
+                        "total_rounds": _rs.total_rounds
+                    }), 409
+            except Exception as _busy_check_err:
+                logger.warning(f"busy 检查失败(继续走 IPC): {_busy_check_err}")
+
         # 优化每个采访项的prompt，添加前缀避免Agent调用工具
         optimized_interviews = []
         for interview in interviews:
@@ -2781,6 +2959,33 @@ def interview_agents_batch():
             "data": result,
             "mode": "online"  # 标记为在线模式
         })
+
+    except TimeoutError as e:
+        # 修 #30:IPC 超时(子进程无响应/卡死) → 自动 fallback 到 offline
+        # 之前用户必须再点一次重试才能触发离线模式,体验差
+        logger.warning(
+            f"批量Interview IPC 超时(超时={timeout}s),自动 fallback 到 offline 模式: "
+            f"simulation_id={simulation_id}, err={e}"
+        )
+        try:
+            result = offline_interview_agents_batch(
+                simulation_id=simulation_id,
+                interviews=optimized_interviews,
+                platform=platform
+            )
+            return jsonify({
+                "success": result.get("success", False),
+                "data": result,
+                "mode": "auto_offline",  # 标记是 IPC 失败后的 fallback
+                "warning": t('api.batchInterviewAutoOffline')
+            })
+        except Exception as offline_err:
+            logger.error(f"offline fallback 也失败: {offline_err}")
+            # 双失败 → 返回原始 504 错误
+            return jsonify({
+                "success": False,
+                "error": t('api.batchInterviewTimeout', error=str(e))
+            }), 504
 
     except ValueError as e:
         return jsonify({
@@ -3333,6 +3538,10 @@ def restore_simulation_snapshot(simulation_id):
                     "restored_files": result.get("restored_files", []),
                     "current_round": result.get("current_round", 0),
                     "total_rounds": result.get("total_rounds", 0),
+                    # 平台独立轮次（双平台进度不一致时，前端日志分别显示
+                    # "Plaza 从 R4 / Community 从 R3"，避免统一轮次误导）
+                    "twitter_round": result.get("twitter_round"),
+                    "reddit_round": result.get("reddit_round"),
                 }
             })
         else:

@@ -5,6 +5,9 @@
       <div class="nav-brand">MIROFISH</div>
       <div class="nav-links">
         <LanguageSwitcher />
+        <button class="llm-config-link" type="button" @click="showLlmConfig = true">
+          {{ $t('nav.llmConfig') }}
+        </button>
         <a href="https://github.com/666ghj/MiroFish" target="_blank" class="github-link">
           {{ $t('nav.visitGithub') }} <span class="arrow">↗</span>
         </a>
@@ -208,6 +211,8 @@
       <!-- 历史项目数据库 -->
       <HistoryDatabase />
     </div>
+
+    <LlmConfigModal v-if="showLlmConfig" @close="showLlmConfig = false" />
   </div>
 </template>
 
@@ -216,8 +221,10 @@ import { ref, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import HistoryDatabase from '../components/HistoryDatabase.vue'
 import LanguageSwitcher from '../components/LanguageSwitcher.vue'
+import LlmConfigModal from '../components/LlmConfigModal.vue'
 
 const router = useRouter()
+const showLlmConfig = ref(false)
 
 // 表单数据
 const formData = ref({
@@ -358,6 +365,19 @@ const startSimulation = () => {
   display: flex;
   align-items: center;
   gap: 16px;
+}
+
+.llm-config-link {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--white);
+  cursor: pointer;
+  font: 500 0.9rem 'JetBrains Mono', monospace;
+}
+
+.llm-config-link:hover {
+  color: var(--orange);
 }
 
 .github-link {

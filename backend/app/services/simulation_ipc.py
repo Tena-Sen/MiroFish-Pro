@@ -355,6 +355,19 @@ class SimulationIPCClient:
         except (json.JSONDecodeError, OSError):
             return False
 
+    def _update_env_status(self, status: str):
+        """
+        修 #29:Flask 端原本没有 _update_env_status,只能借用 server 端的方法,
+        导致 simulation_runner 的 cleanup 路径报 AttributeError。
+        实际逻辑跟 server 一样:写 env_status.json + 原子写入。
+        """
+        from ..utils.atomic_io import atomic_write_json
+        status_file = os.path.join(self.simulation_dir, "env_status.json")
+        atomic_write_json(status_file, {
+            "status": status,
+            "timestamp": datetime.now().isoformat()
+        }, ensure_ascii=False)
+
 
 class SimulationIPCServer:
     """

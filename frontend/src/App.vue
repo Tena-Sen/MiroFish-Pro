@@ -44,4 +44,22 @@
 button {
   font-family: inherit;
 }
+
+.global-llm-config-btn {
+  position: fixed;
+  top: 14px;
+  right: 18px;
+  z-index: 900;
+  border: 1px solid rgba(255, 69, 0, 0.7);
+  padding: 7px 12px;
+  background: #fff;
+  color: #111;
+  cursor: pointer;
+  font: 700 12px 'JetBrains Mono', monospace;
+}
+
+.global-llm-config-btn:hover {
+  background: #ff4500;
+  color: #fff;
+}
 </style>

@@ -139,6 +139,14 @@ class SimulationRunState:
     # 业务语义不变：-1 = 尚未快照过；>=0 = 上一轮触发了快照
     _last_snapshot_round: int = -1
 
+    # actions.jsonl 读取位置（防止快照恢复时重读旧 actions）
+    # 修复（快照恢复重复读取 R0~R4 的 bug）：
+    # 之前 _monitor_simulation 每次启动 twitter_position/reddit_position 都重置为 0，
+    # 导致 restore_snapshot 后 monitor 从头读旧 actions.jsonl，把 R0~R4 重复加进 recent_actions。
+    # 修复：持久化到 state（run_state.json），monitor 启动时恢复位置继续读。
+    twitter_actions_log_position: int = 0
+    reddit_actions_log_position: int = 0
+
     # 每轮摘要
     rounds: List[RoundSummary] = field(default_factory=list)
 
@@ -202,6 +210,11 @@ class SimulationRunState:
             "total_actions_count": self.twitter_actions_count + self.reddit_actions_count,
             # 必修 1：持久化 _last_snapshot_round（避免重启后立刻又触发一次 auto-snapshot）
             "_last_snapshot_round": self._last_snapshot_round,
+            # 修复（快照恢复重复读旧 actions bug）：
+            # actions.jsonl 读取位置必须持久化到 run_state.json，
+            # 否则 monitor 重启时仍会从 0 重读快照里的旧 actions。
+            "twitter_actions_log_position": self.twitter_actions_log_position,
+            "reddit_actions_log_position": self.reddit_actions_log_position,
             "started_at": self.started_at,
             "updated_at": self.updated_at,
             "completed_at": self.completed_at,
@@ -257,12 +270,35 @@ class SimulationRunner:
         """获取运行状态"""
         if simulation_id in cls._run_states:
             return cls._run_states[simulation_id]
-        
+
         # 尝试从文件加载
         state = cls._load_run_state(simulation_id)
         if state:
             cls._run_states[simulation_id] = state
         return state
+
+    @classmethod
+    def purge_run_state(cls, simulation_id: str) -> None:
+        """
+        从内存中彻底清除一个模拟的所有运行状态（删除推演时调用）。
+
+        清理类级 dict 中的残留条目（模拟停止/完成后这些结构不会自动清理）：
+        - _run_states / _processes / _action_queues / _monitor_threads
+        - _stdout_files / _stderr_files / _graph_memory_enabled
+
+        不删磁盘文件（调用方负责 rmtree 整个模拟目录）。
+        仅在进程确认不在运行时调用（delete_simulation 已保证 RUNNING 时拒绝删除）。
+        """
+        for registry in (
+            cls._run_states,
+            cls._processes,
+            cls._action_queues,
+            cls._monitor_threads,
+            cls._stdout_files,
+            cls._stderr_files,
+            cls._graph_memory_enabled,
+        ):
+            registry.pop(simulation_id, None)
     
     @classmethod
     def _load_run_state(cls, simulation_id: str) -> Optional[SimulationRunState]:
@@ -328,6 +364,11 @@ class SimulationRunner:
             if hasattr(state, "_last_snapshot_round"):
                 state._last_snapshot_round = int(data.get("_last_snapshot_round", -1))
 
+            # 修复（快照恢复重复读旧 actions bug）：
+            # 恢复 actions.jsonl 读取位置；缺省视为 0（向后兼容老 run_state）
+            state.twitter_actions_log_position = int(data.get("twitter_actions_log_position", 0))
+            state.reddit_actions_log_position = int(data.get("reddit_actions_log_position", 0))
+
             return state
         except Exception as e:
             logger.error(f"加载运行状态失败: {str(e)}")
@@ -383,6 +424,94 @@ class SimulationRunner:
                 logger.warning(f"清理 IPC 目录失败 {ipc_dir_name}: {e}")
 
     @classmethod
+    def _kill_orphan_subprocess(cls, simulation_id: str, reason: str = "") -> bool:
+        """
+        修复（后端重启孤儿进程双写 bug）：
+        process_pid 持久化在 run_state.json，但从未被使用。后端重启
+        （含 Flask reloader 检测代码变更自动重载）后 cls._processes 清空，
+        而 Windows 上子进程独立存活 —— 仍心跳 env_status.json、仍持有
+        DB/actions.jsonl 句柄。此时用户在 Step5 点"恢复/全新启动"会
+        spawn 第二个子进程，两个进程并发写同一 sim_dir（数据撕裂），
+        且子进程本身无单实例锁。
+
+        本方法按 run_state.json 的 process_pid 查杀孤儿子进程：
+        - pid 已死 → 无操作（正常情况）
+        - pid 活着且 cmdline 匹配本项目模拟脚本 → taskkill /T /F 杀进程树
+        - pid 活着但 cmdline 不匹配（pid 被系统复用成无关进程）→ 跳过，防误杀
+
+        Returns:
+            True 表示杀掉了一个孤儿进程
+        """
+        sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
+        state_file = os.path.join(sim_dir, "run_state.json")
+        pid = None
+        try:
+            if os.path.exists(state_file):
+                with open(state_file, 'r', encoding='utf-8') as f:
+                    pid = json.load(f).get("process_pid")
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(f"读取 process_pid 失败（跳过孤儿查杀）: {e}")
+            return False
+        if not isinstance(pid, int) or pid <= 0:
+            return False
+
+        # 进程是否存活
+        try:
+            import psutil
+            try:
+                proc = psutil.Process(pid)
+            except psutil.NoSuchProcess:
+                return False  # 已死，正常
+            # 防 pid 复用误杀：cmdline 必须匹配本项目模拟脚本
+            try:
+                cmdline = " ".join(proc.cmdline()).lower()
+            except (psutil.AccessDenied, psutil.ZombieProcess):
+                cmdline = ""
+            is_sim_proc = (
+                "run_parallel_simulation" in cmdline
+                or "run_twitter_simulation" in cmdline
+                or "run_reddit_simulation" in cmdline
+            )
+            if not is_sim_proc:
+                logger.info(
+                    f"[孤儿查杀] pid={pid} 存活但非模拟进程（pid 复用？），跳过"
+                )
+                return False
+            # 杀整棵进程树（模拟脚本可能再 spawn OASIS 子进程）
+            logger.warning(
+                f"[孤儿查杀] 发现后端重启遗留的孤儿子进程 pid={pid}"
+                f"（{'，' + reason if reason else ''}），终止进程树"
+            )
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass  # 兜底 taskkill
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True, timeout=10,
+                )
+            except Exception:
+                pass
+            return True
+        except ImportError:
+            # psutil 不可用时的保守兜底：Windows taskkill（无法校验 cmdline，
+            # 但 process_pid 是我们写入的，风险可控）
+            try:
+                result = subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True, timeout=10, text=True,
+                )
+                if result.returncode == 0:
+                    logger.warning(f"[孤儿查杀] taskkill 终止孤儿子进程 pid={pid}")
+                    return True
+            except Exception:
+                pass
+            return False
+
+
+    @classmethod
     def _cleanup_stale_simulation_resources(cls, simulation_id: str, reason: str = "") -> None:
         """
         清理某个 simulation_id 残留的子进程、监控线程和共享资源。
@@ -407,6 +536,12 @@ class SimulationRunner:
         if reason:
             log_prefix += f" ({reason})"
         logger.info(log_prefix)
+
+        # 0. 孤儿进程查杀（后端重启场景）：
+        # _processes 里没有 ≠ 没有进程 —— 后端重启 / Flask reloader 自动重载后
+        # 内存清空，但 Windows 上旧子进程仍存活并写 sim_dir。不杀掉它，
+        # 新启动的子进程会与它双写同一目录（DB/actions.jsonl/run_state.json 竞争）。
+        cls._kill_orphan_subprocess(simulation_id, reason=reason or "启动前孤儿查杀")
 
         # 1. 终止旧进程
         old_process = cls._processes.get(simulation_id)
@@ -507,6 +642,7 @@ class SimulationRunner:
         enable_graph_memory_update: bool = False,  # 是否将活动更新到Zep图谱
         graph_id: str = None,  # Zep图谱ID（启用图谱更新时必需）
         start_round: int = 0,  # 从指定轮次开始（用于快照恢复后继续）
+        chat_only: bool = False,  # 仅 chat 模式:跳过 rounds,直接进 IPC wait,agent 加载照常
     ) -> SimulationRunState:
         """
         启动模拟
@@ -518,13 +654,14 @@ class SimulationRunner:
             enable_graph_memory_update: 是否将Agent活动动态更新到Zep图谱
             graph_id: Zep图谱ID（启用图谱更新时必需）
             start_round: 从指定轮次开始（0=从头开始）
+            chat_only: 仅 chat 模式（True 时忽略 rounds,起子进程后直接进 IPC wait）
 
         Returns:
             SimulationRunState
         """
         try:
             return cls._start_simulation_impl(
-                simulation_id, platform, max_rounds, enable_graph_memory_update, graph_id, start_round
+                simulation_id, platform, max_rounds, enable_graph_memory_update, graph_id, start_round, chat_only
             )
         except (ValueError, KeyError):
             raise
@@ -541,8 +678,9 @@ class SimulationRunner:
         enable_graph_memory_update: bool,
         graph_id: str,
         start_round: int,
+        chat_only: bool = False,
     ) -> SimulationRunState:
-        logger.info(f"_start_simulation_impl 开始: simulation_id={simulation_id}, platform={platform}, start_round={start_round}, max_rounds={max_rounds}")
+        logger.info(f"_start_simulation_impl 开始: simulation_id={simulation_id}, platform={platform}, start_round={start_round}, max_rounds={max_rounds}, chat_only={chat_only}")
 
         # 加载模拟配置
         sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
@@ -561,6 +699,10 @@ class SimulationRunner:
         minutes_per_round = time_config.get("minutes_per_round", 30)
         total_rounds = int(total_hours * 60 / minutes_per_round)
 
+        # （chat-only 的 start_round 覆盖已移到 run_state.json 读取之后，
+        # 见下方 final_user_max_rounds 之后的 chat_only 块——必须在恢复用户
+        # 实际 total_rounds 之后对齐，否则会用 time_config 推荐值如 168）
+
         # 记录起始轮次
         actual_start_round = 0
         if start_round > 0:
@@ -578,6 +720,9 @@ class SimulationRunner:
         # 旧实现仅依赖 runner_status == 'idle'，在崩溃/异常路径下不可靠
         run_state_file = os.path.join(sim_dir, "run_state.json")
         restored_from_snapshot = False
+        # 预初始化（run_state.json 不存在时下方 chat_only / user_max_rounds 逻辑仍可安全引用）
+        saved_current_round = 0
+        saved_user_max_rounds = 0
         if os.path.exists(run_state_file):
             try:
                 with open(run_state_file, 'r', encoding='utf-8') as f:
@@ -610,6 +755,22 @@ class SimulationRunner:
                 else:
                     logger.info("未检测到快照恢复标记，判定为普通启动")
 
+                # 修复（恢复/停止后启动重跑 R0 bug）：
+                # 场景：恢复快照→启动→停止→再次启动（无 force）时，前端 wasRestored
+                # 已清除、start_round 传 0；run_state.json 的 runner_status=idle 且
+                # current_round>0 会走"快照恢复场景（兼容路径）"，但 start_round=0
+                # 会让子脚本 is_resume=False → 删 DB 从 R0 重跑，已有进度被摧毁。
+                # 修复：判定为快照恢复场景且 start_round<=0 时，用 run_state.json 的
+                # current_round 作为起始轮次继续（子脚本还会按各平台 runtime_state
+                # 精确修正，Twitter/Reddit 各自从自身进度续跑）。
+                if restored_from_snapshot and start_round <= 0 and saved_current_round > 0:
+                    start_round = int(saved_current_round)
+                    actual_start_round = start_round
+                    logger.info(
+                        f"继续上次进度: start_round 对齐为 run_state current_round={start_round}，"
+                        f"子脚本将按各平台 runtime_state 精确修正起始轮次"
+                    )
+
                 if saved_total_rounds and saved_total_rounds > 0:
                     total_rounds = saved_total_rounds
                     logger.info(f"从快照恢复 total_rounds: {total_rounds}（原计算值 {int(total_hours * 60 / minutes_per_round)}）")
@@ -629,13 +790,31 @@ class SimulationRunner:
                 logger.info(f"轮数已截断: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
 
         # 确定本次运行最终要保存的 user_max_rounds：
-        # - 快照恢复：使用从 run_state.json 恢复的值（保持快照原始意图）
+        # - 快照恢复 / chat-only：使用从 run_state.json 恢复的值（保持原始意图）
         # - 普通启动：使用用户本次传入的 max_rounds
         final_user_max_rounds = 0
-        if restored_from_snapshot and saved_user_max_rounds and saved_user_max_rounds > 0:
+        if (restored_from_snapshot or chat_only) and saved_user_max_rounds and saved_user_max_rounds > 0:
             final_user_max_rounds = saved_user_max_rounds
         elif max_rounds is not None and max_rounds > 0:
             final_user_max_rounds = max_rounds
+
+        # 修复（chat-only 后主页显示 168/168 轮）：
+        # 原实现在读取 run_state.json 之前就把 start_round 提到 time_config 推荐总轮数
+        # （如 168），且前端 chat-only 曾传 force=true 触发 cleanup 删除 run_state.json，
+        # 最终落盘 current_round=168 / total_rounds=168，主页卡片显示"168/168 轮"。
+        # 正确语义：chat-only 是"保留世界、只恢复对话能力"——
+        #   - start_round 对齐"用户实际总轮数"（上面已优先从 run_state.json 恢复，
+        #     无 run_state 时才回退 time_config 推荐值），子进程 range(total, total)
+        #     空跑直接进 IPC wait，且 DB 存在时进 resume 模式保留世界数据；
+        #   - current_round 保留真实进度（saved_current_round），不虚报完成轮数。
+        if chat_only:
+            start_round = total_rounds
+            actual_start_round = int(saved_current_round) if saved_current_round else 0
+            logger.info(
+                f"chat-only 模式：start_round 对齐用户实际总轮数 {total_rounds}"
+                f"（子进程 rounds 空跑，直接进 IPC wait）；"
+                f"current_round 保留真实进度 {actual_start_round}"
+            )
 
         state = SimulationRunState(
             simulation_id=simulation_id,
@@ -646,7 +825,54 @@ class SimulationRunner:
             current_round=actual_start_round,
             user_max_rounds=final_user_max_rounds,
         )
-        
+
+        # 修复（快照恢复重复读旧 actions bug）：
+        # 创建新 state 时未传 twitter_actions_log_position / reddit_actions_log_position 字段，
+        # 默认 0 → _save_run_state 会把它写回磁盘，覆盖 restore_snapshot 之前设好的位置。
+        # 必须从 disk（已被 restore_snapshot 改写过的）恢复这两个字段，保持 monitor 续读旧 actions.jsonl
+        try:
+            run_state_file_path = os.path.join(cls.RUN_STATE_DIR, simulation_id, "run_state.json")
+            if os.path.exists(run_state_file_path):
+                with open(run_state_file_path, 'r', encoding='utf-8') as _f:
+                    _saved = json.load(_f)
+                state.twitter_actions_log_position = int(_saved.get("twitter_actions_log_position", 0))
+                state.reddit_actions_log_position = int(_saved.get("reddit_actions_log_position", 0))
+                # 恢复各平台独立轮次（快照恢复场景下 run_state.json 来自快照，
+                # 含 twitter_current_round / reddit_current_round 的真实进度）。
+                # force 全新启动时 run_state.json 已被 cleanup_simulation_logs 删除，
+                # 走不到这里，两平台轮次保持 0，不受影响。
+                state.twitter_current_round = int(_saved.get("twitter_current_round", 0))
+                state.reddit_current_round = int(_saved.get("reddit_current_round", 0))
+                # 修复（恢复后动作计数/模拟时长归零）：monitor 只统计启动后新读到的动作
+                # （读取位置已重置到文件末尾，历史 actions 不再过 add_action），
+                # 计数从 0 开始 → 前端轮次日志 "A:" 只显示恢复后的动作数。
+                # 同理 simulated_hours 只在 round_end 更新 → "T:0h"。
+                # 快照恢复场景下 run_state.json 保存了快照时刻的累计值，一并恢复，
+                # 使 A: / T: 展示含历史的完整进度。
+                state.twitter_actions_count = int(_saved.get("twitter_actions_count", 0))
+                state.reddit_actions_count = int(_saved.get("reddit_actions_count", 0))
+                state.twitter_simulated_hours = int(_saved.get("twitter_simulated_hours", 0))
+                state.reddit_simulated_hours = int(_saved.get("reddit_simulated_hours", 0))
+                state.simulated_hours = int(_saved.get("simulated_hours", 0))
+                logger.info(
+                    f"从 run_state.json 恢复: actions 读取位置 "
+                    f"twitter={state.twitter_actions_log_position}, "
+                    f"reddit={state.reddit_actions_log_position}; "
+                    f"平台轮次 twitter={state.twitter_current_round}, "
+                    f"reddit={state.reddit_current_round}; "
+                    f"累计动作 twitter={state.twitter_actions_count}, "
+                    f"reddit={state.reddit_actions_count}; "
+                    f"模拟时长 {state.simulated_hours}h"
+                )
+        except Exception as _e:
+            logger.warning(f"恢复 actions 读取位置失败(继续): {_e}")
+
+        # 修复（快照恢复 recent_actions 残留 bug）：
+        # 新启动 = 新一轮模拟，旧 run_state.json 里的 recent_actions（来自前次模拟）会
+        # 残留在前端时间轴上显示为"历史动作"。必须清空 recent_actions，强制 monitor 从
+        # actions.jsonl 当前位置（已通过 position 字段跳过旧数据）重新同步。
+        state.recent_actions.clear()
+
         cls._save_run_state(state)
 
         # 自检修复：启动新进程前清理旧的进程/监控线程/共享资源
@@ -724,6 +950,11 @@ class SimulationRunner:
             #   - 快照恢复（继续 或 从头开始）：使用 total_rounds（已从 run_state.json 恢复，
             #     可能已被原 max_rounds 截断）作为 --max-rounds
             #   - 正常启动（无快照）：使用用户传入的 max_rounds 作为 --max-rounds
+            # 关键：start_round > 0 同时也意味着「快照 resume 模式」
+            #   → 子脚本 run_parallel_simulation.py 在 start_round>0 且 DB 已存在时会
+            #     跳过 DB 删除 + env.reset() + signup + 初始帖子,直接通过
+            #     platform.running() + connect_platform_channel 接管 snapshot DB
+            #   → 这是真正的快照恢复,而不是「重跑」从某个轮次开始
             if start_round > 0 or restored_from_snapshot:
                 # 快照恢复：使用已恢复的 total_rounds（与 state.total_rounds 一致）
                 cmd.extend(["--max-rounds", str(total_rounds)])
@@ -734,6 +965,15 @@ class SimulationRunner:
                     f"{' 和 --start-round ' + str(start_round) if start_round > 0 else '（start_over 模式，从头开始）'} "
                     f"（脚本将基于 max_rounds 截断 total_rounds，确保与快照保存的轮数一致）"
                 )
+                if start_round > 0:
+                    # 关键 resume 日志:子脚本将根据 (start_round > 0 且 DB 已存在) 判定进入 resume 模式
+                    logger.info(
+                        f"【Resume】start_round={start_round} > 0 → "
+                        f"子脚本将进入 resume 模式:"
+                        f"不删 DB / 不 reset / 不 signup / 不发初始帖;"
+                        f"从 snapshot DB 接续用户/帖子/关注,"
+                        f"Twitter 恢复 sandbox_clock.time_step、Reddit 恢复 start_time"
+                    )
             elif max_rounds is not None and max_rounds > 0:
                 cmd.extend(["--max-rounds", str(max_rounds)])
 
@@ -805,8 +1045,40 @@ class SimulationRunner:
             logger.info(f"模拟启动成功: {simulation_id}, pid={process.pid}, platform={platform}")
             
         except Exception as e:
+            # 修复（启动异常孤儿进程）：Popen 成功之后、monitor 正常接管之前，
+            # 任何异常（如 _save_run_state 写盘失败）都会走到这里。旧实现只标
+            # FAILED 就 raise——子进程继续在后台写文件/调 LLM，而 UI 已显示失败，
+            # 形成幽灵进程。此处统一兜底：杀掉已启动的子进程并清理资源
+            # （正常路径这些清理由 monitor 线程的 finally 负责；monitor 未启动时无人清理）。
+            orphan = cls._processes.get(simulation_id)
+            if orphan is not None and orphan.poll() is None:
+                try:
+                    cls._terminate_process(orphan, simulation_id, timeout=5)
+                    logger.warning(f"启动失败，已终止孤儿子进程: pid={orphan.pid}")
+                except Exception as kill_err:
+                    logger.error(
+                        f"终止孤儿子进程失败（可能残留，请手动结束 pid={orphan.pid}）: {kill_err}"
+                    )
+            cls._processes.pop(simulation_id, None)
+            cls._monitor_threads.pop(simulation_id, None)
+            cls._action_queues.pop(simulation_id, None)
+            for _files_dict in (cls._stdout_files, cls._stderr_files):
+                _fh = _files_dict.pop(simulation_id, None)
+                if _fh is not None:
+                    try:
+                        _fh.close()
+                    except Exception:
+                        pass
+            if cls._graph_memory_enabled.pop(simulation_id, None):
+                try:
+                    ZepGraphMemoryManager.stop_updater(simulation_id)
+                except Exception:
+                    pass
+
             state.runner_status = RunnerStatus.FAILED
             state.error = str(e)
+            state.twitter_running = False
+            state.reddit_running = False
             cls._save_run_state(state)
             raise
         
@@ -828,8 +1100,10 @@ class SimulationRunner:
         if not process or not state:
             return
 
-        twitter_position = 0
-        reddit_position = 0
+        # 修复（快照恢复重复读旧 actions bug）：
+        # 从 state 恢复 position，避免从 0 重读旧 actions.jsonl
+        twitter_position = state.twitter_actions_log_position or 0
+        reddit_position = state.reddit_actions_log_position or 0
         twitter_last_size = -1  # 性能优化：文件大小短路；未增长则跳过 read+parse
         reddit_last_size = -1
         last_save_time = 0  # 上次保存时间戳
@@ -858,6 +1132,8 @@ class SimulationRunner:
                         )
                         if new_position != twitter_position:
                             twitter_position = new_position
+                            # 修复：把 position 持久化到 state，monitor 重启时不会重读旧 actions
+                            state.twitter_actions_log_position = twitter_position
                             changed = True
                         # 读完后用 size 更新 last_size，下次 size 不变即短路
                         try:
@@ -877,6 +1153,8 @@ class SimulationRunner:
                         )
                         if new_position != reddit_position:
                             reddit_position = new_position
+                            # 修复：把 position 持久化到 state，monitor 重启时不会重读旧 actions
+                            state.reddit_actions_log_position = reddit_position
                             changed = True
                         try:
                             reddit_last_size = os.path.getsize(reddit_actions_log)
@@ -892,15 +1170,42 @@ class SimulationRunner:
                 time.sleep(2)
             
             # 进程结束后，最后读取一次日志
+            # 修复（终读 position 未持久化）：旧实现丢弃 _read_action_log 的返回值——
+            # 最后一批动作已进计数（actions_count +，卡片时间轴），但 position 停留在
+            # 上次循环保存的旧值。当前终态后无人再读看似无影响，但任何后续复用该
+            # position 的路径（如 monitor 重启、快照恢复前重算计数）都会重复读最后
+            # 一批动作。与循环内处理保持同构：接住返回值写回 state 并持久化。
             if os.path.exists(twitter_actions_log):
-                cls._read_action_log(twitter_actions_log, twitter_position, state, "twitter")
+                _final_pos = cls._read_action_log(twitter_actions_log, twitter_position, state, "twitter")
+                if _final_pos != twitter_position:
+                    twitter_position = _final_pos
+                    state.twitter_actions_log_position = twitter_position
             if os.path.exists(reddit_actions_log):
-                cls._read_action_log(reddit_actions_log, reddit_position, state, "reddit")
+                _final_pos = cls._read_action_log(reddit_actions_log, reddit_position, state, "reddit")
+                if _final_pos != reddit_position:
+                    reddit_position = _final_pos
+                    state.reddit_actions_log_position = reddit_position
             
             # 进程结束
             exit_code = process.returncode
-            
-            if exit_code == 0:
+
+            # 修复（正常停止被误标 FAILED）：用户主动 stop 时 taskkill 产生的退出码必然非 0，
+            # 旧实现只看 exit_code → 每次正常停止都被标记为 FAILED + 写入吓人的错误信息
+            # + 误触发 crash_ 崩溃快照污染快照列表。
+            # 判定依据：stop_simulation 与本监控线程共享同一个 state 对象（get_run_state
+            # 走内存缓存），用户停止时 stop_simulation 先置 STOPPING（杀进程前）再置
+            # STOPPED（杀进程后），两者任一出现即为用户主动停止。
+            user_stopped = state.runner_status in (RunnerStatus.STOPPING, RunnerStatus.STOPPED)
+
+            if user_stopped:
+                # 用户停止：退出码无诊断意义，不改写状态、不写错误、不建崩溃快照
+                logger.info(f"进程因用户停止而退出: {simulation_id}, exit_code={exit_code}（不标记为失败）")
+                if state.runner_status == RunnerStatus.STOPPING:
+                    # 兜底：stop_simulation 中途异常未终结时，由 monitor 终结为 STOPPED，
+                    # 确保 _sync_manager_state 能把 STOPPED 同步进 state.json
+                    state.runner_status = RunnerStatus.STOPPED
+                    state.completed_at = datetime.now().isoformat()
+            elif exit_code == 0:
                 state.runner_status = RunnerStatus.COMPLETED
                 state.completed_at = datetime.now().isoformat()
                 logger.info(f"模拟完成: {simulation_id}")
@@ -939,8 +1244,11 @@ class SimulationRunner:
 
             # 优化 S2：进程异常退出时自动 snapshot（崩溃抗风险）
             # 仅在 exit_code != 0 时触发，0 是正常完成（已有前端 on_complete 快照）
+            # 修复（正常停止被误标 FAILED 的同源问题）：用户主动停止（taskkill）退出码也非 0，
+            # 但那不是崩溃——此时强制落 crash_ 快照只会污染快照列表。用户停止由
+            # stop_simulation 已有的 pre_restore / 正常流程覆盖，无需崩溃快照。
             # snapshot 失败不能阻塞原异常路径
-            if exit_code != 0:
+            if exit_code != 0 and not user_stopped:
                 try:
                     snap_name = f"crash_r{state.current_round}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                     cls.create_snapshot(simulation_id, snapshot_name=snap_name)
@@ -1124,6 +1432,14 @@ class SimulationRunner:
                             
                         except json.JSONDecodeError:
                             pass
+                # 修复（updated_at 不随事件摄入刷新）：
+                # updated_at 原只在 add_action（新 agent 动作）刷新，事件类行
+                # （round_end / simulation_end）更新轮次、完成标志但不刷新时间戳。
+                # 恢复"两平台已完成"的快照时零新动作，updated_at 永不变 →
+                # /run-status 的 B3 缓存 key 不变，前端轮询永远命中启动时的旧响应。
+                # 摄入了新日志行（position 前进）即视为状态更新，刷新 updated_at。
+                if f.tell() > position:
+                    state.updated_at = datetime.now().isoformat()
                 return f.tell()
         except Exception as e:
             logger.warning(f"读取动作日志失败: {log_path}, error={e}")
@@ -1633,6 +1949,17 @@ class SimulationRunner:
         cleaned_files.append("ipc_commands/")
         cleaned_files.append("ipc_responses/")
 
+        # 清理 agent memory + Python/OASIS random state + runtime state 目录,
+        # 避免 force=true 重启后,上一次模拟的 agent memory / random state 污染新模拟。
+        for subdir in ("agent_memory", "random_state", "runtime_state"):
+            subdir_path = os.path.join(sim_dir, subdir)
+            if os.path.isdir(subdir_path):
+                try:
+                    shutil.rmtree(subdir_path)
+                    cleaned_files.append(f"{subdir}/")
+                except Exception as e:
+                    errors.append(f"删除 {subdir}/ 失败: {str(e)}")
+
         # 清理内存中的运行状态
         if simulation_id in cls._run_states:
             del cls._run_states[simulation_id]
@@ -1987,7 +2314,7 @@ class SimulationRunner:
         simulation_id: str,
         interviews: List[Dict[str, Any]],
         platform: str = None,
-        timeout: float = 120.0
+        timeout: float = 30.0   # 修 #31:从 120s 降到 30s,auto-offline fallback 兜底(总等待 ≤30s)
     ) -> Dict[str, Any]:
         """
         批量采访多个Agent
@@ -2371,6 +2698,24 @@ class SimulationRunner:
                     errors.append(f"复制 {dir_name} 目录失败: {str(e)}")
 
         # 保存数据库文件
+        # 修复（活跃 DB 撕裂拷贝）：周期自动快照/手动快照可能在子进程持续写库时执行。
+        # shutil.copy2 直接拷主 DB 文件不拷 -journal → 事务提交中途拷贝时主库已含
+        # 未提交页，恢复后 SQLite 将其视为已提交 → 静默数据损坏，resume 状态错乱。
+        # 修复方式：.db 文件改用 sqlite3 在线 backup API，得到事务边界上一致完整的副本；
+        # backup 内部遇写锁竞争自动重试（sleep=0.25s），与写入方自然共存。
+        # backup 失败（如文件非 SQLite）回退 copy2 并 warning（至少等同旧行为）。
+        def _backup_sqlite_db(src_path: str, dst_path: str) -> None:
+            import sqlite3
+            src_conn = sqlite3.connect(src_path)
+            try:
+                dst_conn = sqlite3.connect(dst_path)
+                try:
+                    src_conn.backup(dst_conn)
+                finally:
+                    dst_conn.close()
+            finally:
+                src_conn.close()
+
         db_files = [
             "reddit_simulation.db",
             "reddit_simulation_*.db",
@@ -2385,10 +2730,44 @@ class SimulationRunner:
                 db_name = os.path.basename(db_path)
                 dst = os.path.join(snapshot_dir, db_name)
                 try:
-                    shutil.copy2(db_path, dst)
+                    if db_name.endswith(".db"):
+                        try:
+                            _backup_sqlite_db(db_path, dst)
+                        except Exception as backup_err:
+                            logger.warning(
+                                f"SQLite backup 失败 {db_name}: {backup_err}，回退直接拷贝"
+                                f"（注意：DB 可能正在写入，快照一致性不保证）"
+                            )
+                            shutil.copy2(db_path, dst)
+                    else:
+                        shutil.copy2(db_path, dst)
                     snapshot_files.append(db_name)
                 except Exception as e:
                     errors.append(f"复制 {db_name} 失败: {str(e)}")
+
+        # 保存 agent memory + Python/OASIS random state + runtime state 目录。
+        # 这些目录由子脚本每轮落盘,snapshot 必须一并复制,才能保证
+        # 恢复时 resume 流程可以从历史 memory + random state 接续
+        # (而不仅仅依赖 DB)。
+        runtime_dirs_to_snapshot = [
+            "agent_memory",
+            "random_state",
+            "runtime_state",
+        ]
+        for subdir in runtime_dirs_to_snapshot:
+            src_dir = os.path.join(sim_dir, subdir)
+            if not os.path.isdir(src_dir):
+                continue
+            dst_dir = os.path.join(snapshot_dir, subdir)
+            try:
+                shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)
+                for root, _, files in os.walk(dst_dir):
+                    for fname in files:
+                        rel = os.path.relpath(os.path.join(root, fname), snapshot_dir)
+                        rel = rel.replace(os.sep, "/")
+                        snapshot_files.append(rel)
+            except Exception as e:
+                errors.append(f"复制 {subdir} 目录失败: {str(e)}")
 
         # 保存快照元数据
         metadata = {
@@ -2511,6 +2890,20 @@ class SimulationRunner:
                 try:
                     with open(metadata_path, 'r', encoding='utf-8') as f:
                         metadata = json.load(f)
+                    # 平台真实轮次（runtime_state 由子进程每轮结束原子写入，比
+                    # run_state 的 monitor 5s 落盘更准）：前端恢复弹窗据此显示各平台
+                    # 续跑轮次/完成状态，避免 run_state 滞后导致显示偏差
+                    for _platform in ("twitter", "reddit"):
+                        _rt_path = os.path.join(snapshot_dir, "runtime_state", f"{_platform}.json")
+                        try:
+                            if os.path.exists(_rt_path):
+                                with open(_rt_path, 'r', encoding='utf-8') as _f:
+                                    _rt = json.load(_f)
+                                _completed = _rt.get("completed_round")
+                                if isinstance(_completed, int) and _completed >= 0:
+                                    metadata.setdefault("runtime_rounds", {})[_platform] = _completed
+                        except (OSError, json.JSONDecodeError):
+                            pass
                     snapshots.append(metadata)
                 except Exception as e:
                     logger.error(f"读取快照元数据失败: {snapshot_name}, error: {e}")
@@ -2644,6 +3037,32 @@ class SimulationRunner:
             except Exception as e:
                 logger.warning(f"清理 {platform}/actions.jsonl 失败: {e}")
 
+        # 历史 actions 保留（不再物理清空）：
+        # 之前为了解决"恢复后误以为从 R0 开始"把 actions.jsonl 的旧动作全删了，
+        # 副作用是恢复后前端时间轴只剩最后一轮的几个动作，历史全部丢失，
+        # 用户无法回顾 R0~R(n-1) 的完整模拟过程。
+        # 现在防重复靠三层（均已保留）：
+        #   1. position 重置到文件末尾 → monitor 不重复读旧 actions
+        #   2. recent_actions 清空 → "最近动作"只显示恢复后的新动作
+        #   3. simulation_end 截断（上面的循环）→ 旧结束标记不干扰新进程
+        # 前端 all_actions 全量读 actions.jsonl → 恢复后能看到 R0~R(n-1) 历史 + 新 actions。
+
+        # 恢复 agent memory + Python/OASIS random state + runtime state 目录
+        # (snapshots/<name>/ 下已 copy 过来),覆盖 fresh 模式运行时可能残留的旧状态。
+        # 子脚本在 resume 流程会读这些目录恢复 agent memory 与 random state。
+        for subdir in ("agent_memory", "random_state", "runtime_state"):
+            src_dir = os.path.join(snapshot_dir, subdir)
+            if not os.path.isdir(src_dir):
+                continue
+            dst_dir = os.path.join(sim_dir, subdir)
+            try:
+                if os.path.exists(dst_dir):
+                    shutil.rmtree(dst_dir)
+                shutil.copytree(src_dir, dst_dir)
+                logger.info(f"恢复 {subdir}/ 目录(用于 resume 加载 agent memory / random state)")
+            except Exception as e:
+                logger.warning(f"恢复 {subdir}/ 目录失败: {e}")
+
         # 修正 run_state.json 中的 runner_status（必须是 idle，因为模拟需要重新启动）
         run_state_file = os.path.join(sim_dir, "run_state.json")
         if os.path.exists(run_state_file):
@@ -2672,6 +3091,134 @@ class SimulationRunner:
                 #  导致 --max-rounds 不透传，子脚本按 time_config 重算 total_rounds 多跑数轮）。
                 run_state_data["restored_at"] = datetime.now().isoformat()
                 run_state_data["restored_snapshot_name"] = snapshot_name
+                # 修复（快照恢复重复读取 R0~R4 actions bug）：
+                # restore_snapshot 把 actions.jsonl 替换为快照里的旧数据，
+                # 但 run_state.json 里的 twitter_actions_log_position / reddit_actions_log_position
+                # 仍是上一次运行时的旧值（可能大于新文件大小）。
+                # 必须在恢复后把 position 设回当前文件大小（"已读到当前文件末尾"），
+                # 避免 monitor 启动时按旧 position seek 错位 → 重读 R0~R4 旧 actions。
+                for platform, key in (("twitter", "twitter_actions_log_position"),
+                                      ("reddit",  "reddit_actions_log_position")):
+                    actions_file = os.path.join(sim_dir, platform, "actions.jsonl")
+                    if os.path.exists(actions_file):
+                        try:
+                            file_size = os.path.getsize(actions_file)
+                            run_state_data[key] = file_size
+                            logger.info(f"快照恢复后 {key} 重置为文件大小 {file_size}")
+                        except OSError:
+                            pass
+                # 修复（恢复后 A: 计数与文件不一致）：
+                # create_snapshot 直接拷贝磁盘上的 run_state.json，而 monitor 每 5s
+                # 才落盘一次 → 快照里的 twitter/reddit_actions_count 最多滞后 5s，
+                # 比快照 actions.jsonl 的实际条数少几个。恢复后 A: 从这个滞后基数
+                # 开始累加，永远比真实总数偏小。
+                # 修复方式：恢复时从恢复后的 actions.jsonl 重新精确计数
+                # （与 _read_actions_from_file 同口径：跳过 event_type 行、要求有 agent_id），
+                # 使 A: 基数与文件内容严格一致。
+                for platform, count_key in (("twitter", "twitter_actions_count"),
+                                            ("reddit",  "reddit_actions_count")):
+                    actions_file = os.path.join(sim_dir, platform, "actions.jsonl")
+                    if not os.path.exists(actions_file):
+                        continue
+                    exact_count = 0
+                    try:
+                        with open(actions_file, 'r', encoding='utf-8') as f:
+                            for line in f:
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                try:
+                                    data = json.loads(line)
+                                except (json.JSONDecodeError, ValueError):
+                                    continue
+                                if "event_type" in data or "agent_id" not in data:
+                                    continue
+                                exact_count += 1
+                        old_count = run_state_data.get(count_key)
+                        if old_count != exact_count:
+                            logger.info(
+                                f"快照恢复后 {count_key} 按文件重新计数: "
+                                f"{old_count} -> {exact_count}（快照内 run_state 可能滞后于 actions.jsonl）"
+                            )
+                        run_state_data[count_key] = exact_count
+                    except OSError as e:
+                        logger.warning(f"恢复时重新计数 {count_key} 失败(沿用快照值): {e}")
+                # 同源修复（T: 模拟时长滞后）：round_end 事件携带 simulated_hours，
+                # 快照内 run_state 若滞后就少算最后一轮。顺序扫描找各平台最后一个
+                # round_end 的 simulated_hours，与计数保持同等的精确性。
+                _restored_platform_hours = {}
+                for platform, hour_key in (("twitter", "twitter_simulated_hours"),
+                                           ("reddit",  "reddit_simulated_hours")):
+                    actions_file = os.path.join(sim_dir, platform, "actions.jsonl")
+                    if not os.path.exists(actions_file):
+                        continue
+                    try:
+                        last_hours = None
+                        with open(actions_file, 'r', encoding='utf-8') as f:
+                            for line in f:
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                try:
+                                    data = json.loads(line)
+                                except (json.JSONDecodeError, ValueError):
+                                    continue
+                                if data.get("event_type") == "round_end" and "simulated_hours" in data:
+                                    last_hours = data.get("simulated_hours", 0)
+                        if last_hours is not None:
+                            old_hours = run_state_data.get(hour_key)
+                            if old_hours != last_hours:
+                                logger.info(
+                                    f"快照恢复后 {hour_key} 按文件修正: {old_hours} -> {last_hours}"
+                                )
+                            run_state_data[hour_key] = last_hours
+                            _restored_platform_hours[platform] = last_hours
+                    except OSError as e:
+                        logger.warning(f"恢复时修正 {hour_key} 失败(沿用快照值): {e}")
+                # 总时长 = 两平台最大值（与 monitor 的 max 语义一致）
+                if _restored_platform_hours:
+                    run_state_data["simulated_hours"] = max(_restored_platform_hours.values())
+                # 修复（恢复后平台轮次显示错误/误导）：
+                # run_state.json 中的 twitter_current_round / reddit_current_round
+                # 来自 monitor 每 5s 的落盘，可能滞后于子进程 runtime_state 中
+                # 的真实 completed_round（例如快照保存瞬间 monitor 还没读到最后一轮
+                # round_end）。恢复后 UI 以此为显示基数，滞后值会让轮次显示落后一拍。
+                # 修复：恢复时用 runtime_state/<platform>.json 的 completed_round
+                # 覆盖（该文件由子进程每轮结束原子写入，是平台真实进度）。
+                _restored_platform_rounds = {}
+                for platform, round_key in (("twitter", "twitter_current_round"),
+                                            ("reddit",  "reddit_current_round")):
+                    runtime_path = os.path.join(sim_dir, "runtime_state", f"{platform}.json")
+                    if not os.path.exists(runtime_path):
+                        continue
+                    try:
+                        with open(runtime_path, 'r', encoding='utf-8') as f:
+                            runtime_data = json.load(f)
+                        completed = runtime_data.get("completed_round")
+                        if isinstance(completed, int) and completed >= 0:
+                            old_round = run_state_data.get(round_key)
+                            if old_round != completed:
+                                logger.info(
+                                    f"快照恢复后 {round_key} 按平台真实进度修正: "
+                                    f"{old_round} -> {completed}（run_state 可能滞后于 runtime_state）"
+                                )
+                            run_state_data[round_key] = completed
+                            _restored_platform_rounds[platform] = completed
+                    except (OSError, json.JSONDecodeError) as e:
+                        logger.warning(f"恢复时读取 {platform} runtime_state 失败(沿用快照值): {e}")
+                # 总轮次对齐：与 monitor 的 max 语义一致，避免 current_round 落后于平台轮次
+                if _restored_platform_rounds:
+                    run_state_data["current_round"] = max(
+                        run_state_data.get("current_round", 0) or 0,
+                        max(_restored_platform_rounds.values()),
+                    )
+                # 修复（快照恢复 recent_actions 残留 bug）：
+                # 快照里的 recent_actions 字段是上次模拟的最近 50 条 actions（包含 R0~R2）。
+                # restore_snapshot 把这个数组拷到 sim_dir/run_state.json 后，
+                # 前端轮询 /run-status/detail 时会从 disk 读 recent_actions，显示 R0~R2 actions → 用户误以为"从 R0 开始"。
+                # 必须在恢复时清空 recent_actions，强制 monitor 从 actions.jsonl 当前 position
+                # 重新同步（position 字段已设到 file_size，跳过旧数据）。
+                run_state_data["recent_actions"] = []
                 # 原子写入：避免快照恢复过程中前端读到半截 JSON
                 atomic_write_json(run_state_file, run_state_data)
                 logger.info(
@@ -2710,6 +3257,19 @@ class SimulationRunner:
         except Exception as e:
             logger.warning(f"恢复快照后同步 state.json 失败: {simulation_id}, error={e}")
 
+        # 返回值补充平台独立轮次（前端恢复日志显示"Plaza R4 / Community R3"，
+        # 而非单一 current_round+1，避免双平台轮次不一致时误导）。
+        # 优先读恢复后（已按 runtime_state 修正过的）run_state.json。
+        _return_tw_round = None
+        _return_rd_round = None
+        try:
+            with open(os.path.join(sim_dir, "run_state.json"), 'r', encoding='utf-8') as f:
+                _post_restore_state = json.load(f)
+            _return_tw_round = _post_restore_state.get("twitter_current_round")
+            _return_rd_round = _post_restore_state.get("reddit_current_round")
+        except (OSError, json.JSONDecodeError):
+            pass
+
         return {
             "success": len(errors) == 0,
             "snapshot_name": snapshot_name,
@@ -2718,6 +3278,8 @@ class SimulationRunner:
             "errors": errors if errors else None,
             "current_round": metadata.get("current_round", 0),
             "total_rounds": metadata.get("total_rounds", 0),
+            "twitter_round": _return_tw_round,
+            "reddit_round": _return_rd_round,
         }
 
     @classmethod

@@ -9,6 +9,7 @@ OASIS Agent Profile生成器
 """
 
 import json
+import os
 import random
 import time
 import asyncio
@@ -23,6 +24,7 @@ from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, get_locale, set_locale, t
 from ..utils.atomic_io import atomic_write_json, atomic_write_text
 from .zep_entity_reader import EntityNode, ZepEntityReader
+from .graph_backend import get_graph_store
 from .graph_store import GraphStore
 
 logger = get_logger('mirofish.oasis_profile')
@@ -342,16 +344,19 @@ class OasisProfileGenerator:
 
         return results
 
-    def _get_or_create_store(self, graph_id: str) -> 'GraphStore':
+    def _get_or_create_store(self, graph_id: str):
         """
-        优化 B2：按 graph_id 复用 GraphStore 实例。
+        优化 B2：按 graph_id 复用图谱存储实例（按 Config.GRAPH_BACKEND 选择后端）。
 
         业务语义不变：所有 entity 共享同一份内存中的图谱快照；
         profile 生成阶段只读图谱，不会修改，所以缓存安全。
+
+        返回类型：local 时为 GraphStore；zep 时为 ZepGraphBackend。
+        两个后端都实现统一的 read/search 接口。
         """
         store = self._store_cache.get(graph_id)
         if store is None:
-            store = GraphStore(graph_id)
+            store = get_graph_store(graph_id)
             self._store_cache[graph_id] = store
         return store
 
@@ -835,8 +840,14 @@ class OasisProfileGenerator:
 
         # 优化 B3：批量写盘 — 每 BATCH_SIZE 个 profile 才落盘一次，避免 N 次全量重写
         # 业务语义不变：最终文件内容与原版完全一致，前端 /profiles/realtime 仍能读到
+        #
+        # 修复（抗中途崩溃）：
+        # - 第一个 profile 完成立即落盘 FIRST_BATCH=1 → 万一后端在第1批完成前崩溃，至少留下 partial progress
+        # - 后续保持每 5 个一批，避免 N 次全量重写
+        FIRST_BATCH = 1
         BATCH_SIZE = 5
         dirty_since_last_flush = [0]  # 自上次落盘以来新生成的 profile 数
+        has_flushed_once = [False]   # 是否已经写过至少一次（决定下次落盘阈值）
 
         # 实时写入文件的辅助函数
         def save_profiles_realtime():
@@ -851,9 +862,12 @@ class OasisProfileGenerator:
                     return
 
                 # 优化 B3：未达到批次大小则跳过写盘（收尾时会强制 flush）
-                if dirty_since_last_flush[0] < BATCH_SIZE:
+                # 修复：首批阈值 FIRST_BATCH=1，确保崩在第一批之前也能留下数据
+                threshold = FIRST_BATCH if not has_flushed_once[0] else BATCH_SIZE
+                if dirty_since_last_flush[0] < threshold:
                     return
                 dirty_since_last_flush[0] = 0
+                has_flushed_once[0] = True
 
                 try:
                     if output_platform == "reddit":
@@ -1305,20 +1319,35 @@ class OasisProfileGenerator:
     ):
         """
         保存Profile到文件（根据平台选择正确格式）
-        
+
         OASIS平台格式要求：
         - Twitter: CSV格式
         - Reddit: JSON格式
-        
+
         Args:
             profiles: Profile列表
             file_path: 文件路径
             platform: 平台类型 ("reddit" 或 "twitter")
+
+        Side effect: 写完 profile 后会失效 sim_dir/agent_cache/ 下所有缓存,
+        确保下一次启动子进程会重新构造 SocialAgent 而不是用旧 cache (因为
+        profile 内容已经变了)。
         """
         if platform == "twitter":
             self._save_twitter_csv(profiles, file_path)
         else:
             self._save_reddit_json(profiles, file_path)
+
+        # Agent persona 缓存失效:profile 内容变了,旧 cache 不再生效
+        # 失败只 log,不阻断主流程
+        try:
+            from .agent_cache_manager import AgentCacheManager
+            simulation_dir = os.path.dirname(os.path.abspath(file_path))
+            deleted = AgentCacheManager.invalidate_sim_cache(simulation_dir)
+            if deleted:
+                logger.info(f"Profile 重生成后失效 {deleted} 个 agent cache ({platform}, sim_dir={simulation_dir})")
+        except Exception as e:
+            logger.warning(f"profile 重生成后失效 agent cache 失败 (继续): {e}")
     
     def _save_twitter_csv(self, profiles: List[OasisAgentProfile], file_path: str):
         """

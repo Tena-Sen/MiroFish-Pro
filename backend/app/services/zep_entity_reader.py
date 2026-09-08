@@ -8,6 +8,7 @@ from typing import Dict, Any, List, Optional, Set
 from dataclasses import dataclass, field
 
 from ..utils.logger import get_logger
+from .graph_backend import get_graph_store
 from .graph_store import GraphStore
 
 logger = get_logger('mirofish.entity_reader')
@@ -77,7 +78,7 @@ class ZepEntityReader:
     def get_all_nodes(self, graph_id: str) -> List[Dict[str, Any]]:
         """获取图谱的所有节点"""
         logger.info(f"获取图谱 {graph_id} 的所有节点...")
-        store = GraphStore(graph_id)
+        store = get_graph_store(graph_id)
         nodes = store.get_all_nodes()
 
         nodes_data = [
@@ -98,7 +99,7 @@ class ZepEntityReader:
     def get_all_edges(self, graph_id: str) -> List[Dict[str, Any]]:
         """获取图谱的所有边"""
         logger.info(f"获取图谱 {graph_id} 的所有边...")
-        store = GraphStore(graph_id)
+        store = get_graph_store(graph_id)
         edges = store.get_all_edges()
 
         edges_data = [
@@ -138,7 +139,7 @@ class ZepEntityReader:
         """筛选出符合预定义实体类型的节点"""
         logger.info(f"开始筛选图谱 {graph_id} 的实体...")
 
-        store = GraphStore(graph_id)
+        store = get_graph_store(graph_id)
 
         # 获取所有节点（排除 Episode）
         all_nodes = [n for n in store.get_all_nodes() if "Episode" not in n.labels]
@@ -245,7 +246,7 @@ class ZepEntityReader:
     ) -> Optional[EntityNode]:
         """获取单个实体及其完整上下文"""
         try:
-            store = GraphStore(graph_id)
+            store = get_graph_store(graph_id)
             node = store.get_node(entity_uuid)
 
             if not node or "Episode" in node.labels:

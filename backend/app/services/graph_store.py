@@ -8,7 +8,9 @@ import os
 import uuid
 import json
 import time
+import re
 import threading
+import unicodedata
 from typing import Dict, Any, List, Optional, Set
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -213,6 +215,120 @@ class GraphStore:
         self._dirty = True
         return node_uuid
 
+    @staticmethod
+    def normalize_entity_name(name: str) -> str:
+        """归一化实体名称，用于跨分块去重和检索。"""
+        value = unicodedata.normalize("NFKC", str(name or "")).strip().lower()
+        return re.sub(r"[\s\-_—–·•:：,，.。/\\()（）【】\[\]{}\"'“”‘’]+", "", value)
+
+    @classmethod
+    def entity_match_keys(cls, name: str, labels: Optional[List[str]] = None) -> Set[str]:
+        """返回实体的基础键和组织机构简称键。"""
+        base = cls.normalize_entity_name(name)
+        if not base:
+            return set()
+
+        keys = {base}
+        label_text = " ".join(str(label).lower() for label in (labels or []))
+        suffixes = (
+            "有限责任公司", "股份有限公司", "有限公司", "集团公司", "集团", "股份",
+            "corporation", "incorporated", "limited", "ltd", "corp", "inc", "co",
+            "公司",
+        )
+        if any(token in label_text for token in ("company", "organization", "corporation", "agency", "机构", "公司", "集团")):
+            for suffix in suffixes:
+                if base.endswith(suffix) and len(base) > len(suffix) + 1:
+                    keys.add(base[:-len(suffix)])
+        return keys
+
+    def find_matching_node(self, name: str, labels: Optional[List[str]] = None) -> Optional[NodeData]:
+        """按名称、别名和组织简称查找已有实体。"""
+        wanted = self.entity_match_keys(name, labels)
+        if not wanted:
+            return None
+
+        for node in self._nodes.values():
+            if "Episode" in node.labels:
+                continue
+            candidates = [node.name] + list(node.attributes.get("aliases", []))
+            for candidate in candidates:
+                if wanted & self.entity_match_keys(candidate, node.labels):
+                    return node
+        return None
+
+    def upsert_entity(
+        self,
+        name: str,
+        labels: List[str],
+        summary: str = "",
+        attributes: Dict[str, Any] = None,
+    ) -> str:
+        """添加或合并实体，保留别名并复用已有 UUID。"""
+        existing = self.find_matching_node(name, labels)
+        if existing is None:
+            return self.add_node(name=name, labels=labels, summary=summary, attributes=attributes)
+
+        merged_labels = list(dict.fromkeys(existing.labels + list(labels or [])))
+        merged_attributes = dict(existing.attributes or {})
+        aliases = list(merged_attributes.get("aliases", []))
+        if name != existing.name and name not in aliases:
+            aliases.append(name)
+        if aliases:
+            merged_attributes["aliases"] = aliases
+        merged_attributes.update(attributes or {})
+        merged_attributes["aliases"] = aliases
+
+        existing.labels = merged_labels
+        if summary and len(summary) > len(existing.summary or ""):
+            existing.summary = summary
+        existing.attributes = merged_attributes
+        self._graph.nodes[existing.uuid].update({"name": existing.name, "labels": merged_labels})
+        self._tfidf_dirty = True
+        self._dirty = True
+        return existing.uuid
+
+    def add_or_merge_edge(
+        self,
+        name: str,
+        fact: str,
+        source_node_uuid: str,
+        target_node_uuid: str,
+        attributes: Dict[str, Any] = None,
+        episodes: List[str] = None,
+    ) -> str:
+        """按端点和关系类型合并重复关系。"""
+        relation_key = self.normalize_entity_name(name)
+        for edge in self._edges.values():
+            if (
+                edge.source_node_uuid == source_node_uuid
+                and edge.target_node_uuid == target_node_uuid
+                and self.normalize_entity_name(edge.name) == relation_key
+            ):
+                if fact and fact != edge.fact:
+                    facts = list(edge.attributes.get("facts", []))
+                    if edge.fact and edge.fact not in facts:
+                        facts.insert(0, edge.fact)
+                    if fact not in facts:
+                        facts.append(fact)
+                    edge.attributes["facts"] = facts[-10:]
+                    edge.fact = "；".join(facts[-3:])
+                if episodes:
+                    edge.episodes = list(dict.fromkeys(edge.episodes + episodes))
+                if attributes:
+                    edge.attributes.update(attributes)
+                self._tfidf_dirty = True
+                self._dirty = True
+                return edge.uuid
+
+        return self.add_edge(
+            name=name,
+            fact=fact,
+            source_node_uuid=source_node_uuid,
+            target_node_uuid=target_node_uuid,
+            attributes=attributes,
+            episodes=episodes,
+        )
+
     def get_node(self, node_uuid: str) -> Optional[NodeData]:
         """获取节点"""
         return self._nodes.get(node_uuid)
@@ -346,62 +462,54 @@ class GraphStore:
     # ========== 搜索（TF-IDF 语义搜索） ==========
 
     def search(self, query: str, limit: int = 10, scope: str = "edges") -> Dict[str, Any]:
-        """
-        语义搜索（基于 TF-IDF）
-
-        Args:
-            query: 搜索查询
-            limit: 返回结果数量
-            scope: "edges", "nodes", 或 "both"
-
-        Returns:
-            搜索结果 {edges: [...], nodes: [...]}
-        """
-        self._ensure_tfidf_index()
-
+        """混合检索：TF-IDF + 中文字符/关键词匹配 + 别名召回。"""
         result = {"edges": [], "nodes": []}
-
-        if self._tfidf_matrix is None or self._tfidf_matrix.shape[0] == 0:
+        if not query or not query.strip():
             return result
 
+        self._ensure_tfidf_index()
+        query_norm = self.normalize_entity_name(query)
+        keywords = [part for part in re.findall(r"[\u4e00-\u9fff]|[a-zA-Z0-9]+", query.lower()) if part.strip()]
+        scores: Dict[str, float] = {}
+
+        def text_score(text: str) -> float:
+            normalized = self.normalize_entity_name(text)
+            score = 1.0 if query_norm and query_norm in normalized else 0.0
+            score += min(0.8, sum(0.12 for keyword in keywords if keyword in text.lower()))
+            return score
+
         try:
-            from sklearn.metrics.pairwise import cosine_similarity
-            query_vec = self._tfidf_vectorizer.transform([query])
-            scores = cosine_similarity(query_vec, self._tfidf_matrix).flatten()
+            if self._tfidf_matrix is not None and self._tfidf_vectorizer is not None:
+                from sklearn.metrics.pairwise import cosine_similarity
+                query_vector = self._tfidf_vectorizer.transform([query])
+                for index, value in enumerate(cosine_similarity(query_vector, self._tfidf_matrix).flatten()):
+                    if value > 0:
+                        scores[self._tfidf_doc_ids[index]] = float(value) * 0.65
+        except Exception as exc:
+            logger.debug(f"TF-IDF 混合检索失败，继续关键词检索: {exc}")
 
-            # 按分数排序
-            scored_indices = sorted(
-                range(len(scores)),
-                key=lambda i: scores[i],
-                reverse=True
-            )
+        for edge in self._edges.values():
+            scores[edge.uuid] = scores.get(edge.uuid, 0.0) + text_score(f"{edge.name} {edge.fact}") * 0.35
+        for node in self._nodes.values():
+            if "Episode" not in node.labels:
+                aliases = " ".join(node.attributes.get("aliases", []))
+                scores[node.uuid] = scores.get(node.uuid, 0.0) + text_score(
+                    f"{node.name} {aliases} {node.summary}"
+                ) * 0.35
 
-            for idx in scored_indices:
-                if scores[idx] < 0.01:  # 最低相似度阈值
-                    break
-
-                doc_id = self._tfidf_doc_ids[idx]
-                doc_type = self._tfidf_doc_types[idx]
-
-                if doc_type == "edge" and scope in ("edges", "both"):
-                    edge = self._edges.get(doc_id)
-                    if edge:
-                        result["edges"].append(edge.to_dict())
-                elif doc_type == "node" and scope in ("nodes", "both"):
-                    node = self._nodes.get(doc_id)
-                    if node and "Episode" not in node.labels:
-                        result["nodes"].append(node.to_dict())
-
-                if len(result["edges"]) >= limit and len(result["nodes"]) >= limit:
-                    break
-
-        except Exception as e:
-            logger.warning(f"TF-IDF 搜索失败，降级为关键词匹配: {e}")
-            return self._keyword_search(query, limit, scope)
-
-        # 限制数量
-        result["edges"] = result["edges"][:limit]
-        result["nodes"] = result["nodes"][:limit]
+        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        if scope in ("edges", "both"):
+            result["edges"] = [
+                self._edges[item_id].to_dict()
+                for item_id, score in ranked
+                if item_id in self._edges and score > 0
+            ][:limit]
+        if scope in ("nodes", "both"):
+            result["nodes"] = [
+                self._nodes[item_id].to_dict()
+                for item_id, score in ranked
+                if item_id in self._nodes and score > 0
+            ][:limit]
         return result
 
     def _keyword_search(self, query: str, limit: int, scope: str) -> Dict[str, Any]:
@@ -467,9 +575,15 @@ class GraphStore:
                         doc_types.append("node")
 
                 if documents:
+                    # 修复（中文 TF-IDF 失效）：原 analyzer='word' 按空白切词，
+                    # 中文无空格 → 整句成为单 token，查询与文档 token 永不相同，
+                    # 中文查询的 TF-IDF 余弦相似度恒为 0，该层（权重 0.65）从未生效。
+                    # 改用字符级 n-gram：中文按字/双字切分（"数据泄露"→"数据""据泄""泄露"），
+                    # 英文单词同口径按字符分解，查询与文档一致，余弦匹配恢复有效。
+                    # max_features 上限防大图谱内存膨胀。
                     self._tfidf_vectorizer = TfidfVectorizer(
                         max_features=10000,
-                        analyzer='word',
+                        analyzer='char',
                         ngram_range=(1, 2),
                     )
                     self._tfidf_matrix = self._tfidf_vectorizer.fit_transform(documents)
