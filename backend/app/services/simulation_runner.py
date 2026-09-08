@@ -424,6 +424,94 @@ class SimulationRunner:
                 logger.warning(f"清理 IPC 目录失败 {ipc_dir_name}: {e}")
 
     @classmethod
+    def _kill_orphan_subprocess(cls, simulation_id: str, reason: str = "") -> bool:
+        """
+        修复（后端重启孤儿进程双写 bug）：
+        process_pid 持久化在 run_state.json，但从未被使用。后端重启
+        （含 Flask reloader 检测代码变更自动重载）后 cls._processes 清空，
+        而 Windows 上子进程独立存活 —— 仍心跳 env_status.json、仍持有
+        DB/actions.jsonl 句柄。此时用户在 Step5 点"恢复/全新启动"会
+        spawn 第二个子进程，两个进程并发写同一 sim_dir（数据撕裂），
+        且子进程本身无单实例锁。
+
+        本方法按 run_state.json 的 process_pid 查杀孤儿子进程：
+        - pid 已死 → 无操作（正常情况）
+        - pid 活着且 cmdline 匹配本项目模拟脚本 → taskkill /T /F 杀进程树
+        - pid 活着但 cmdline 不匹配（pid 被系统复用成无关进程）→ 跳过，防误杀
+
+        Returns:
+            True 表示杀掉了一个孤儿进程
+        """
+        sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
+        state_file = os.path.join(sim_dir, "run_state.json")
+        pid = None
+        try:
+            if os.path.exists(state_file):
+                with open(state_file, 'r', encoding='utf-8') as f:
+                    pid = json.load(f).get("process_pid")
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(f"读取 process_pid 失败（跳过孤儿查杀）: {e}")
+            return False
+        if not isinstance(pid, int) or pid <= 0:
+            return False
+
+        # 进程是否存活
+        try:
+            import psutil
+            try:
+                proc = psutil.Process(pid)
+            except psutil.NoSuchProcess:
+                return False  # 已死，正常
+            # 防 pid 复用误杀：cmdline 必须匹配本项目模拟脚本
+            try:
+                cmdline = " ".join(proc.cmdline()).lower()
+            except (psutil.AccessDenied, psutil.ZombieProcess):
+                cmdline = ""
+            is_sim_proc = (
+                "run_parallel_simulation" in cmdline
+                or "run_twitter_simulation" in cmdline
+                or "run_reddit_simulation" in cmdline
+            )
+            if not is_sim_proc:
+                logger.info(
+                    f"[孤儿查杀] pid={pid} 存活但非模拟进程（pid 复用？），跳过"
+                )
+                return False
+            # 杀整棵进程树（模拟脚本可能再 spawn OASIS 子进程）
+            logger.warning(
+                f"[孤儿查杀] 发现后端重启遗留的孤儿子进程 pid={pid}"
+                f"（{'，' + reason if reason else ''}），终止进程树"
+            )
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass  # 兜底 taskkill
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True, timeout=10,
+                )
+            except Exception:
+                pass
+            return True
+        except ImportError:
+            # psutil 不可用时的保守兜底：Windows taskkill（无法校验 cmdline，
+            # 但 process_pid 是我们写入的，风险可控）
+            try:
+                result = subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True, timeout=10, text=True,
+                )
+                if result.returncode == 0:
+                    logger.warning(f"[孤儿查杀] taskkill 终止孤儿子进程 pid={pid}")
+                    return True
+            except Exception:
+                pass
+            return False
+
+
+    @classmethod
     def _cleanup_stale_simulation_resources(cls, simulation_id: str, reason: str = "") -> None:
         """
         清理某个 simulation_id 残留的子进程、监控线程和共享资源。
@@ -448,6 +536,12 @@ class SimulationRunner:
         if reason:
             log_prefix += f" ({reason})"
         logger.info(log_prefix)
+
+        # 0. 孤儿进程查杀（后端重启场景）：
+        # _processes 里没有 ≠ 没有进程 —— 后端重启 / Flask reloader 自动重载后
+        # 内存清空，但 Windows 上旧子进程仍存活并写 sim_dir。不杀掉它，
+        # 新启动的子进程会与它双写同一目录（DB/actions.jsonl/run_state.json 竞争）。
+        cls._kill_orphan_subprocess(simulation_id, reason=reason or "启动前孤儿查杀")
 
         # 1. 终止旧进程
         old_process = cls._processes.get(simulation_id)
@@ -605,14 +699,9 @@ class SimulationRunner:
         minutes_per_round = time_config.get("minutes_per_round", 30)
         total_rounds = int(total_hours * 60 / minutes_per_round)
 
-        # chat-only 模式:把 start_round 提到 total_rounds,让下游 for 循环空跑直接进 IPC wait。
-        # 只在用户没显式给 start_round 的情况下覆盖(避免跟快照恢复冲突)。
-        if chat_only and start_round <= 0:
-            start_round = total_rounds
-            logger.info(
-                f"chat-only 模式：effective_start_round = total_rounds = {start_round},"
-                f"子进程 rounds loop 将空跑,直接进入 IPC wait"
-            )
+        # （chat-only 的 start_round 覆盖已移到 run_state.json 读取之后，
+        # 见下方 final_user_max_rounds 之后的 chat_only 块——必须在恢复用户
+        # 实际 total_rounds 之后对齐，否则会用 time_config 推荐值如 168）
 
         # 记录起始轮次
         actual_start_round = 0
@@ -631,6 +720,9 @@ class SimulationRunner:
         # 旧实现仅依赖 runner_status == 'idle'，在崩溃/异常路径下不可靠
         run_state_file = os.path.join(sim_dir, "run_state.json")
         restored_from_snapshot = False
+        # 预初始化（run_state.json 不存在时下方 chat_only / user_max_rounds 逻辑仍可安全引用）
+        saved_current_round = 0
+        saved_user_max_rounds = 0
         if os.path.exists(run_state_file):
             try:
                 with open(run_state_file, 'r', encoding='utf-8') as f:
@@ -698,13 +790,31 @@ class SimulationRunner:
                 logger.info(f"轮数已截断: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
 
         # 确定本次运行最终要保存的 user_max_rounds：
-        # - 快照恢复：使用从 run_state.json 恢复的值（保持快照原始意图）
+        # - 快照恢复 / chat-only：使用从 run_state.json 恢复的值（保持原始意图）
         # - 普通启动：使用用户本次传入的 max_rounds
         final_user_max_rounds = 0
-        if restored_from_snapshot and saved_user_max_rounds and saved_user_max_rounds > 0:
+        if (restored_from_snapshot or chat_only) and saved_user_max_rounds and saved_user_max_rounds > 0:
             final_user_max_rounds = saved_user_max_rounds
         elif max_rounds is not None and max_rounds > 0:
             final_user_max_rounds = max_rounds
+
+        # 修复（chat-only 后主页显示 168/168 轮）：
+        # 原实现在读取 run_state.json 之前就把 start_round 提到 time_config 推荐总轮数
+        # （如 168），且前端 chat-only 曾传 force=true 触发 cleanup 删除 run_state.json，
+        # 最终落盘 current_round=168 / total_rounds=168，主页卡片显示"168/168 轮"。
+        # 正确语义：chat-only 是"保留世界、只恢复对话能力"——
+        #   - start_round 对齐"用户实际总轮数"（上面已优先从 run_state.json 恢复，
+        #     无 run_state 时才回退 time_config 推荐值），子进程 range(total, total)
+        #     空跑直接进 IPC wait，且 DB 存在时进 resume 模式保留世界数据；
+        #   - current_round 保留真实进度（saved_current_round），不虚报完成轮数。
+        if chat_only:
+            start_round = total_rounds
+            actual_start_round = int(saved_current_round) if saved_current_round else 0
+            logger.info(
+                f"chat-only 模式：start_round 对齐用户实际总轮数 {total_rounds}"
+                f"（子进程 rounds 空跑，直接进 IPC wait）；"
+                f"current_round 保留真实进度 {actual_start_round}"
+            )
 
         state = SimulationRunState(
             simulation_id=simulation_id,

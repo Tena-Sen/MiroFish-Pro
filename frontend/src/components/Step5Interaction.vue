@@ -184,17 +184,6 @@
             <span v-else-if="restartMode === 'fresh'">{{ $t('step5.freshStarting') }}</span>
             <span v-else>{{ $t('step5.envStoppedAction') }}</span>
           </button>
-          <!-- 强制从头启动按钮 —— 永跳过 picker,清空并从 R0 重新开始 -->
-          <!-- 视觉上稍弱一点,避免和主入口抢镜;鼠标 hover 显示提示"已有数据会被清空" -->
-          <button
-            v-show="envStatus === 'stopped' && !envStatusLoading && !isRestarting"
-            class="env-status-action env-status-action-force"
-            :disabled="isRestarting"
-            @click="handleForceFreshStart"
-            :title="$t('step5.envForceFreshHint')"
-          >
-            {{ $t('step5.envForceFreshBtn') }}
-          </button>
           <!-- 恢复期进度由独立的大 banner 接管 (.restart-progress-area),这里不再放小转圈避免双转圈 -->
         </div>
 
@@ -453,7 +442,14 @@
                 ref="chatInputRef"
               ></textarea>
               <!-- 平台选择器: "都问 / 只问 Reddit / 只问 Twitter",默认 both 保留现有行为 -->
-              <div class="platform-selector" role="radiogroup" :aria-label="t('step5.platformLabel')">
+              <!-- 仅直连 Agent 模式显示：platform 参数只随 interview/batch 请求发送，
+                   Report Agent(/api/report/chat)模式不感知 platform，显示会造成虚假选择 -->
+              <div
+                v-if="chatTarget === 'agent'"
+                class="platform-selector"
+                role="radiogroup"
+                :aria-label="t('step5.platformLabel')"
+              >
                 <button
                   type="button"
                   class="platform-pill"
@@ -766,39 +762,6 @@ const getSnapshotRound = (snap) => {
   return snap.current_round ?? snap.run_state?.current_round ?? 0
 }
 
-// 强制从头启动 —— 跳过快照 picker,直接 force=true 全新启动
-// 跟 "一键重启" 不同:这个按钮永不弹 picker,适合用户明确想清空重来的场景
-const handleForceFreshStart = async () => {
-  if (!props.simulationId || isRestarting.value) return
-  isRestarting.value = true
-  pickedSnapshot.value = null
-  recoveryStage.value = 'starting'
-  addLog(t('step5.envForceFreshTriggered'))
-  try {
-    // 从头开始 = force 清空 + 从 R3 开始(跳过 R0/R1/R2)
-    // 后端跑模拟循环时不会立刻写 env_status.json=alive(要等 144 轮跑完),
-    // 所以不等 polling,API 200 就立刻跳 Step 3 监控
-    const res = await startSimulation({
-      simulation_id: props.simulationId,
-      platform: 'parallel',
-      force: true,
-      start_round: 3,  // 跳过 R0/R1/R2
-      enable_graph_memory_update: true
-    })
-    if (res.success) {
-      addLog(t('step5.envForceFreshNavigating'))
-      resetRestartState()  // 复位 isRestarting,免得组件卸载后状态残留
-      goBack('env_stopped')  // 立刻跳 Step 3
-    } else {
-      addLog(t('step5.envRestartFailed', { error: res.error || '' }))
-      resetRestartState()
-    }
-  } catch (err) {
-    addLog(t('step5.envRestartException', { error: err.message }))
-    resetRestartState()
-  }
-}
-
 const handleEnvStoppedAction = async () => {
   if (!props.simulationId || isRestarting.value) return
   isRestarting.value = true
@@ -972,7 +935,9 @@ const doFreshStart = async (opts = {}) => {
   const res = await startSimulation({
     simulation_id: props.simulationId,
     platform: 'parallel',
-    force: true,
+    // chat-only 保留世界数据（DB/actions/run_state），不能 force 清理；
+    // 后端会把 start_round 对齐 run_state.json 里的用户实际总轮数，跳过剩余轮次直接进 IPC wait
+    force: !chatOnly,
     start_round: startRound,  // 0 = 正常从头;3 = 跳过 R0/R1/R2
     enable_graph_memory_update: true,
     chat_only: chatOnly        // True 时后端把 start_round 提到 total_rounds,跳过 rounds 直接进 IPC wait
@@ -3017,7 +2982,10 @@ onUnmounted(() => {
   flex-direction: column;
   padding: 24px;
   border-bottom: 1px solid #E5E7EB;
-  overflow: hidden;
+  /* 空间不足时(矮视口/停止banner/结果面板挤压)整个设置区可滚动,
+     否则 overflow:hidden 会把最底部的发送按钮裁掉 */
+  overflow-y: auto;
+  min-height: 0;
 }
 
 .setup-section {
@@ -3435,7 +3403,7 @@ onUnmounted(() => {
   align-items: center;
   gap: 8px;
   padding: 8px 12px;
-  margin: 0 16px 12px;
+  margin: 12px 16px 12px;
   border-radius: 6px;
   font-size: 12px;
   font-weight: 500;
@@ -3463,20 +3431,6 @@ onUnmounted(() => {
 .env-status-action:hover {
   background: #FFE0B2;
   border-color: #FB8C00;
-}
-
-/* 次级按钮 —— 强制从头开始,样式比主入口稍弱以免抢镜 */
-.env-status-action-force {
-  background: #FFF;
-  color: #757575;
-  border-color: #DDDDDD;
-  margin-left: 6px;   /* 紧贴主按钮右侧 */
-}
-
-.env-status-action-force:hover {
-  background: #FAFAFA;
-  border-color: #BDBDBD;
-  color: #424242;
 }
 
 /* 多快照选择器（≥2 个 final_/fail_ 快照时） */

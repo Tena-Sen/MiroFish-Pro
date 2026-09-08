@@ -1232,12 +1232,24 @@ def delete_simulation(simulation_id: str):
             }), 404
 
         # 检查是否有正在运行的模拟
+        # 修复（陈旧 RUNNING 状态误拒删 / 孤儿进程句柄毁删）：
+        # 后端重启 / Flask reloader 自动重载后 run_state.json 的 runner_status
+        # 停在 RUNNING（无人更新），但进程可能已死或成孤儿。
+        # 仅【后端托管且活着】的进程才拒绝删除（用户应先停止）；
+        # 孤儿进程（后端失联）查杀后放行，避免 Windows 文件句柄让 rmtree 失败。
         run_state = SimulationRunner.get_run_state(simulation_id)
         if run_state and run_state.runner_status == RunnerStatus.RUNNING:
-            return jsonify({
-                "success": False,
-                "error": "模拟正在运行中，请先停止后再删除"
-            }), 400
+            _managed_proc = SimulationRunner._processes.get(simulation_id)
+            if _managed_proc is not None and _managed_proc.poll() is None:
+                return jsonify({
+                    "success": False,
+                    "error": "模拟正在运行中，请先停止后再删除"
+                }), 400
+            # 真实进程已死（陈旧状态）或孤儿进程：查杀孤儿（若在）后放行删除
+            SimulationRunner._kill_orphan_subprocess(simulation_id, reason="删除推演前孤儿查杀")
+            logger.info(
+                f"删除推演: run_state 为 RUNNING 但非托管活进程（后端重启陈旧状态/孤儿），放行删除 {simulation_id}"
+            )
 
         # 直接构建目录路径（避免 _get_simulation_dir 创建空目录）
         sim_dir = os.path.join(manager.SIMULATION_DATA_DIR, simulation_id)
