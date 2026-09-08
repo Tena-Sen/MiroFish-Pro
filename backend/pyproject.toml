@@ -32,10 +32,18 @@ dependencies = [
     
     # 工具库
     "python-dotenv>=1.0.0",
-    "pydantic>=2.0.0",
+    # 修复（OASIS 启动崩溃）：camel-ai 0.2.78 + mcp 1.24 与 pydantic>=2.11 不兼容
+    # （pydantic._internal.model_construction 在 import 时 KeyError）
+    # 锁定 pydantic<2.11，让 OASIS sub-process 能正常启动
+    "pydantic>=2.0.0,<2.11",
 ]
 
 [project.optional-dependencies]
+zep = [
+    # Zep Cloud Standalone Graph 后端；仅在 GRAPH_BACKEND=zep 时需要。
+    # 默认 GRAPH_BACKEND=local，本地 GraphStore 不依赖 zep-cloud。
+    "zep-cloud>=2.0.0",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",

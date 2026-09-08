@@ -77,6 +77,141 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 
 
+AGENT_MEMORY_DIR_NAME = "agent_memory"
+RANDOM_STATE_DIR_NAME = "random_state"
+RUNTIME_STATE_DIR_NAME = "runtime_state"
+
+
+def _tupleize_random_state(value):
+    if isinstance(value, list):
+        return tuple(_tupleize_random_state(item) for item in value)
+    return value
+
+
+def _oasis_random_module():
+    try:
+        import importlib
+        return importlib.import_module("oasis.social_platform.platform").random
+    except Exception:
+        return random
+
+
+def _write_json_atomic(path: str, data: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
+
+
+def _runtime_state_path(simulation_dir: str, platform_name: str) -> str:
+    return os.path.join(simulation_dir, RUNTIME_STATE_DIR_NAME, f"{platform_name}.json")
+
+
+def _random_state_path(simulation_dir: str, platform_name: str) -> str:
+    return os.path.join(simulation_dir, RANDOM_STATE_DIR_NAME, f"{platform_name}.json")
+
+
+def _agent_memory_dir(simulation_dir: str, platform_name: str) -> str:
+    return os.path.join(simulation_dir, AGENT_MEMORY_DIR_NAME, platform_name)
+
+
+def _reset_persistent_runtime_state(simulation_dir: str, platform_name: str) -> None:
+    import shutil
+    for path in (
+        _agent_memory_dir(simulation_dir, platform_name),
+        _runtime_state_path(simulation_dir, platform_name),
+        _random_state_path(simulation_dir, platform_name),
+    ):
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        elif os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def _load_random_state(simulation_dir: str, platform_name: str) -> None:
+    path = _random_state_path(simulation_dir, platform_name)
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        python_state = data.get("python_random_state")
+        oasis_state = data.get("oasis_random_state")
+        if python_state is not None:
+            random.setstate(_tupleize_random_state(python_state))
+        if oasis_state is not None:
+            _oasis_random_module().setstate(_tupleize_random_state(oasis_state))
+    except Exception as e:
+        _subprocess_logger.warning(f"加载 {platform_name} random state 失败(继续): {e}")
+
+
+def _load_agent_memories(simulation_dir: str, agent_graph, platform_name: str) -> None:
+    memory_dir = _agent_memory_dir(simulation_dir, platform_name)
+    if not os.path.isdir(memory_dir):
+        return
+    for agent_id, agent in agent_graph.get_agents():
+        path = os.path.join(memory_dir, f"{agent_id}.json")
+        if not os.path.exists(path):
+            continue
+        try:
+            agent.load_memory_from_path(path)
+        except Exception as e:
+            _subprocess_logger.warning(
+                f"加载 {platform_name} Agent {agent_id} memory 失败(继续): {e}"
+            )
+
+
+def _save_runtime_state(simulation_dir: str, agent_graph, platform_name: str,
+                        completed_round: int, total_rounds: int) -> None:
+    memory_dir = _agent_memory_dir(simulation_dir, platform_name)
+    os.makedirs(memory_dir, exist_ok=True)
+    for agent_id, agent in agent_graph.get_agents():
+        try:
+            agent.save_memory(os.path.join(memory_dir, f"{agent_id}.json"))
+        except Exception as e:
+            _subprocess_logger.warning(
+                f"保存 {platform_name} Agent {agent_id} memory 失败(继续): {e}"
+            )
+
+    oasis_random = _oasis_random_module()
+    _write_json_atomic(
+        _random_state_path(simulation_dir, platform_name),
+        {
+            "python_random_state": list(random.getstate()),
+            "oasis_random_state": list(oasis_random.getstate()),
+            "updated_at": datetime.now().isoformat(),
+        },
+    )
+    _write_json_atomic(
+        _runtime_state_path(simulation_dir, platform_name),
+        {
+            "platform": platform_name,
+            "completed_round": completed_round,
+            "next_round": completed_round + 1,
+            "total_rounds": total_rounds,
+            "updated_at": datetime.now().isoformat(),
+        },
+    )
+
+
+def _load_runtime_state(simulation_dir: str, agent_graph, platform_name: str) -> Dict[str, Any]:
+    _load_random_state(simulation_dir, platform_name)
+    _load_agent_memories(simulation_dir, agent_graph, platform_name)
+    path = _runtime_state_path(simulation_dir, platform_name)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        _subprocess_logger.warning(f"加载 {platform_name} runtime state 失败(继续): {e}")
+        return {}
+
+
 # 全局变量：用于信号处理
 _shutdown_event = None
 _cleanup_done = False
@@ -201,7 +336,8 @@ def _try_load_cached_agent_graph(simulation_dir: str, profile_path: str, config_
         if not payload:
             return None, False
 
-        from oasis.social_agent.agent import AgentGraph, SocialAgent
+        from oasis.social_agent.agent import SocialAgent
+        from oasis.social_agent.agent_graph import AgentGraph
         from oasis.social_platform.config.user import UserInfo
         from oasis.social_platform.typing import ActionType as _AT
 
@@ -1230,56 +1366,20 @@ def _get_comment_info(
     return None
 
 
-def create_model(config: Dict[str, Any], use_boost: bool = False):
-    """
-    创建LLM模型
-    
-    支持双 LLM 配置，用于并行模拟时提速：
-    - 通用配置：LLM_API_KEY, LLM_BASE_URL, LLM_MODEL_NAME
-    - 加速配置（可选）：LLM_BOOST_API_KEY, LLM_BOOST_BASE_URL, LLM_BOOST_MODEL_NAME
-    
-    如果配置了加速 LLM，并行模拟时可以让不同平台使用不同的 API 服务商，提高并发能力。
-    
-    Args:
-        config: 模拟配置字典
-        use_boost: 是否使用加速 LLM 配置（如果可用）
-    """
-    # 检查是否有加速配置
-    boost_api_key = os.environ.get("LLM_BOOST_API_KEY", "")
-    boost_base_url = os.environ.get("LLM_BOOST_BASE_URL", "")
-    boost_model = os.environ.get("LLM_BOOST_MODEL_NAME", "")
-    has_boost_config = bool(boost_api_key)
-    
-    # 根据参数和配置情况选择使用哪个 LLM
-    if use_boost and has_boost_config:
-        # 使用加速配置
-        llm_api_key = boost_api_key
-        llm_base_url = boost_base_url
-        llm_model = boost_model or os.environ.get("LLM_MODEL_NAME", "")
-        config_label = "[加速LLM]"
-    else:
-        # 使用通用配置
-        llm_api_key = os.environ.get("LLM_API_KEY", "")
-        llm_base_url = os.environ.get("LLM_BASE_URL", "")
-        llm_model = os.environ.get("LLM_MODEL_NAME", "")
-        config_label = "[通用LLM]"
-    
-    # 如果 .env 中没有模型名，则使用 config 作为备用
-    if not llm_model:
-        llm_model = config.get("llm_model", "gpt-4o-mini")
-    
-    # 设置 camel-ai 所需的环境变量
+def create_model(config: Dict[str, Any]):
+    """创建统一 LLM 模型，所有平台共用 LLM_* 配置。"""
+    llm_api_key = os.environ.get("LLM_API_KEY", "")
+    llm_base_url = os.environ.get("LLM_BASE_URL", "")
+    llm_model = os.environ.get("LLM_MODEL_NAME", "") or config.get("llm_model", "gpt-4o-mini")
+
     if llm_api_key:
         os.environ["OPENAI_API_KEY"] = llm_api_key
-    
     if not os.environ.get("OPENAI_API_KEY"):
         raise ValueError("缺少 API Key 配置，请在项目根目录 .env 文件中设置 LLM_API_KEY")
-    
     if llm_base_url:
         os.environ["OPENAI_API_BASE_URL"] = llm_base_url
-    
-    print(f"{config_label} model={llm_model}, base_url={llm_base_url[:40] if llm_base_url else '默认'}...")
-    
+
+    print(f"[统一LLM] model={llm_model}, base_url={llm_base_url[:40] if llm_base_url else '默认'}...")
     return ModelFactory.create(
         model_platform=ModelPlatformType.OPENAI,
         model_type=llm_model,
@@ -1292,42 +1392,56 @@ def get_active_agents_for_round(
     current_hour: int,
     round_num: int
 ) -> List:
-    """根据时间和配置决定本轮激活哪些Agent"""
+    """根据时间和配置决定本轮激活哪些Agent。
+
+    修复（r0→r9 跳号 / R1~R8 0 action）：
+    之前实现用 simulated_hour 判定 peak/off_peak，再用 multiplier 缩小 target_count，
+    再用 activity_level=0.5 二次过滤。结果每轮真正激活的 agent 数 ≈ 1~3，
+    大部分 round 几乎没人做事，actions.jsonl 出现 R0/R9/R10 突然冒出来。
+    根本原因：simulated_hour = (round_num * 30) // 60 % 24 在前 10 轮全部落在 off_peak [0..5]，
+    multiplier=0.3 把可用人数压到 ~1.5，再被 activity_level=0.5 砍一半，最终经常 0~2 个 agent。
+
+    新实现：全天随机激活，不依赖 hour 决定人数。
+    - target_count 在 base_min~base_max 之间均匀采样（不再乘 peak/off_peak 倍率）
+    - activity_level 仍用于 agent 候选筛选（保持"不是所有 agent 都必须活跃"语义）
+    - 业务不变：仍是随机抽样，只是每轮都能保证有足够的人在做事
+    """
     time_config = config.get("time_config", {})
     agent_configs = config.get("agent_configs", [])
-    
+
     base_min = time_config.get("agents_per_hour_min", 5)
     base_max = time_config.get("agents_per_hour_max", 20)
-    
-    peak_hours = time_config.get("peak_hours", [9, 10, 11, 14, 15, 20, 21, 22])
-    off_peak_hours = time_config.get("off_peak_hours", [0, 1, 2, 3, 4, 5])
-    
-    if current_hour in peak_hours:
-        multiplier = time_config.get("peak_activity_multiplier", 1.5)
-    elif current_hour in off_peak_hours:
-        multiplier = time_config.get("off_peak_activity_multiplier", 0.3)
-    else:
-        multiplier = 1.0
-    
-    target_count = int(random.uniform(base_min, base_max) * multiplier)
-    
+
+    # 修复：取消 peak/off_peak 倍率，全天均匀采样
+    target_count = int(random.uniform(base_min, base_max))
+
     candidates = []
     for cfg in agent_configs:
         agent_id = cfg.get("agent_id", 0)
-        active_hours = cfg.get("active_hours", list(range(8, 23)))
         activity_level = cfg.get("activity_level", 0.5)
-        
-        if current_hour not in active_hours:
-            continue
-        
+
+        # 修复（R4~R8 0 actions）：忽略 agent 自己的 active_hours 过滤。
+        # 之前：每个 agent 有 active_hours 字段，hour 不在该区间就被过滤。
+        # simulation_config.json 里大部分 agent 的 active_hours 是 [9,10,11,14,15,16,17]，
+        # 所以 R4~R8（hour 4~8）几乎所有 agent 都被过滤 → candidates 为空 → 0 actions。
+        # 现在：全天随机，不再因 hour 跳过 agent。
+        # active_hours 字段保留但忽略（兼容老 config）
+
         if random.random() < activity_level:
             candidates.append(agent_id)
-    
+
     selected_ids = random.sample(
-        candidates, 
+        candidates,
         min(target_count, len(candidates))
     ) if candidates else []
-    
+
+    # 诊断日志：每轮打印激活的 agent 数量，方便排查"R4~R8 0 actions"问题
+    if _subprocess_logger:
+        _subprocess_logger.info(
+            f"[R{round_num + 1}/hour={simulated_hour if 'simulated_hour' in dir() else '?'}] "
+            f"candidates={len(candidates)}, selected={len(selected_ids)}, target={target_count}"
+        )
+
     active_agents = []
     for agent_id in selected_ids:
         try:
@@ -1335,7 +1449,7 @@ def get_active_agents_for_round(
             active_agents.append((agent_id, agent))
         except Exception:
             pass
-    
+
     return active_agents
 
 
@@ -1345,6 +1459,150 @@ class PlatformSimulation:
         self.env = None
         self.agent_graph = None
         self.total_actions = 0
+
+
+# ========================================================================
+# 快照恢复(resume)模式：检测 DB 是否来自快照，决定是否跳过 signup/reset
+# 见 OASIS 0.2.5 platform.running() + agents_generator.connect_platform_channel
+# ========================================================================
+async def _resume_platform_env(env, agent_graph, platform_name: str, start_round: int,
+                               minutes_per_round: int, log_info,
+                               db_path: Optional[str] = None) -> None:
+    """
+    把 snapshot DB 已落地的 OASIS 平台状态连接到 in-memory agent_graph。
+    - 启动 platform.running() 协程(替代 env.reset() 默认的启动方式)
+    - 用 connect_platform_channel 把 env.channel 挂到每个 agent 的 channel + env.action.channel
+    - 恢复 Twitter sandbox_clock.time_step / Reddit pl_utils.start_time,让新动作的时间与快照后续轮次连续
+
+    平台时间恢复策略:
+    - 优先从 trace 表读 MAX(created_at) 决定起点,确保 resume 后写入的时间严格大于历史最大时间
+      (避免与 snapshot 中已经存在的最后一条记录时间冲突)
+    - 当 trace 表为空或读取失败时,回退到 start_round 推算的起点
+    """
+    try:
+        from oasis.social_agent.agents_generator import connect_platform_channel
+    except Exception as _e:
+        log_info(f"导入 connect_platform_channel 失败,resume 模式不可用: {_e}")
+        raise
+
+    # 把 env 的 channel 接到所有 agent 上
+    env.agent_graph = connect_platform_channel(channel=env.channel,
+                                               agent_graph=agent_graph)
+
+    # 手动启动 platform 主循环(替代 env.reset() 内部的 platform_task)
+    env.platform_task = asyncio.create_task(env.platform.running())
+
+    # 读取 trace 表历史最大 created_at,作为平台时钟恢复的依据
+    max_created_at = _trace_max_created_at(db_path) if db_path else None
+
+    # 恢复平台时间状态,避免新动作的时间戳从 0/现在 开始
+    try:
+        if platform_name == "twitter":
+            # Twitter 用 sandbox_clock.time_step(整数)作为 created_at,每 step() +1
+            # 从 trace 表历史 max(created_at) + 1 恢复,保证新写入的 created_at 紧接历史最大时间
+            if max_created_at is not None:
+                try:
+                    new_time_step = max(int(start_round), int(max_created_at) + 1)
+                except (TypeError, ValueError):
+                    new_time_step = int(start_round)
+            else:
+                new_time_step = int(start_round)
+            env.platform.sandbox_clock.time_step = new_time_step
+            log_info(
+                f"[Resume] Twitter sandbox_clock.time_step 已恢复为 {new_time_step}"
+                f"(来源: trace MAX(created_at)={max_created_at}, start_round={start_round}),"
+                f"下一轮 step() 后将写入 created_at={new_time_step + 1}"
+            )
+        elif platform_name == "reddit":
+            # Reddit 用 time_transfer:start_time + k*(now - real_start_time)
+            # k=60 → 1 真实秒 = 60 模拟秒 = 1 模拟分钟
+            # 想要新动作的 created_at 约等于 "快照后下一轮"的模拟时间。
+            # 优先从 trace 表历史 max(created_at) 推导 real_start_time:
+            #   created_at = real_start_time + k * (real_now - real_start_time)
+            #   ⇒ real_start_time = real_now - (created_at - real_start_time) / k
+            # 若 trace 表为空或读取失败,则回退到 start_round 推算的 offset。
+            from datetime import datetime, timedelta
+            real_now = datetime.now()
+            new_start_time: Optional[datetime] = None
+            fallback_offset_seconds = (start_round * minutes_per_round) / 60.0
+
+            if max_created_at is not None:
+                try:
+                    # Reddit 的 created_at 是 ISO 字符串
+                    last_sim_time = datetime.fromisoformat(str(max_created_at))
+                    next_sim_time = last_sim_time + timedelta(minutes=minutes_per_round)
+                    clock = env.platform.sandbox_clock
+                    clock_real_start = getattr(clock, "real_start_time", real_now)
+                    k = getattr(clock, "k", 60)
+                    elapsed_real_seconds = (real_now - clock_real_start).total_seconds()
+                    new_start_time = next_sim_time - timedelta(
+                        seconds=k * elapsed_real_seconds
+                    )
+                    log_info(
+                        f"[Resume] Reddit start_time 基于 trace MAX(created_at)={max_created_at} 推导,"
+                        f"next_sim_time={next_sim_time.isoformat()}"
+                    )
+                except (TypeError, ValueError) as _parse_err:
+                    log_info(
+                        f"[Resume] Reddit trace created_at 解析失败,使用当前时间作为恢复基准: {_parse_err}"
+                    )
+                    new_start_time = real_now
+
+            if new_start_time is None:
+                new_start_time = real_now
+                log_info(
+                    "[Resume] Reddit trace 不可用,使用当前时间作为恢复基准"
+                )
+
+            # Platform 和 PlatformUtils 都持有 start_time,两处保持一致
+            env.platform.start_time = new_start_time
+            try:
+                env.platform.pl_utils.start_time = new_start_time
+            except Exception:
+                pass
+            log_info(
+                f"[Resume] Reddit start_time 已设置为 {new_start_time.isoformat()},"
+                f"新动作时间将从快照后下一模拟时间开始"
+            )
+    except Exception as _te:
+        log_info(f"[Resume] 恢复平台时钟失败(继续): {_te}")
+
+
+def _trace_max_rowid(db_path: str) -> int:
+    """读取现有 trace 表的最大 rowid,用于 resume 模式让 last_rowid 跳过历史动作"""
+    if not os.path.exists(db_path):
+        return 0
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT IFNULL(MAX(rowid), 0) FROM trace")
+        row = cursor.fetchone()
+        conn.close()
+        return int(row[0]) if row else 0
+    except Exception:
+        return 0
+
+
+def _trace_max_created_at(db_path: str) -> Optional[Any]:
+    """读取现有 trace 表的最大 created_at,用于 resume 模式恢复平台时钟。
+
+    - Twitter 的 created_at 是整数(time_step)
+    - Reddit 的 created_at 是 ISO 字符串
+    返回原始类型(Union[int, str, None]),调用方按平台类型解读。
+    """
+    if not os.path.exists(db_path):
+        return None
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT MAX(created_at) FROM trace")
+        row = cursor.fetchone()
+        conn.close()
+        if not row or row[0] is None:
+            return None
+        return row[0]
+    except Exception:
+        return None
 
 
 async def run_twitter_simulation(
@@ -1364,28 +1622,29 @@ async def run_twitter_simulation(
         main_logger: 主日志管理器
         max_rounds: 最大模拟轮数（可选，用于截断过长的模拟）
         start_round: 从指定轮次开始（0=从头开始）
+                       >0 且快照 DB 存在时进入 resume 模式:不删 DB、不 reset、不 signup、不发初始帖
 
     Returns:
         PlatformSimulation: 包含env和agent_graph的结果对象
     """
     result = PlatformSimulation()
-    
+
     def log_info(msg):
         if main_logger:
             main_logger.info(f"[Twitter] {msg}")
         print(f"[Twitter] {msg}")
-    
+
     log_info("初始化...")
-    
-    # Twitter 使用通用 LLM 配置
-    model = create_model(config, use_boost=False)
-    
+
+    # Twitter 与 Reddit 共用统一 LLM 配置
+    model = create_model(config)
+
     # OASIS Twitter使用CSV格式
     profile_path = os.path.join(simulation_dir, "twitter_profiles.csv")
     if not os.path.exists(profile_path):
         log_info(f"错误: Profile文件不存在: {profile_path}")
         return result
-    
+
     # Agent persona 缓存:有 cache 且 hash 匹配 → 跳过 320 个 SocialAgent 构造(省 ~30-50s)
     _twitter_config_path = os.path.join(simulation_dir, "simulation_config.json")
     cached_graph, cache_hit = _try_load_cached_agent_graph(
@@ -1403,55 +1662,101 @@ async def run_twitter_simulation(
         _save_agent_graph_to_cache(
             simulation_dir, result.agent_graph, profile_path, _twitter_config_path, "twitter"
         )
-    
+
     # 从配置文件获取 Agent 真实名称映射（使用 entity_name 而非默认的 Agent_X）
     agent_names = get_agent_names_from_config(config)
     # 如果配置中没有某个 agent，则使用 OASIS 的默认名称
     for agent_id, agent in result.agent_graph.get_agents():
         if agent_id not in agent_names:
             agent_names[agent_id] = getattr(agent, 'name', f'Agent_{agent_id}')
-    
+
     db_path = os.path.join(simulation_dir, "twitter_simulation.db")
-    if os.path.exists(db_path):
-        try:
-            os.remove(db_path)
-        except PermissionError:
-            # Windows 文件锁定问题，等待后重试
-            import time
-            time.sleep(2)
+    db_exists_before = os.path.exists(db_path)
+
+    # ------------------------------------------------------------------
+    # Resume 模式判定:
+    #   start_round > 0 且 DB 已存在(快照恢复后由 restore_snapshot 写入)
+    #   → 跳过 DB 删除 + env.reset() + 初始帖子,直接接管 snapshot 的世界状态
+    # ------------------------------------------------------------------
+    is_resume = start_round > 0 and db_exists_before
+    if is_resume:
+        log_info(
+            f"检测到快照恢复场景:start_round={start_round} 且 DB 已存在({db_path}) → 进入 resume 模式"
+            f"(不删 DB / 不 reset / 不 signup / 不发初始帖,直接接管 snapshot 世界状态)"
+        )
+    else:
+        if db_exists_before:
             try:
                 os.remove(db_path)
             except PermissionError:
-                # 如果仍然锁定，使用新文件名
-                db_path = os.path.join(simulation_dir, f"twitter_simulation_{int(time.time())}.db")
-                log_info(f"原数据库文件被锁定，使用新文件: {db_path}")
-    
+                # Windows 文件锁定问题，等待后重试
+                import time
+                time.sleep(2)
+                try:
+                    os.remove(db_path)
+                except PermissionError:
+                    # 如果仍然锁定，使用新文件名
+                    db_path = os.path.join(simulation_dir, f"twitter_simulation_{int(time.time())}.db")
+                    log_info(f"原数据库文件被锁定，使用新文件: {db_path}")
+
     result.env = oasis.make(
         agent_graph=result.agent_graph,
         platform=oasis.DefaultPlatformType.TWITTER,
         database_path=db_path,
         semaphore=30,  # 限制最大并发 LLM 请求数，防止 API 过载
     )
-    
-    await result.env.reset()
-    log_info("环境已启动")
-    
-    if action_logger:
+
+    if is_resume:
+        # 用 platform.running() + connect_platform_channel 接管 snapshot DB,
+        # 完全跳过 env.reset() —— 它会通过 generate_custom_agents 重跑 signup 污染 DB
+        time_config_for_resume = config.get("time_config", {})
+        minutes_per_round_for_resume = time_config_for_resume.get("minutes_per_round", 30)
+        # 关键修复（双平台轮次错位）：resume 时用本平台 runtime_state.json 里的
+        # completed_round 修正起始轮次，而不是沿用统一 start_round。
+        # 场景：快照时 Twitter 跑完 R3、Reddit 只跑完 R2，run_state.current_round
+        # 取 max=3 → 统一 start_round=3 → Reddit 主循环 range(3,..) 从 R4 开始，
+        # Reddit 的 R3 被直接跳过。各平台按自身进度续跑才能对齐。
+        runtime_state = _load_runtime_state(simulation_dir, result.agent_graph, "twitter")
+        completed_round = runtime_state.get("completed_round")
+        if isinstance(completed_round, int) and completed_round >= 0:
+            if completed_round != start_round:
+                log_info(
+                    f"[Resume] Twitter 按本平台进度修正起始轮次: {start_round} -> {completed_round}"
+                    f"（本平台已完成 R1~R{completed_round}，将从 R{completed_round + 1} 续跑）"
+                )
+            start_round = completed_round
+        await _resume_platform_env(
+            env=result.env,
+            agent_graph=result.agent_graph,
+            platform_name="twitter",
+            start_round=start_round,
+            minutes_per_round=minutes_per_round_for_resume,
+            log_info=log_info,
+            db_path=db_path,
+        )
+        log_info("[Resume] Twitter 环境已从快照恢复,保留 DB 中所有历史用户/帖子/关注")
+    else:
+        _reset_persistent_runtime_state(simulation_dir, "twitter")
+        await result.env.reset()
+        log_info("环境已启动")
+
+    if action_logger and not is_resume:
         action_logger.log_simulation_start(config)
-    
+
     total_actions = 0
-    last_rowid = 0  # 跟踪数据库中最后处理的行号（使用 rowid 避免 created_at 格式差异）
-    
-    # 执行初始事件
+    # Resume 模式:last_rowid 从 DB 当前最大 rowid 开始,避免把历史动作重复落盘
+    last_rowid = _trace_max_rowid(db_path) if is_resume else 0
+
+    # 执行初始事件 —— resume 模式跳过(初始帖已在 snapshot DB 中,不需要再发一次)
     event_config = config.get("event_config", {})
     initial_posts = event_config.get("initial_posts", [])
-    
+
     # 记录 round 0 开始（初始事件阶段）
-    if action_logger:
+    if action_logger and not is_resume:
         action_logger.log_round_start(0, 0)  # round 0, simulated_hour 0
-    
+
     initial_action_count = 0
-    if initial_posts:
+    if initial_posts and not is_resume:
         initial_actions = {}
         for post in initial_posts:
             agent_id = post.get("poster_agent_id", 0)
@@ -1462,7 +1767,7 @@ async def run_twitter_simulation(
                     action_type=ActionType.CREATE_POST,
                     action_args={"content": content}
                 )
-                
+
                 if action_logger:
                     action_logger.log_action(
                         round_num=0,
@@ -1475,13 +1780,18 @@ async def run_twitter_simulation(
                     initial_action_count += 1
             except Exception:
                 pass
-        
+
         if initial_actions:
             await result.env.step(initial_actions)
             log_info(f"已发布 {len(initial_actions)} 条初始帖子")
-    
+    elif is_resume and initial_posts:
+        log_info(
+            f"[Resume] 跳过 {len(initial_posts)} 条 initial_posts,"
+            f"它们已在 snapshot DB 中(action_logger 不会再重复记录)"
+        )
+
     # 记录 round 0 结束
-    if action_logger:
+    if action_logger and not is_resume:
         action_logger.log_round_end(0, initial_action_count)
     
     # 主模拟循环
@@ -1559,20 +1869,29 @@ async def run_twitter_simulation(
         
         if action_logger:
             action_logger.log_round_end(round_num + 1, round_action_count)
-        
+
+        # 持久化 agent memory + Python/OASIS random state(每轮)
+        _save_runtime_state(
+            simulation_dir,
+            result.env.agent_graph,
+            "twitter",
+            round_num + 1,
+            total_rounds,
+        )
+
         if (round_num + 1) % 20 == 0:
             progress = (round_num + 1) / total_rounds * 100
             log_info(f"Day {simulated_day}, {simulated_hour:02d}:00 - Round {round_num + 1}/{total_rounds} ({progress:.1f}%)")
-    
+
     # 注意：不关闭环境，保留给Interview使用
-    
+
     if action_logger:
         action_logger.log_simulation_end(total_rounds, total_actions)
-    
+
     result.total_actions = total_actions
     elapsed = (datetime.now() - start_time).total_seconds()
     log_info(f"模拟循环完成! 耗时: {elapsed:.1f}秒, 总动作: {total_actions}")
-    
+
     return result
 
 
@@ -1593,27 +1912,28 @@ async def run_reddit_simulation(
         main_logger: 主日志管理器
         max_rounds: 最大模拟轮数（可选，用于截断过长的模拟）
         start_round: 从指定轮次开始（0=从头开始）
+                       >0 且快照 DB 存在时进入 resume 模式:不删 DB、不 reset、不 signup、不发初始帖
 
     Returns:
         PlatformSimulation: 包含env和agent_graph的结果对象
     """
     result = PlatformSimulation()
-    
+
     def log_info(msg):
         if main_logger:
             main_logger.info(f"[Reddit] {msg}")
         print(f"[Reddit] {msg}")
-    
+
     log_info("初始化...")
-    
-    # Reddit 使用加速 LLM 配置（如果有的话，否则回退到通用配置）
-    model = create_model(config, use_boost=True)
-    
+
+    # Reddit 与 Twitter 使用同一套全局 LLM 配置
+    model = create_model(config)
+
     profile_path = os.path.join(simulation_dir, "reddit_profiles.json")
     if not os.path.exists(profile_path):
         log_info(f"错误: Profile文件不存在: {profile_path}")
         return result
-    
+
     # Agent persona 缓存:同上 Reddit 路径(见 _try_load_cached_agent_graph 注释)
     _reddit_config_path = os.path.join(simulation_dir, "simulation_config.json")
     cached_graph, cache_hit = _try_load_cached_agent_graph(
@@ -1630,55 +1950,95 @@ async def run_reddit_simulation(
         _save_agent_graph_to_cache(
             simulation_dir, result.agent_graph, profile_path, _reddit_config_path, "reddit"
         )
-    
+
     # 从配置文件获取 Agent 真实名称映射（使用 entity_name 而非默认的 Agent_X）
     agent_names = get_agent_names_from_config(config)
     # 如果配置中没有某个 agent，则使用 OASIS 的默认名称
     for agent_id, agent in result.agent_graph.get_agents():
         if agent_id not in agent_names:
             agent_names[agent_id] = getattr(agent, 'name', f'Agent_{agent_id}')
-    
+
     db_path = os.path.join(simulation_dir, "reddit_simulation.db")
-    if os.path.exists(db_path):
-        try:
-            os.remove(db_path)
-        except PermissionError:
-            # Windows 文件锁定问题，等待后重试
-            import time
-            time.sleep(2)
+    db_exists_before = os.path.exists(db_path)
+
+    # ------------------------------------------------------------------
+    # Resume 模式判定:与 Twitter 同语义
+    # ------------------------------------------------------------------
+    is_resume = start_round > 0 and db_exists_before
+    if is_resume:
+        log_info(
+            f"检测到快照恢复场景:start_round={start_round} 且 DB 已存在({db_path}) → 进入 resume 模式"
+            f"(不删 DB / 不 reset / 不 signup / 不发初始帖,直接接管 snapshot 世界状态)"
+        )
+    else:
+        if db_exists_before:
             try:
                 os.remove(db_path)
             except PermissionError:
-                # 如果仍然锁定，使用新文件名
-                db_path = os.path.join(simulation_dir, f"reddit_simulation_{int(time.time())}.db")
-                log_info(f"原数据库文件被锁定，使用新文件: {db_path}")
-    
+                # Windows 文件锁定问题，等待后重试
+                import time
+                time.sleep(2)
+                try:
+                    os.remove(db_path)
+                except PermissionError:
+                    # 如果仍然锁定，使用新文件名
+                    db_path = os.path.join(simulation_dir, f"reddit_simulation_{int(time.time())}.db")
+                    log_info(f"原数据库文件被锁定，使用新文件: {db_path}")
+
     result.env = oasis.make(
         agent_graph=result.agent_graph,
         platform=oasis.DefaultPlatformType.REDDIT,
         database_path=db_path,
         semaphore=30,  # 限制最大并发 LLM 请求数，防止 API 过载
     )
-    
-    await result.env.reset()
-    log_info("环境已启动")
-    
+
+    if is_resume:
+        time_config_for_resume = config.get("time_config", {})
+        minutes_per_round_for_resume = time_config_for_resume.get("minutes_per_round", 30)
+        # 关键修复（双平台轮次错位）：与 Twitter 同语义——resume 时用本平台
+        # runtime_state.json 的 completed_round 修正起始轮次，避免落后的平台
+        # 被统一 start_round 强行对齐到领先平台的轮次而跳轮。
+        runtime_state = _load_runtime_state(simulation_dir, result.agent_graph, "reddit")
+        completed_round = runtime_state.get("completed_round")
+        if isinstance(completed_round, int) and completed_round >= 0:
+            if completed_round != start_round:
+                log_info(
+                    f"[Resume] Reddit 按本平台进度修正起始轮次: {start_round} -> {completed_round}"
+                    f"（本平台已完成 R1~R{completed_round}，将从 R{completed_round + 1} 续跑）"
+                )
+            start_round = completed_round
+        await _resume_platform_env(
+            env=result.env,
+            agent_graph=result.agent_graph,
+            platform_name="reddit",
+            start_round=start_round,
+            minutes_per_round=minutes_per_round_for_resume,
+            log_info=log_info,
+            db_path=db_path,
+        )
+        log_info("[Resume] Reddit 环境已从快照恢复,保留 DB 中所有历史用户/帖子/评论")
+    else:
+        _reset_persistent_runtime_state(simulation_dir, "reddit")
+        await result.env.reset()
+        log_info("环境已启动")
+
     if action_logger:
         action_logger.log_simulation_start(config)
-    
+
     total_actions = 0
-    last_rowid = 0  # 跟踪数据库中最后处理的行号（使用 rowid 避免 created_at 格式差异）
-    
-    # 执行初始事件
+    # Resume 模式:last_rowid 从 DB 当前最大 rowid 开始
+    last_rowid = _trace_max_rowid(db_path) if is_resume else 0
+
+    # 执行初始事件 —— resume 模式跳过
     event_config = config.get("event_config", {})
     initial_posts = event_config.get("initial_posts", [])
-    
+
     # 记录 round 0 开始（初始事件阶段）
-    if action_logger:
+    if action_logger and not is_resume:
         action_logger.log_round_start(0, 0)  # round 0, simulated_hour 0
-    
+
     initial_action_count = 0
-    if initial_posts:
+    if initial_posts and not is_resume:
         initial_actions = {}
         for post in initial_posts:
             agent_id = post.get("poster_agent_id", 0)
@@ -1697,7 +2057,7 @@ async def run_reddit_simulation(
                         action_type=ActionType.CREATE_POST,
                         action_args={"content": content}
                     )
-                
+
                 if action_logger:
                     action_logger.log_action(
                         round_num=0,
@@ -1710,13 +2070,18 @@ async def run_reddit_simulation(
                     initial_action_count += 1
             except Exception:
                 pass
-        
+
         if initial_actions:
             await result.env.step(initial_actions)
             log_info(f"已发布 {len(initial_actions)} 条初始帖子")
-    
+    elif is_resume and initial_posts:
+        log_info(
+            f"[Resume] 跳过 {len(initial_posts)} 条 initial_posts,"
+            f"它们已在 snapshot DB 中(action_logger 不会再重复记录)"
+        )
+
     # 记录 round 0 结束
-    if action_logger:
+    if action_logger and not is_resume:
         action_logger.log_round_end(0, initial_action_count)
     
     # 主模拟循环
@@ -1794,16 +2159,25 @@ async def run_reddit_simulation(
         
         if action_logger:
             action_logger.log_round_end(round_num + 1, round_action_count)
-        
+
+        # 持久化 agent memory + Python/OASIS random state(每轮)
+        _save_runtime_state(
+            simulation_dir,
+            result.env.agent_graph,
+            "reddit",
+            round_num + 1,
+            total_rounds,
+        )
+
         if (round_num + 1) % 20 == 0:
             progress = (round_num + 1) / total_rounds * 100
             log_info(f"Day {simulated_day}, {simulated_hour:02d}:00 - Round {round_num + 1}/{total_rounds} ({progress:.1f}%)")
-    
+
     # 注意：不关闭环境，保留给Interview使用
-    
+
     if action_logger:
         action_logger.log_simulation_end(total_rounds, total_actions)
-    
+
     result.total_actions = total_actions
     elapsed = (datetime.now() - start_time).total_seconds()
     log_info(f"模拟循环完成! 耗时: {elapsed:.1f}秒, 总动作: {total_actions}")

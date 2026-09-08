@@ -2855,24 +2855,16 @@ class ReportManager:
     
     @classmethod
     def get_report_by_simulation(cls, simulation_id: str) -> Optional[Report]:
-        """根据模拟ID获取报告"""
-        cls._ensure_reports_dir()
-        
-        for item in os.listdir(cls.REPORTS_DIR):
-            item_path = os.path.join(cls.REPORTS_DIR, item)
-            # 新格式：文件夹
-            if os.path.isdir(item_path):
-                report = cls.get_report(item)
-                if report and report.simulation_id == simulation_id:
-                    return report
-            # 兼容旧格式：JSON文件
-            elif item.endswith('.json'):
-                report_id = item[:-5]
-                report = cls.get_report(report_id)
-                if report and report.simulation_id == simulation_id:
-                    return report
-        
-        return None
+        """根据模拟ID获取报告
+
+        同一模拟可能有多份报告（Step 4 "重新生成" 会产生新 report_id，
+        旧报告文件夹保留）。按 created_at 取最新的一份，
+        避免 os.listdir 的目录顺序不确定导致拿到旧报告
+        （旧报告多为 COMPLETED，会让 generate 走 already_generated
+        分支把用户跳回旧报告）。
+        """
+        reports = cls.list_reports(simulation_id=simulation_id, limit=1)
+        return reports[0] if reports else None
     
     @classmethod
     def list_reports(cls, simulation_id: Optional[str] = None, limit: int = 50) -> List[Report]:

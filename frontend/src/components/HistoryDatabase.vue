@@ -181,6 +181,14 @@
                 <span class="btn-text">{{ $t('history.step2Button') }}</span>
               </button>
               <button 
+                class="modal-btn btn-simulation-run" 
+                @click="goToSimulationRun"
+              >
+                <span class="btn-step">Step3</span>
+                <span class="btn-icon">▶</span>
+                <span class="btn-text">{{ $t('history.step3Button') }}</span>
+              </button>
+              <button 
                 class="modal-btn btn-report" 
                 @click="goToReport"
                 :disabled="!selectedProject.report_id"
@@ -563,6 +571,17 @@ const goToSimulation = () => {
   if (selectedProject.value?.simulation_id) {
     router.push({
       name: 'Simulation',
+      params: { simulationId: selectedProject.value.simulation_id }
+    })
+    closeModal()
+  }
+}
+
+// 导航到开始模拟页面（SimulationRun - Step3）
+const goToSimulationRun = () => {
+  if (selectedProject.value?.simulation_id) {
+    router.push({
+      name: 'SimulationRun',
       params: { simulationId: selectedProject.value.simulation_id }
     })
     closeModal()
@@ -1444,18 +1463,20 @@ onUnmounted(() => {
 /* 导航按钮 */
 .modal-actions {
   display: flex;
-  gap: 16px;
+  flex-wrap: wrap;
+  gap: 12px;
   padding: 20px 32px;
   background: #FFFFFF;
 }
 
 .modal-btn {
   flex: 1;
+  min-width: 100px;
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 8px;
-  padding: 16px;
+  padding: 14px 12px;
   border: 1px solid #E5E7EB;
   border-radius: 8px;
   background: #FFFFFF;
@@ -1502,6 +1523,7 @@ onUnmounted(() => {
 
 .modal-btn.btn-project .btn-icon { color: #3B82F6; }
 .modal-btn.btn-simulation .btn-icon { color: #F59E0B; }
+.modal-btn.btn-simulation-run .btn-icon { color: #8B5CF6; }
 .modal-btn.btn-report .btn-icon { color: #10B981; }
 
 .modal-btn:hover:not(:disabled) .btn-text {

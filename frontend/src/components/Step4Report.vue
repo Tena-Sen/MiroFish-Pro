@@ -10,6 +10,20 @@
             <div class="report-meta">
               <span class="report-tag">Prediction Report</span>
               <span class="report-id">ID: {{ reportId || 'REF-2024-X92' }}</span>
+              <!-- 下载报告 Markdown（生成中可下载已完成章节，完成后为全文） -->
+              <button
+                v-if="reportId"
+                class="report-download-btn"
+                :disabled="isDownloading"
+                @click="handleDownloadReport"
+              >
+                <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                  <polyline points="7 10 12 15 17 10"></polyline>
+                  <line x1="12" y1="15" x2="12" y2="3"></line>
+                </svg>
+                <span>{{ isDownloading ? $t('step4.downloadReport') + '...' : $t('step4.downloadReport') }}</span>
+              </button>
             </div>
             <h1 class="main-title">{{ reportOutline.title }}</h1>
             <p class="sub-title">{{ reportOutline.summary }}</p>
@@ -134,6 +148,37 @@
               <line x1="5" y1="12" x2="19" y2="12"></line>
               <polyline points="12 5 19 12 12 19"></polyline>
             </svg>
+          </button>
+
+          <!-- Download Button - 下载报告 Markdown（与左上角小按钮同一处理函数） -->
+          <button
+            v-if="isComplete && reportId"
+            class="next-step-btn download-btn"
+            :disabled="isDownloading"
+            @click="handleDownloadReport"
+          >
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+              <polyline points="7 10 12 15 17 10"></polyline>
+              <line x1="12" y1="15" x2="12" y2="3"></line>
+            </svg>
+            <span>{{ isDownloading ? $t('step4.downloadReport') + '...' : $t('step4.downloadReport') }}</span>
+          </button>
+
+          <!-- Regenerate Button - 基于磁盘产物（图谱/actions/人设）强制重生成全新报告，
+               不依赖 Step 3 模拟子进程存活 -->
+          <button
+            v-if="isComplete && simulationId"
+            class="back-step-btn regenerate-btn"
+            :disabled="isRegenerating"
+            @click="regenerateReport"
+          >
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="23 4 23 10 17 10"></polyline>
+              <polyline points="1 20 1 14 7 14"></polyline>
+              <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+            </svg>
+            <span>{{ isRegenerating ? $t('step4.retrying') : $t('step4.regenerateReport') }}</span>
           </button>
 
           <!-- Back Button - 返回到 Step 3 -->
@@ -397,11 +442,11 @@
             <div class="report-error-actions">
               <button
                 class="report-error-btn primary"
-                :disabled="isRetrying"
-                @click="retryRegenerate"
+                :disabled="isRegenerating"
+                @click="regenerateReport"
               >
-                <span v-if="isRetrying" class="loading-spinner-small"></span>
-                <span>{{ isRetrying ? $t('step4.retrying') : $t('step4.retryGenerate') }}</span>
+                <span v-if="isRegenerating" class="loading-spinner-small"></span>
+                <span>{{ isRegenerating ? $t('step4.retrying') : $t('step4.retryGenerate') }}</span>
               </button>
               <button
                 class="report-error-btn secondary"
@@ -484,7 +529,7 @@
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, h, reactive } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { getAgentLog, getConsoleLog, generateReport } from '../api/report'
+import { getAgentLog, getConsoleLog, generateReport, downloadReport } from '../api/report'
 
 const router = useRouter()
 const { t } = useI18n()
@@ -508,17 +553,40 @@ const goBack = () => {
   emit('go-back')
 }
 
-// 报告生成失败后的两个恢复动作:
-// 1. 重新生成报告(强制重生成,跳过已有章节的优化)
-// 2. 回到 Step 3 检查模拟数据
-const retryRegenerate = async () => {
-  if (isRetrying.value || !props.simulationId) return
-  isRetrying.value = true
+// 下载报告 Markdown：完成后为全文；生成中下载已生成章节（后端现场组装）
+const isDownloading = ref(false)
+const handleDownloadReport = async () => {
+  if (isDownloading.value || !props.reportId) return
+  isDownloading.value = true
+  try {
+    await downloadReport(props.reportId)
+  } catch (err) {
+    // 404 JSON 错误体也会以 blob 形式到达这里，尝试解析出后端错误信息
+    let msg = err?.message || ''
+    try {
+      const detail = await err?.response?.data?.text?.()
+      const parsed = detail ? JSON.parse(detail) : null
+      if (parsed?.error) msg = parsed.error
+    } catch { /* 保持原始错误 */ }
+    addLog(`${t('step4.downloadFailed')}: ${msg || t('step4.downloadNoSections')}`)
+  } finally {
+    isDownloading.value = false
+  }
+}
+
+// 重新生成报告（基于磁盘产物：图谱 JSON / actions.jsonl / 人设文件，
+// 不依赖 Step 3 模拟子进程存活）：
+// - 失败面板的"重新生成报告"按钮
+// - 完成态操作区的"重新生成报告"按钮
+// force_regenerate=true → 后端生成全新 report_id，从大纲开始完整重写
+const regenerateReport = async () => {
+  if (isRegenerating.value || !props.simulationId) return
+  isRegenerating.value = true
   try {
     addLog('正在重新生成报告 (force_regenerate=true)...')
     const res = await generateReport({
       simulation_id: props.simulationId,
-      force_regenerate: true   // 用户主动 retry,强制重生成
+      force_regenerate: true   // 强制重生成全新报告
     })
     if (res.success && res.data) {
       const newReportId = res.data.report_id
@@ -526,12 +594,12 @@ const retryRegenerate = async () => {
       // 跳到新的 Report 路由(reportId 变了)
       router.push({ name: 'Report', params: { reportId: newReportId } })
     } else {
-      addLog(`重试失败: ${res.error || '未知错误'}`)
+      addLog(`重新生成失败: ${res.error || '未知错误'}`)
     }
   } catch (err) {
-    addLog(`重试异常: ${err.message || err}`)
+    addLog(`重新生成异常: ${err.message || err}`)
   } finally {
-    isRetrying.value = false
+    isRegenerating.value = false
   }
 }
 
@@ -564,7 +632,7 @@ const expandedLogs = ref(new Set())
 const collapsedSections = ref(new Set())
 const isComplete = ref(false)
 const hasError = ref(false)              // 报告生成是否出错
-const isRetrying = ref(false)           // 重新生成中
+const isRegenerating = ref(false)       // 重新生成报告中
 const errorMessage = ref('')            // 错误详情(给用户看)
 const startTime = ref(null)
 const leftPanel = ref(null)
@@ -2638,6 +2706,33 @@ watch(() => props.reportId, (newId) => {
   letter-spacing: 0.02em;
 }
 
+.report-download-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+  background: transparent;
+  border: 1px solid #D1D5DB;
+  color: #4B5563;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px 10px;
+  cursor: pointer;
+  border-radius: 2px;
+  transition: all 0.15s ease;
+}
+
+.report-download-btn:hover:not(:disabled) {
+  border-color: #111827;
+  color: #111827;
+  background: #F3F4F6;
+}
+
+.report-download-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .main-title {
   font-family: 'Times New Roman', Times, serif;
   font-size: 36px;
@@ -3712,6 +3807,50 @@ watch(() => props.reportId, (newId) => {
 
 .back-step-btn:hover svg {
   transform: translateX(-4px);
+}
+
+/* 下载按钮：完成态操作区的次要主按钮（白底描边，与"进入深度互动"形成层次） */
+.next-step-btn.download-btn {
+  background: #FFFFFF;
+  color: #1F2937;
+  border: 1px solid #D1D5DB;
+  padding: 12px 20px;
+}
+
+.next-step-btn.download-btn:hover:not(:disabled) {
+  background: #F3F4F6;
+  border-color: #9CA3AF;
+}
+
+.next-step-btn.download-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.next-step-btn.download-btn:hover svg {
+  transform: translateY(2px);
+}
+
+/* 重新生成按钮：完成态操作区的次级按钮（刷新图标 hover 旋转） */
+.back-step-btn.regenerate-btn {
+  color: #6B7280;
+}
+
+.back-step-btn.regenerate-btn:hover:not(:disabled) {
+  color: #374151;
+}
+
+.back-step-btn.regenerate-btn svg {
+  transition: transform 0.4s ease;
+}
+
+.back-step-btn.regenerate-btn:hover:not(:disabled) svg {
+  transform: rotate(180deg);
+}
+
+.back-step-btn.regenerate-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 /* Workflow Empty */

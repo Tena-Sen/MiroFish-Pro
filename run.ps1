@@ -68,9 +68,19 @@ Write-Host ""
 # 0. 检查依赖
 Write-Host "[1/6] Checking dependencies..." -ForegroundColor Yellow
 
+# Try system Python first; fall back to uv-managed Python.
 $python = Get-Command python -ErrorAction SilentlyContinue
 if (-not $python) {
-    Write-Err "Python not found. Please install Python >=3.11."
+    $uvForPython = Get-Command uv -ErrorAction SilentlyContinue
+    if ($uvForPython) {
+        $uvPython = & uv python find 2>$null
+        if ($uvPython -and (Test-Path $uvPython)) {
+            $python = Get-Command $uvPython -ErrorAction SilentlyContinue
+        }
+    }
+}
+if (-not $python) {
+    Write-Err "Python not found. Please install Python >=3.11 or uv (https://docs.astral.sh/uv/)."
     Read-Host "Press Enter to exit"
     exit 1
 }

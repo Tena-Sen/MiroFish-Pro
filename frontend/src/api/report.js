@@ -58,3 +58,20 @@ export const getReport = (reportId) => {
 export const chatWithReport = (data) => {
   return requestWithRetry(() => service.post('/api/report/chat', data), 3, 1000)
 }
+
+/**
+ * 下载报告 Markdown 文件（生成中下载已生成的部分章节）
+ * @param {string} reportId
+ */
+export const downloadReport = async (reportId) => {
+  // blob 响应绕过 JSON 拦截器（Blob 无 success 字段，拦截器原样返回）
+  const blob = await service.get(`/api/report/${reportId}/download`, { responseType: 'blob' })
+  const url = window.URL.createObjectURL(new Blob([blob]))
+  const link = document.createElement('a')
+  link.href = url
+  link.download = `${reportId}.md`
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  window.URL.revokeObjectURL(url)
+}

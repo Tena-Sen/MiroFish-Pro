@@ -16,6 +16,15 @@ from ..config import Config
 logger = logging.getLogger(__name__)
 
 
+def _is_unsupported_temperature_error(e: Exception) -> bool:
+    """判断异常是否为 'temperature 参数不受支持' 类 400 错误（如 kimi-k3）。
+
+    这类模型不支持传入 temperature，需要去掉该参数后重试。
+    """
+    msg = str(e).lower()
+    return "'temperature'" in msg and ("not supported" in msg or "unsupported" in msg)
+
+
 class LLMClient:
     """LLM客户端"""
     
@@ -65,8 +74,17 @@ class LLMClient:
         
         if response_format:
             kwargs["response_format"] = response_format
-        
-        response = self.client.chat.completions.create(**kwargs)
+
+        try:
+            response = self.client.chat.completions.create(**kwargs)
+        except Exception as e:
+            # 修复：部分模型（如 kimi-k3）不支持 temperature 参数，去掉后重试一次
+            if _is_unsupported_temperature_error(e):
+                logger.warning(f"模型 {self.model} 不支持 temperature 参数，去掉后重试")
+                kwargs.pop("temperature", None)
+                response = self.client.chat.completions.create(**kwargs)
+            else:
+                raise
         content = response.choices[0].message.content
         # 部分模型（如MiniMax M2.5）会在content中包含<think>思考内容，需要移除
         content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
@@ -194,7 +212,16 @@ class LLMClientAsync:
         if response_format:
             kwargs["response_format"] = response_format
 
-        response = await self.client.chat.completions.create(**kwargs)
+        try:
+            response = await self.client.chat.completions.create(**kwargs)
+        except Exception as e:
+            # 修复：部分模型（如 kimi-k3）不支持 temperature 参数，去掉后重试一次
+            if _is_unsupported_temperature_error(e):
+                logger.warning(f"模型 {self.model} 不支持 temperature 参数，去掉后重试")
+                kwargs.pop("temperature", None)
+                response = await self.client.chat.completions.create(**kwargs)
+            else:
+                raise
         content = response.choices[0].message.content
         # 复用 LLMClient 的清理逻辑（保证输出一致）
         return re.sub(r'<think>[\s\S]*?</think>', '', content).strip()

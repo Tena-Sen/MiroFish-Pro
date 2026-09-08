@@ -634,6 +634,36 @@ def prepare_simulation():
                 })
             else:
                 logger.info(f"模拟 {simulation_id} 未准备完成，将启动准备任务")
+
+        # 修复（重复 prepare 竞态）：原实现只检查"已完成"，不检查"正在准备中"。
+        # 准备进行期间再次请求（双击/网络重试/force_regenerate）会启动第二个后台线程：
+        # - 双倍 LLM 调用（46 个人设 + N 批配置生成，纯烧钱）
+        # - 两线程并发原子写同一批文件（reddit_profiles.json / simulation_config.json /
+        #   simulation_state.json），后写覆盖先写
+        # 基于 TaskManager 内存任务判断（而非 state.status）：任务在创建后端线程前
+        # 同步注册；后端重启后内存任务清空，卡在 PREPARING 的陈旧状态可自愈重新发起。
+        # 注意：force_regenerate 也会被拦——force 的语义是"完成后重新生成"，
+        # 不是"打断进行中的准备"（如需打断请重启后端）。
+        _task_manager = TaskManager()
+        _active_task = None
+        for _task in _task_manager.list_tasks(task_type="simulation_prepare"):
+            if (
+                _task.get("status") in ("pending", "processing")
+                and (_task.get("metadata") or {}).get("simulation_id") == simulation_id
+            ):
+                _active_task = _task
+                break
+        if _active_task:
+            logger.warning(
+                f"模拟 {simulation_id} 已有进行中的准备任务 {_active_task['task_id']}，拒绝重复准备"
+            )
+            return jsonify({
+                "success": False,
+                "error": t('api.simulationPreparing'),
+                "task_id": _active_task["task_id"],
+                "status": "preparing"
+            }), 409
+
         
         # 从项目获取必要信息
         project = ProjectManager.get_project(state.project_id)
@@ -1352,9 +1382,21 @@ def get_simulation_profiles_realtime(simulation_id: str):
                     with open(profiles_file, 'r', encoding='utf-8') as f:
                         profiles = json.load(f)
                 else:
+                    # Twitter CSV 字段归一化为 reddit JSON 同样的字段名（前端一套代码读两个平台）
+                    # CSV 列：name / username / description (= bio) / user_char (= persona) / profession
                     with open(profiles_file, 'r', encoding='utf-8') as f:
                         reader = csv.DictReader(f)
-                        profiles = list(reader)
+                        for row in reader:
+                            profiles.append({
+                                "realname": row.get("realname", "") or row.get("name", ""),
+                                "name": row.get("name", ""),
+                                "username": row.get("username", ""),
+                                "bio": row.get("bio", "") or row.get("description", ""),
+                                "persona": row.get("persona", "") or row.get("user_char", ""),
+                                "profession": row.get("profession", "未知"),
+                                "entity_type": row.get("entity_type", "Entity"),
+                                "user_id": row.get("user_id", ""),
+                            })
             except (json.JSONDecodeError, Exception) as e:
                 logger.warning(f"读取 profiles 文件失败（可能正在写入中）: {e}")
                 profiles = []
@@ -1929,11 +1971,39 @@ def start_simulation():
 
                 # 如果是强制模式，清理运行日志
                 if force:
-                    logger.info(f"强制模式：清理模拟日志 {simulation_id}")
-                    cleanup_result = SimulationRunner.cleanup_simulation_logs(simulation_id)
-                    if not cleanup_result.get("success"):
-                        logger.warning(f"清理日志时出现警告: {cleanup_result.get('errors')}")
-                    force_restarted = True
+                    # 修复（force 启动摧毁刚恢复的快照世界）：
+                    # 场景：用户恢复快照后（或前端 wasRestored 状态丢失时）点击启动，
+                    # 前端传 force=true → cleanup_simulation_logs 删除刚恢复的
+                    # DB / runtime_state / run_state.json → 子进程从 R0 全新重跑，
+                    # 恢复操作完全白费。
+                    # 防护：run_state.json 中存在 restored_at（restore_snapshot 写入，
+                    # 尚未被启动消费）说明世界刚被快照恢复、还没跑过 —— 不清理，
+                    # 改走快照恢复路径（_start_simulation_impl 会检测 restored_at
+                    # 并以 resume 模式续跑）。
+                    _force_guard_skip = False
+                    try:
+                        _rs_path = os.path.join(
+                            SimulationRunner.RUN_STATE_DIR, simulation_id, "run_state.json"
+                        )
+                        if os.path.exists(_rs_path):
+                            with open(_rs_path, 'r', encoding='utf-8') as _f:
+                                _rs_data = json.load(_f)
+                            if _rs_data.get("restored_at") and _rs_data.get("runner_status") in ("idle", ""):
+                                _force_guard_skip = True
+                    except Exception as _ge:
+                        logger.warning(f"force 防护检查失败（按原逻辑继续清理）: {_ge}")
+
+                    if _force_guard_skip:
+                        logger.info(
+                            f"force 启动防护：检测到快照恢复标记（restored_at 未消费），"
+                            f"跳过清理以保留恢复的世界，改为 resume 模式续跑 {simulation_id}"
+                        )
+                    else:
+                        logger.info(f"强制模式：清理模拟日志 {simulation_id}")
+                        cleanup_result = SimulationRunner.cleanup_simulation_logs(simulation_id)
+                        if not cleanup_result.get("success"):
+                            logger.warning(f"清理日志时出现警告: {cleanup_result.get('errors')}")
+                        force_restarted = True
 
                 # 重置状态为 ready
                 logger.info(f"模拟 {simulation_id} 准备工作已完成，重置状态为 ready（原状态: {state.status.value}）")
@@ -2128,7 +2198,19 @@ def get_run_status(simulation_id: str):
             })
 
         state_dict = run_state.to_dict()
-        cache_key = (simulation_id, state_dict.get("updated_at", ""))
+        # 修复（chat-only 恢复后完成状态被缓存吞掉）：
+        # B3 缓存原以 updated_at 为唯一 key，而 updated_at 只在 add_action
+        # （新 agent 动作）时刷新。恢复"两平台均已完成"的快照时子进程零新动作，
+        # updated_at 永不变化 → monitor 置 COMPLETED 后缓存仍命中启动时缓存的
+        # running 响应 → 前端永远看不到 completed，Step 4 卡死。
+        # 修复：key 纳入完成判定相关字段，任一状态跃迁即失效缓存重建响应。
+        cache_key = (
+            simulation_id,
+            state_dict.get("updated_at", ""),
+            state_dict.get("runner_status", ""),
+            state_dict.get("twitter_completed", False),
+            state_dict.get("reddit_completed", False),
+        )
 
         if cache_key in _run_status_cache:
             # 优化 B3：稳态短路 — 同一 updated_at 直接复用上次 JSON 字符串
@@ -3408,6 +3490,10 @@ def restore_simulation_snapshot(simulation_id):
                     "restored_files": result.get("restored_files", []),
                     "current_round": result.get("current_round", 0),
                     "total_rounds": result.get("total_rounds", 0),
+                    # 平台独立轮次（双平台进度不一致时，前端日志分别显示
+                    # "Plaza 从 R4 / Community 从 R3"，避免统一轮次误导）
+                    "twitter_round": result.get("twitter_round"),
+                    "reddit_round": result.get("reddit_round"),
                 }
             })
         else:

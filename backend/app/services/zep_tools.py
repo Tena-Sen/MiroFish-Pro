@@ -18,6 +18,7 @@ from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.llm_client import LLMClient
 from ..utils.locale import get_locale, t
+from .graph_backend import get_graph_backend, get_graph_store
 from .graph_store import GraphStore
 
 logger = get_logger('mirofish.graph_tools')
@@ -357,9 +358,9 @@ class ZepToolsService:
             self._llm_client = LLMClient()
         return self._llm_client
 
-    def _get_store(self, graph_id: str) -> GraphStore:
-        """获取 GraphStore 实例"""
-        return GraphStore(graph_id)
+    def _get_store(self, graph_id: str):
+        """获取图谱存储实例（按 Config.GRAPH_BACKEND 选择后端）"""
+        return get_graph_store(graph_id)
 
     def search_graph(
         self,
@@ -467,7 +468,24 @@ class ZepToolsService:
         """获取单个节点的详细信息"""
         logger.info(t("console.fetchingNodeDetail", uuid=node_uuid[:8]))
 
-        # 需要遍历所有图谱找到该节点
+        if Config.GRAPH_BACKEND == "zep":
+            # Zep 后端：尝试直接用 node.get；如果失败再尝试遍历
+            backend = get_graph_backend(None)
+            try:
+                node = backend.get_node(node_uuid)
+            except Exception as e:
+                logger.debug(f"Zep get_node({node_uuid}) 失败: {e}")
+                node = None
+            if node and "Episode" not in node.labels:
+                return NodeInfo(
+                    uuid=node.uuid,
+                    name=node.name,
+                    labels=node.labels,
+                    summary=node.summary,
+                    attributes=node.attributes,
+                )
+
+        # local 后端：遍历所有图谱找到该节点
         for graph_info in GraphStore.list_graphs():
             store = GraphStore(graph_info["graph_id"])
             node = store.get_node(node_uuid)

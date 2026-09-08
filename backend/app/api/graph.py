@@ -248,9 +248,15 @@ def generate_ontology():
         })
         
     except Exception as e:
+        error_text = str(e)
+        if 'Arrearage' in error_text or 'overdue-payment' in error_text:
+            return jsonify({
+                "success": False,
+                "error": "LLM 服务商账户欠费或账户状态异常，请充值、解除欠费后重试，或在首页 LLM 配置中更换可用账号。"
+            }), 402
         return jsonify({
             "success": False,
-            "error": str(e),
+            "error": error_text,
             "traceback": traceback.format_exc()
         }), 500
 
@@ -320,6 +326,35 @@ def build_graph():
         
         # 如果强制重建，重置状态
         if force and project.status in [ProjectStatus.GRAPH_BUILDING, ProjectStatus.FAILED, ProjectStatus.GRAPH_COMPLETED]:
+            # 修复（force 构建竞态）：旧构建任务可能仍在 PROCESSING。若不处理，
+            # 两个 daemon 线程会并发读写同一个 project 对象（graph_id/ status/
+            # graph_build_task_id 互相覆盖），前端同时轮询两个 task_id 也无所适从。
+            # 将旧任务标记 FAILED：旧线程后续的 update_task 只会刷新同一个 task
+            # 的字段，不再代表有效构建；前端轮询旧 task_id 会立即看到失败并停止。
+            old_task_id = project.graph_build_task_id
+            if old_task_id and project.status == ProjectStatus.GRAPH_BUILDING:
+                try:
+                    TaskManager().update_task(
+                        old_task_id,
+                        status=TaskStatus.FAILED,
+                        message=t('api.taskCancelledByRebuild'),
+                    )
+                    logger.info(f"force 重建: 旧构建任务 {old_task_id} 已标记为失败（被新构建取代）")
+                except Exception as e:
+                    logger.warning(f"force 重建: 标记旧任务 {old_task_id} 失败时出错（继续）: {e}")
+
+            # 修复（force 重建不删旧图谱 → 磁盘泄漏）：旧代码只把 graph_id 置 None，
+            # 旧图谱 JSON 文件留在磁盘上永不清理，反复重建会不断累积。
+            # 注意时序：必须在置 None 之前取出旧 graph_id 再删除。
+            old_graph_id = project.graph_id
+            if old_graph_id:
+                try:
+                    GraphBuilderService().delete_graph(old_graph_id)
+                    logger.info(f"force 重建: 已删除旧图谱 {old_graph_id}")
+                except Exception as e:
+                    # 删除失败不阻断重建（最多残留一个孤儿文件），但要有迹可循
+                    logger.warning(f"force 重建: 删除旧图谱 {old_graph_id} 失败（继续）: {e}")
+
             project.status = ProjectStatus.ONTOLOGY_GENERATED
             project.graph_id = None
             project.graph_build_task_id = None
@@ -434,11 +469,17 @@ def build_graph():
                     progress_callback=add_progress_callback
                 )
 
-                # 本地图谱存储是同步处理的，无需等待远程处理完成
+                # 本地图谱同步完成；Zep 模式等待第三方异步抽取完成
                 task_manager.update_task(
                     task_id,
                     message=t('progress.waitingZepProcess'),
                     progress=80
+                )
+                builder.wait_for_episodes(
+                    graph_id=graph_id,
+                    episode_uuids=episode_uuids,
+                    timeout=600,
+                    poll_interval=3,
                 )
 
                 # 获取图谱数据
@@ -580,14 +621,22 @@ def get_graph_data_summary(graph_id: str):
     - 业务逻辑不变（节点/边数据本身完全一致）
     """
     try:
-        from ..services.graph_store import GraphStore
-        store = GraphStore(graph_id)
+        from ..services.graph_backend import get_graph_store
+        store = get_graph_store(graph_id)
+        if hasattr(store, "_nodes") and hasattr(store, "_edges"):
+            node_count = len(store._nodes)
+            edge_count = len(store._edges)
+        else:
+            # Zep 后端：走 get_statistics
+            stats = store.get_statistics()
+            node_count = stats.get("total_nodes", 0)
+            edge_count = stats.get("total_edges", 0)
         return jsonify({
             "success": True,
             "data": {
                 "graph_id": graph_id,
-                "node_count": len(store._nodes),
-                "edge_count": len(store._edges),
+                "node_count": node_count,
+                "edge_count": edge_count,
             }
         })
 

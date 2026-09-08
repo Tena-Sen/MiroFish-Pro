@@ -433,39 +433,56 @@ def list_reports():
 def download_report(report_id: str):
     """
     下载报告（Markdown格式）
-    
-    返回Markdown文件
+
+    返回Markdown文件。
+    生成中下载时 full_report.md 尚未写入，回退为现场组装已生成章节（部分报告），
+    避免下载到空文件。
     """
     try:
         report = ReportManager.get_report(report_id)
-        
+
         if not report:
             return jsonify({
                 "success": False,
                 "error": t('api.reportNotFound', id=report_id)
             }), 404
-        
+
         md_path = ReportManager._get_report_markdown_path(report_id)
-        
-        if not os.path.exists(md_path):
-            # 如果MD文件不存在，生成一个临时文件
-            import tempfile
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False) as f:
-                f.write(report.markdown_content)
-                temp_path = f.name
-            
+
+        if os.path.exists(md_path):
             return send_file(
-                temp_path,
+                md_path,
                 as_attachment=True,
                 download_name=f"{report_id}.md"
             )
-        
+
+        # full_report.md 不存在（生成中）：优先用持久化的 markdown_content，
+        # 为空时现场从已生成的章节文件组装部分报告
+        content = report.markdown_content or ""
+        if not content:
+            header = ""
+            if report.outline:
+                header += f"# {report.outline.title}\n\n"
+                header += f"> {report.outline.summary}\n\n"
+            header += "---\n\n"
+            sections = ReportManager.get_generated_sections(report_id)
+            if not sections:
+                return jsonify({
+                    "success": False,
+                    "error": "报告尚未生成任何章节，请等待生成开始后再下载"
+                }), 404
+            body = "".join(s["content"] for s in sections)
+            content = header + body
+
+        import io
+        buf = io.BytesIO(content.encode('utf-8'))
         return send_file(
-            md_path,
+            buf,
             as_attachment=True,
-            download_name=f"{report_id}.md"
+            download_name=f"{report_id}.md",
+            mimetype='text/markdown'
         )
-        
+
     except Exception as e:
         logger.error(f"下载报告失败: {str(e)}")
         return jsonify({

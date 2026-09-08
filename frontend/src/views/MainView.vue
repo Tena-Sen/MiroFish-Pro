@@ -90,6 +90,7 @@ import LanguageSwitcher from '../components/LanguageSwitcher.vue'
 
 const route = useRoute()
 const router = useRouter()
+const showLlmConfig = ref(false)
 const { t, tm } = useI18n()
 
 // Layout State
@@ -114,6 +115,8 @@ const systemLogs = ref([])
 // Polling timers
 let pollTimer = null
 let graphPollTimer = null
+// 图谱轮询的上次节点/边数量（用于日志去重：数量不变不打日志）
+let lastGraphCounts = { nodes: -1, edges: -1 }
 
 // --- Computed Layout Styles ---
 const leftPanelStyle = computed(() => {
@@ -323,7 +326,12 @@ const fetchGraphData = async () => {
         graphData.value = gRes.data
         const nodeCount = gRes.data.node_count || gRes.data.nodes?.length || 0
         const edgeCount = gRes.data.edge_count || gRes.data.edges?.length || 0
-        addLog(`Graph data refreshed. Nodes: ${nodeCount}, Edges: ${edgeCount}`)
+        // 仅在节点/边数量变化时打日志：构建期每 10s 轮询一次，
+        // 无条件打印会产生大量 "Nodes: 0, Edges: 0" 重复噪音
+        if (nodeCount !== lastGraphCounts.nodes || edgeCount !== lastGraphCounts.edges) {
+          addLog(`Graph data refreshed. Nodes: ${nodeCount}, Edges: ${edgeCount}`)
+          lastGraphCounts = { nodes: nodeCount, edges: edgeCount }
+        }
       }
     }
   } catch (err) {

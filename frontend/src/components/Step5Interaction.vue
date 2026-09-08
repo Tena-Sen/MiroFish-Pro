@@ -1599,13 +1599,26 @@ const loadAgentLogs = async () => {
 
 const loadProfiles = async () => {
   if (!props.simulationId) return
-  
+
+  // Step5 修复：之前硬编码 'reddit'，导致 Twitter agents 下拉为空
+  // 现在并发拉两个平台，按 user_id + platform 去重，每个 profile 带 _platform 标记
   try {
-    const res = await getSimulationProfilesRealtime(props.simulationId, 'reddit')
-    if (res.success && res.data) {
-      profiles.value = res.data.profiles || []
-      addLog(t('log.loadedProfiles', { count: profiles.value.length }))
-    }
+    const [redditRes, twitterRes] = await Promise.all([
+      getSimulationProfilesRealtime(props.simulationId, 'reddit').catch(() => ({ success: false, data: { profiles: [] } })),
+      getSimulationProfilesRealtime(props.simulationId, 'twitter').catch(() => ({ success: false, data: { profiles: [] } })),
+    ])
+
+    const redditProfiles = (redditRes.success && redditRes.data?.profiles) || []
+    const twitterProfiles = (twitterRes.success && twitterRes.data?.profiles) || []
+
+    // 标记平台来源，便于下拉/聊天区分
+    const tagged = [
+      ...redditProfiles.map((p) => ({ ...p, _platform: 'reddit' })),
+      ...twitterProfiles.map((p) => ({ ...p, _platform: 'twitter' })),
+    ]
+
+    profiles.value = tagged
+    addLog(t('log.loadedProfiles', { count: profiles.value.length }))
   } catch (err) {
     addLog(t('log.loadProfilesFailed', { error: err.message }))
   }
